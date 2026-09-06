@@ -1,14 +1,9 @@
-<!-- BEGIN MICROSOFT SECURITY.MD V1.0.0 BLOCK -->
+# Security
 
-## Security
+Do not post security vulnerabilities or credentials in public issues. Use a
+private contact channel confirmed on the maintainer's
+[GitHub profile](https://github.com/kafeifei), or GitHub private vulnerability
+reporting when enabled for this repository.
 
-Microsoft takes the security of our software products and services seriously, which
-includes all source code repositories in our GitHub organizations.
-
-**Please do not report security vulnerabilities through public GitHub issues.**
-
-For security reporting information, locations, contact information, and policies,
-please review the latest guidance for Microsoft repositories at
-[https://aka.ms/SECURITY.md](https://aka.ms/SECURITY.md).
-
-<!-- END MICROSOFT SECURITY.MD BLOCK -->
+Provide a minimal, redacted reproduction. Provider secrets and real session
+transcripts are not required for a bug report.

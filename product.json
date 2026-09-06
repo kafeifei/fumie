@@ -1,40 +1,89 @@
 {
-	"nameShort": "Code - OSS",
-	"nameLong": "Code - OSS",
-	"applicationName": "code-oss",
-	"dataFolderName": ".vscode-oss",
-	"sharedDataFolderName": ".vscode-oss-shared",
-	"win32MutexName": "vscodeoss",
+	"nameShort": "Fumie",
+	"nameLong": "Fumie",
+	"applicationName": "fumie",
+	"dataFolderName": ".fumie",
+	"sharedDataFolderName": ".fumie-shared",
+	"win32MutexName": "fumie",
 	"licenseName": "MIT",
-	"licenseUrl": "https://github.com/microsoft/vscode/blob/main/LICENSE.txt",
-	"serverLicenseUrl": "https://github.com/microsoft/vscode/blob/main/LICENSE.txt",
+	"licenseUrl": "https://github.com/kafeifei/fumie/blob/main/LICENSE.txt",
+	"serverLicenseUrl": "https://github.com/kafeifei/fumie/blob/main/LICENSE.txt",
 	"serverGreeting": [],
 	"serverLicense": [],
 	"serverLicensePrompt": "",
-	"serverApplicationName": "code-server-oss",
-	"serverDataFolderName": ".vscode-server-oss",
-	"tunnelApplicationName": "code-tunnel-oss",
-	"win32DirName": "Microsoft Code OSS",
-	"win32NameVersion": "Microsoft Code OSS",
-	"win32RegValueName": "CodeOSS",
-	"win32x64AppId": "{{D77B7E06-80BA-4137-BCF4-654B95CCEBC5}",
-	"win32arm64AppId": "{{D1ACE434-89C5-48D1-88D3-E2991DF85475}",
-	"win32x64UserAppId": "{{CC6B787D-37A0-49E8-AE24-8559A032BE0C}",
-	"win32arm64UserAppId": "{{3AEBF0C8-F733-4AD4-BADE-FDB816D53D7B}",
-	"win32AppUserModelId": "Microsoft.CodeOSS",
-	"win32ShellNameShort": "C&ode - OSS",
-	"win32TunnelServiceMutex": "vscodeoss-tunnelservice",
-	"win32TunnelMutex": "vscodeoss-tunnel",
-	"darwinBundleIdentifier": "com.visualstudio.code.oss",
-	"darwinProfileUUID": "47827DD9-4734-49A0-AF80-7E19B11495CC",
-	"darwinProfilePayloadUUID": "CF808BE7-53F3-46C6-A7E2-7EDB98A5E959",
-	"linuxIconName": "code-oss",
+	"serverApplicationName": "fumie-server",
+	"serverDataFolderName": ".fumie-server",
+	"tunnelApplicationName": "fumie-tunnel",
+	"tunnelApplicationConfig": {
+		"authenticationProviders": {
+			"github": {
+				"scopes": [
+					"read:user"
+				]
+			}
+		},
+		"editorWebUrl": "https://vscode.dev",
+		"extension": {
+			"extensionId": "ms-vscode.remote-server",
+			"friendlyName": "Remote - Tunnels"
+		}
+	},
+	"win32DirName": "Fumie",
+	"win32NameVersion": "Fumie",
+	"win32RegValueName": "Fumie",
+	"win32x64AppId": "{{05EF3BA3-61BB-5BCE-A7D1-1C1DEC210BDB}",
+	"win32arm64AppId": "{{DEEA3EF5-1670-507F-BD40-60412D27D4B8}",
+	"win32x64UserAppId": "{{1CCFA345-2136-5CC6-81BB-76096881A786}",
+	"win32arm64UserAppId": "{{547FCC3E-3DE3-5FDA-A51B-3F09994CB108}",
+	"win32AppUserModelId": "Fumie.Fumie",
+	"win32ShellNameShort": "F&umie",
+	"win32TunnelServiceMutex": "fumie-tunnelservice",
+	"win32TunnelMutex": "fumie-tunnel",
+	"darwinBundleIdentifier": "io.github.kafeifei.fumie",
+	"darwinProfileUUID": "E914B6D1-F0ED-5B09-8E8C-56626BF1439B",
+	"darwinProfilePayloadUUID": "3F7071A5-8B98-52D7-9DAB-2815273C3AD9",
+	"linuxIconName": "fumie",
 	"licenseFileName": "LICENSE.txt",
-	"reportIssueUrl": "https://github.com/microsoft/vscode/issues/new",
+	"reportIssueUrl": "https://github.com/kafeifei/fumie/issues",
 	"nodejsArtifactFeed": "",
 	"electronArtifactFeed": "",
-	"urlProtocol": "code-oss",
-	"agentsTelemetryAppName": "agents",
+	"urlProtocol": "fumie",
+	"sessionsRequireDefaultAccount": false,
+	"sessionsAccountUI": true,
+	"sessionsMinimalShell": true,
+	"sessionsRemoteConnectionsUI": true,
+	"sessionsAllowedAgentHostProviders": [
+		"codex",
+		"claude",
+		"acp-claude",
+		"kimi",
+		"deepseek",
+		"pi",
+		"opencode"
+	],
+	"agentHostInstructions": [
+		"You are a coding agent inside Fumie, an agent-first desktop coding environment built on Code OSS. Fumie may host you in its Agents window, terminal chat, or editor inline chat. In the Agents window, Fumie manages the visible session, workspace or isolated worktree, Files/Changes, permissions, and Settings > Models; agent and model are separate choices. Your harness owns its model loop and tools. Trust observed Fumie UI and session state, follow surface-specific instructions, use only exposed controls, and never claim a UI or configuration change without observing it."
+	],
+	"agentHostDefaultFumieHome": "~/.fumie",
+	"agentHostDefaultCodexHome": "~/.codex",
+	"agentHostDefaultCodexSqliteHome": "~/.codex",
+	"agentHostDefaultCodexBinaryPath": "~/.local/bin/codex",
+	"agentHostDefaultCodexUsageSource": "openai",
+	"agentHostDefaultCopilotHome": "~/Library/Application Support/Fumie/copilot-home",
+	"agentHostDefaultClaudeUseCopilotProxy": false,
+	"agentHostByokModelsEnabledByDefault": true,
+	"extensionGlobalStateDefaults": {
+		"openai.chatgpt": {
+			"viewed2025-09-15-nux": true
+		}
+	},
+	"extensionEnabledApiProposals": {
+		"openai.chatgpt": [
+			"languageModelProxy",
+			"chatSessionsProvider"
+		]
+	},
+	"agentsTelemetryAppName": "fumie",
 	"webviewContentExternalBaseUrlTemplate": "https://{{uuid}}.vscode-cdn.net/insider/ef65ac1ba57f57f2a3961bfe94aa20481caca4c6/out/vs/workbench/contrib/webview/browser/pre/",
 	"builtInExtensions": [
 		{

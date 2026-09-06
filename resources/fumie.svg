@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Fumie">
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="#20242a"/>
+  <path d="M316 272h408v104H432v116h252v104H432v180H316z" fill="#ece8dd"/>
+</svg>

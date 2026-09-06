@@ -1,9 +1,9 @@
 {
-  "name": "code-oss-dev",
+  "name": "fumie-dev",
   "version": "1.136.0",
   "distro": "c842171bd42ca4aef20b0a186c94d99edd763842",
   "author": {
-    "name": "Microsoft Corporation"
+    "name": "Kafeifei"
   },
   "license": "MIT",
   "main": "./out/main.js",
@@ -287,10 +287,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/microsoft/vscode.git"
+    "url": "https://github.com/kafeifei/fumie.git"
   },
   "bugs": {
-    "url": "https://github.com/microsoft/vscode/issues"
+    "url": "https://github.com/kafeifei/fumie/issues"
   },
   "optionalDependencies": {
     "windows-foreground-love": "0.6.1"
