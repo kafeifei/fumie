@@ -292,7 +292,7 @@ export class AgentHostSdkSetupNotificationContribution extends Disposable implem
 			this._chatEntitlementService.onDidChangeEntitlement,
 			this._defaultAccountService.onDidChangeDefaultAccount,
 			this._languageModelsService.onDidChangeLanguageModels,
-			Event.filter(this._configurationService.onDidChangeConfiguration, event => event.affectsConfiguration(AgentHostAllowSignedOutWhenUsableSettingId)),
+			Event.filter(this._configurationService.onDidChangeConfiguration, event => event.affectsConfiguration(AgentHostAllowSignedOutWhenUsableSettingId) || event.affectsConfiguration('chat.tips.enabled')),
 		)(() => this._update()));
 		// The host restarts (and a remote reconnects) behind a fresh root state, so
 		// re-bind rather than holding one subscription for the window's lifetime.
@@ -336,6 +336,11 @@ export class AgentHostSdkSetupNotificationContribution extends Disposable implem
 			if (toReport) {
 				this._lastReported.set(setup.agent, toReport);
 				this._agentSdkSetupService.reportSetupState(setup.agent, toReport);
+			}
+			// Account setup suggestions follow the tips preference; providers can
+			// also be configured directly in Settings without signing in here.
+			if (state === 'noAccount' && !this._configurationService.getValue<boolean>('chat.tips.enabled')) {
+				continue;
 			}
 			const notification = createAgentSdkSetupNotification(setup, displayName, state);
 			if (!notification) {
