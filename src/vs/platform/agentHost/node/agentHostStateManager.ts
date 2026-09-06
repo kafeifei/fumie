@@ -10,7 +10,7 @@ import { equals } from '../../../base/common/objects.js';
 import { ILogService } from '../../log/common/log.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
 import { TelemetryLevel } from '../../telemetry/common/telemetry.js';
-import { ActionType, ActionEnvelope, ActionOrigin, INotification, IRootConfigChangedAction, SessionAction, ChatAction, RootAction, StateAction, TerminalAction, ChangesetAction, ClientChangesetAction, AnnotationsAction, ClientAnnotationsAction, isRootAction, isSessionAction, isChatAction, isChangesetAction, isAnnotationsAction, type AuthRequiredParams, type ProgressParams, type SessionSummaryChangedParams } from '../common/state/sessionActions.js';
+import { ActionType, ActionEnvelope, ActionOrigin, INotification, IRootConfigChangedAction, SessionAction, ChatAction, RootAction, StateAction, TerminalAction, ChangesetAction, ClientChangesetAction, AnnotationsAction, ClientAnnotationsAction, isRootAction, isSessionAction, isChatAction, isChangesetAction, isAnnotationsAction, type AuthRequiredParams, type ProgressParams, type SessionSummaryChangedParams, type SessionSummaryChanges } from '../common/state/sessionActions.js';
 import type { IStateSnapshot } from '../common/state/sessionProtocol.js';
 import { rootReducer, sessionReducer, chatReducer, changesetReducer, annotationsReducer } from '../common/state/sessionReducers.js';
 import { createRootState, createSessionState, createChatState, createDefaultChatSummary, chatSummaryFromState, buildDefaultChatUri, parseDefaultChatUri, parseRequiredSessionUriFromChatUri, parseSubagentSessionUri, isAhpChatChannel, isDefaultChatUri, mergeSessionWithDefaultChat, isAhpRootChannel, readSessionExternal, SessionLifecycle, withHostBuildInfo, type Changeset, type ChangesetState, type AnnotationsState, type ChatState, type ChatSummary, type Customization, type ISessionWithDefaultChat, type Message, type RootState, type SessionConfigState, type SessionMeta, type SessionState, type SessionSummary, type Turn, type URI, ROOT_STATE_URI, ChangesetStatus, IHostBuildInfo, SessionStatus } from '../common/state/sessionState.js';
@@ -117,7 +117,7 @@ class SessionSummaryNotifier extends Disposable {
 
 	constructor(
 		private readonly _getSummary: (session: string) => SessionSummary | undefined,
-		private readonly _emit: (session: string, changes: Partial<SessionSummary>) => void,
+		private readonly _emit: (session: string, changes: SessionSummaryChanges) => void,
 	) {
 		super();
 	}
@@ -178,15 +178,21 @@ class SessionSummaryNotifier extends Disposable {
 			return;
 		}
 
-		const changes: Partial<SessionSummary> = {};
+		// Optional fields go out as an explicit `null` when they are cleared.
+		// Spelling a clear as `undefined` looks right in TypeScript but does not
+		// survive `JSON.stringify` — the wire carried `changes: {}`, which is
+		// indistinguishable from "nothing changed", so a client could learn that
+		// a session started an activity but never that it finished one. The
+		// activity line and its spinner stayed on the session list row forever.
+		const changes: SessionSummaryChanges = {};
 		if (current.title !== lastNotified.title) { changes.title = current.title; }
 		if (current.status !== lastNotified.status) { changes.status = current.status; }
-		if (current.activity !== lastNotified.activity) { changes.activity = current.activity; }
+		if (current.activity !== lastNotified.activity) { changes.activity = current.activity ?? null; }
 		if (current.modifiedAt !== lastNotified.modifiedAt) { changes.modifiedAt = current.modifiedAt; }
-		if (current.project !== lastNotified.project) { changes.project = current.project; }
-		if (current.changes !== lastNotified.changes) { changes.changes = current.changes; }
-		if (current.workingDirectories !== lastNotified.workingDirectories) { changes.workingDirectories = current.workingDirectories; }
-		if (current._meta !== lastNotified._meta) { changes._meta = current._meta; }
+		if (current.project !== lastNotified.project) { changes.project = current.project ?? null; }
+		if (current.changes !== lastNotified.changes) { changes.changes = current.changes ?? null; }
+		if (current.workingDirectories !== lastNotified.workingDirectories) { changes.workingDirectories = current.workingDirectories ?? null; }
+		if (current._meta !== lastNotified._meta) { changes._meta = current._meta ?? null; }
 
 		this._lastNotified.set(session, current);
 
@@ -412,6 +418,16 @@ export class AgentHostStateManager extends Disposable {
 		}
 	}
 
+	/**
+	 * Permanently retains a session that would otherwise still count as an
+	 * unused draft — e.g. a provisional session the user explicitly archived.
+	 * An explicit user action on the catalog row means the session must survive
+	 * the empty-draft GC even though it never had a turn.
+	 */
+	retainSession(session: URI): void {
+		this._markSessionUsed(session);
+	}
+
 	private _resolveOwningSession(sessionOrChat: URI): URI | undefined {
 		return isAhpChatChannel(sessionOrChat) ? parseDefaultChatUri(sessionOrChat) : sessionOrChat;
 	}
@@ -554,6 +570,11 @@ export class AgentHostStateManager extends Disposable {
 		if (entry) {
 			entry.providerData = providerData;
 		}
+	}
+
+	/** Returns a chat's opaque provider backing receipt without interpreting it. */
+	getChatProviderData(chat: URI): string | undefined {
+		return this._chatEntries.get(chat)?.providerData;
 	}
 
 	/**
@@ -727,14 +748,12 @@ export class AgentHostStateManager extends Disposable {
 	 * Creates a new session in state with `lifecycle: 'creating'`.
 	 * Returns the initial session state.
 	 *
-	 * By default a {@link NotificationType.SessionAdded} notification is
-	 * emitted so clients see the new session immediately. Pass
-	 * `options.emitNotification: false` to defer the notification — a typical
-	 * use is for **provisional** sessions that exist on the server but should
-	 * not appear in client session lists until they have been persisted by
-	 * the agent (e.g. on the first message that materializes an SDK session
-	 * and writes its on-disk metadata). Call {@link markSessionPersisted}
-	 * afterwards to fire the deferred notification.
+	 * A {@link NotificationType.SessionAdded} notification is emitted
+	 * immediately so clients see the new session. Every current production
+	 * call site relies on this default; `options.emitNotification: false`
+	 * remains for callers that need to seed a not-yet-announced session
+	 * directly (paired with a later {@link markSessionPersisted} to announce
+	 * it), which today is only exercised by tests.
 	 */
 	createSession(summary: SessionSummary, options?: { readonly emitNotification?: boolean }): SessionState {
 		const key = summary.resource;
@@ -767,26 +786,32 @@ export class AgentHostStateManager extends Disposable {
 	}
 
 	/**
-	 * Fire a {@link NotificationType.SessionAdded} notification for a session
-	 * whose creation was deferred via `createSession({ emitNotification: false })`.
+	 * Marks a session as persisted after materialization.
 	 *
 	 * Propagates the materialization-resolved catalog fields (`project`,
 	 * `workingDirectory`, `modifiedAt`, `changes`) from the supplied summary
 	 * onto the session entry so subscribers see them. The reducer-owned metadata
 	 * (`title`, `status`, `activity`) is intentionally NOT copied back — the live
-	 * state is authoritative for those. No-ops for sessions that were already
-	 * announced (idempotent).
+	 * state is authoritative for those.
+	 *
+	 * If the session's summary was already announced — the common case, since
+	 * {@link createSession} always announces — this marks it dirty so
+	 * materialization is broadcast as a {@link NotificationType.SessionSummaryChanged}
+	 * on the next notifier flush. Otherwise it announces the summary and fires
+	 * a {@link NotificationType.SessionAdded} notification.
 	 */
-	markSessionPersisted(session: URI, summary: SessionSummary, force = false): void {
+	markSessionPersisted(session: URI, summary: SessionSummary): void {
 		const key = session.toString();
 		const entry = this._sessionStates.get(key);
 		if (!entry) {
 			this._logService.warn(`[AgentHostStateManager] markSessionPersisted: unknown session ${key}`);
 			return;
 		}
-		if (!force && this._addedSessionSummaries.has(key)) {
-			return;
-		}
+		// The notifier records a session's announced summary whenever it has
+		// been surfaced to clients (either through `createSession` or here);
+		// using it as the idempotency check keeps us from firing `SessionAdded`
+		// twice for a session whose creation was not deferred.
+		const wasAnnounced = this._summaryNotifier.isAnnounced(key);
 		// Propagate the materialization-resolved fields so subscribers calling
 		// `getSessionState` / `getSessionSummary` see the resolved working
 		// directory / project. We don't need to schedule a
@@ -796,6 +821,10 @@ export class AgentHostStateManager extends Disposable {
 		entry.modifiedAt = summary.modifiedAt;
 		entry.changes = summary.changes;
 		const full = this._toSummary(key, entry);
+		if (wasAnnounced) {
+			this._summaryNotifier.markDirty(key);
+			return;
+		}
 		this._emitSessionAdded(full);
 	}
 
@@ -1624,7 +1653,7 @@ export class AgentHostStateManager extends Disposable {
 				}
 
 				resultingState = newState;
-			} else if (!isAhpChatChannel(key)) {
+			} else if (!isAhpChatChannel(key) && sessionAction.type !== ActionType.SessionIsArchivedChanged) {
 				this._logService.warn(`[AgentHostStateManager] Action for unknown session: ${key}, type=${action.type}`);
 			}
 		}

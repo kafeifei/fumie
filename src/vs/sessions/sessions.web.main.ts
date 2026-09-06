@@ -173,6 +173,9 @@ import './contrib/providers/remoteAgentHost/browser/wslAgentHost.contribution.js
 // Remote agent host terminal profiles — registers terminal profiles for connected agent hosts
 import './contrib/providers/remoteAgentHost/browser/remoteAgentHostTerminal.contribution.js';
 
+// Remembered-host inventory, shared by the host filter and the Settings hosts page
+import './services/remoteAgentHostInventory/browser/remoteAgentHostInventoryService.js';
+
 // Remote agent host session provider — discovers agents and registers sessions
 import './contrib/providers/remoteAgentHost/browser/remoteAgentHost.contribution.js';
 import './contrib/providers/remoteAgentHost/browser/remoteAgentHostActions.js';
@@ -207,8 +210,6 @@ import './contrib/providers/agentHost/browser/mobile/mobileChatPhoneInputPresent
 // without duplicate-registration conflicts.
 import './contrib/providers/copilotChatSessions/browser/mobilePermissionPicker.contribution.js';
 
-// TODO: support agent feedback in web
-import './contrib/agentFeedback/browser/nullAgentFeedbackService.contribution.js';
 import '../workbench/contrib/webview/browser/webview.web.contribution.js';
 import '../workbench/contrib/extensions/browser/extensions.web.contribution.js';
 import '../workbench/contrib/terminal/browser/terminal.web.contribution.js';

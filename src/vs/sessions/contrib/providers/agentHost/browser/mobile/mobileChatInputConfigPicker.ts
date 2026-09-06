@@ -295,6 +295,9 @@ class MobileChatInputConfigPicker extends Disposable {
 			await this._phonePresenter.showCombinedModeAndModelSheet(trigger, {
 				kind: 'session',
 				getSessionContext: () => createChatPhoneInputSessionContext(this._session.get()),
+				// The trigger label above the sheet reads the selection model, so the
+				// sheet's checkmark has to read it too.
+				getSelectedModelId: () => this._selectionModel.state.get().currentModel?.identifier,
 				selectModel: modelIdentifier => this._switchToModel(modelIdentifier),
 			});
 			const afterCtx = this._getContext();

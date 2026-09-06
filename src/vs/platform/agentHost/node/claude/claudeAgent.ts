@@ -4,11 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { CCAModel } from '@vscode/copilot-api';
-import type { ModelInfo, OnElicitation, Options, SDKSessionInfo, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { ModelInfo, OnElicitation, Options, SDKRateLimitInfo, SDKSessionInfo, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { Limiter, retry, SequencerByKey } from '../../../../base/common/async.js';
+import { Limiter, raceCancellation, retry, SequencerByKey } from '../../../../base/common/async.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
-import { CancellationError } from '../../../../base/common/errors.js';
+import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
+import { AgentMessageNotSubmittedError } from '../../common/agentMessageNotSubmittedError.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableMap, DisposableStore, IDisposable } from '../../../../base/common/lifecycle.js';
 import { IObservable, observableValue } from '../../../../base/common/observable.js';
@@ -20,13 +21,18 @@ import { INativeEnvironmentService } from '../../../environment/common/environme
 import { ILogService } from '../../../log/common/log.js';
 import { IProductService } from '../../../product/common/productService.js';
 import { IAgentPluginManager, ISyncedCustomization } from '../../common/agentPluginManager.js';
+import { decodeClaudeChatBacking, encodeClaudeChatBacking, type ClaudeChatBackingStorage, type IClaudePersistedChatBacking } from './claudeChatBackingCodec.js';
+import { IClaudeBackingStore, type IClaudeStoreRouting } from './claudeBackingStore.js';
 import { IAgentSdkDownloader } from '../agentSdkDownloader.js';
 import { AgentSdkSetupChannel } from '../agentSdkSetupChannel.js';
-import { decodeProviderData, encodeProviderData, type IPersistedChat } from '../agentChatBackings.js';
+import type { AgentSdkAccountStatus } from '../../common/agentSdkSetup.js';
+import { type IPersistedChat } from '../agentChatBackings.js';
 import { buildSideChatSourceContext, prepareSideChatPrompt, sliceSideChatTurns } from '../agentPeerChats.js';
 import { AgentHostConfigKey, agentHostCustomizationConfigSchema } from '../../common/agentHostCustomizationConfig.js';
-import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostClaudeMultiRootEnabledConfigKey, createSchema, platformRootSchema, platformSessionSchema, schemaProperty } from '../../common/agentHostSchema.js';
-import { ClaudePermissionMode, ClaudeSessionConfigKey, narrowClaudePermissionMode } from '../../common/claudeSessionConfigKeys.js';
+import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostClaudeMultiRootEnabledConfigKey, AutoApproveLevel, createSchema, platformRootSchema, platformSessionSchema } from '../../common/agentHostSchema.js';
+import { CLAUDE_ACCOUNT_META_KEY, CLAUDE_ACCOUNT_SIGN_OUT_REQUEST_KEY, IClaudeAccountInfo } from '../../common/claudeAccount.js';
+import { ClaudePermissionMode, ClaudeSessionConfigKey } from '../../common/claudeSessionConfigKeys.js';
+import { permissionTierForClaudeMode } from '../../common/fumiePermissionTiers.js';
 import { createClaudeThinkingLevelSchema, isClaudeEffortLevel } from '../../common/claudeModelConfig.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { AgentProvider, AgentSession, AgentSignal, CLAUDE_AGENT_PROVIDER_ID, IActiveClient, IAgent, IAgentChatContext, IAgentChatDataChange, IAgentChatMetadata, IAgentChats, IAgentChatConfigCompletionsParams, IAgentCreateChatOptions, IAgentCreateChatResult, IAgentDescriptor, IAgentDiscoveredChat, IAgentMaterializeChatEvent, IAgentModelInfo, IAgentResolveChatConfigParams, IAgentSessionProjectInfo, IAgentSpawnChatEvent, IAgentSpawnedChatParent, SubagentChatSignal, resolveAgentChatContext, resolveAgentHostCustomizations, resolveAgentHostInstructions, resolveSubagentChatParent } from '../../common/agent.js';
@@ -49,7 +55,7 @@ import { ICopilotApiService } from '../shared/copilotApiService.js';
 import { ClaudeSdkPackage, IClaudeAgentSdkService } from './claudeAgentSdkService.js';
 import { buildModelEnumerationOptions } from './claudeSdkOptions.js';
 import { isClaudeAccountSetUp, resolveClaudeTransportMode, type ClaudeTransportMode } from './claudeTransportMode.js';
-import { mergeClaudeModelCatalogs, resolveClaudeSessionTransport } from './claudeModelSelection.js';
+import { mergeClaudeModelCatalogs, parseClaudeByokSelection, resolveClaudeSessionTransport } from './claudeModelSelection.js';
 import { mapSessionMessagesToTurns, resolveForkAnchorUuid } from './claudeReplayMapper.js';
 import { getSubagentTranscript } from './claudeSubagentResolver.js';
 import { SubagentRegistry } from './claudeSubagentRegistry.js';
@@ -58,18 +64,32 @@ import { handleCanUseTool } from './claudeCanUseTool.js';
 import { handleElicitation } from './claudeElicitationBridge.js';
 import type { IAgentServerToolHost } from '../../common/agentServerTools.js';
 import { createPricingMetaFromBilling, normalizeCAPIBilling } from '../../common/agentModelPricing.js';
-import { tryParseClaudeModelId } from './claudeModelId.js';
+import { claudeModelLimitsFallback, toSdkModelId, tryParseClaudeModelId } from './claudeModelId.js';
 import { resolvePromptToContentBlocks } from './claudePromptResolver.js';
 import { IClaudeProxyHandle, IClaudeProxyService, type ClaudeTransport } from './claudeProxyService.js';
-import { readClaudePermissionMode } from './claudeSessionPermissionMode.js';
+import { claudePermissionModeFromValues, readClaudePermissionMode } from './claudeSessionPermissionMode.js';
 import { ClaudeSessionMetadataStore, IClaudeSessionOverlay } from './claudeSessionMetadataStore.js';
 import { IAgentHostSessionTitleSignal } from '../agentHostSessionTitleSignal.js';
 import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
+import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
+import { INativeModelProviderProxyService, type INativeModelProviderProxyHandle } from '../nativeModelProviderProxyService.js';
+import { getByokLmAgentModelId } from '../../common/agentHostByokLm.js';
+import { createAgentModelByokMeta } from '../../common/agentModelByokMeta.js';
+import { readAgentModelGroupId } from '../../common/agentModelSource.js';
+import { CLAUDE_PROVIDER_ANTHROPIC } from '../../common/claudeProviders.js';
+import { launchClaudeOfficialLogin, launchClaudeOfficialLogout, resolveClaudeCliExecutable } from './claudeOfficialLogin.js';
+import { readClaudeCliModelRegistry, type IClaudeCliRegistryModel } from './claudeCliModelRegistry.js';
+import { claudeRateLimitsFromUsage, describeClaudeUsageWindows, mergeClaudeRateLimitEvent } from './claudeRateLimits.js';
 
 const USER_AGENT_PREFIX = 'vscode_claude_code';
 
 /** Where a user goes to establish Claude credentials; the workbench labels the link. */
 const CLAUDE_SETUP_DOCS_URL = 'https://code.claude.com/docs/en/third-party-integrations';
+
+interface IClaudeNativeModelCatalog {
+	readonly accountStatus: 'signedOut' | 'signedIn';
+	readonly models: readonly IAgentModelInfo[];
+}
 
 /**
  * Returns true if `m` is a Claude-family model that should be advertised
@@ -159,23 +179,145 @@ function isSdkDefaultModel(m: ModelInfo): boolean {
 	return m.value === SDK_DEFAULT_MODEL_VALUE;
 }
 
+/** The `[1m]` long-context decoration an SDK row carries on its value or its resolved model. */
+const CLAUDE_LONG_CONTEXT_SUFFIX = '[1m]';
+
+/**
+ * How the Claude CLI names a family's 1M-context SKU.
+ *
+ * The baked catalog {@link readClaudeCliModelRegistry} reads holds ONE entry per
+ * family — `{id:"claude-opus-5",display_name:"Opus 5",context:{window:1e6,
+ * supports_1m_suffix:!0}}` — with no separate `claude-opus-5-1m` row to borrow a
+ * name from (verified against the bundled 0.3.260 binary: every `display_name`
+ * in the catalog is a bare family name). The CLI builds its `[1m]` options on
+ * top of those entries and labels them `Opus 4.7 (1M context)` /
+ * `Sonnet 4.6 (1M context)` — strings that live in the CLI's own option list,
+ * not in the catalog. So a `[1m]` SDK row takes the registry's family name and
+ * re-applies the CLI's own marker, rather than inventing a different one.
+ */
+const CLAUDE_LONG_CONTEXT_NAME_SUFFIX = ' (1M context)';
+
+/**
+ * The CLI-registry row naming the same model as an SDK row: the concrete model
+ * an alias resolves to when it has one (`opus[1m]` -> `claude-opus-5[1m]`), else
+ * the row's own value. Both sides reduce through {@link claudeModelIdentity} so
+ * neither the `[1m]` decoration nor a build-date suffix hides the match.
+ */
+function findClaudeRegistryModel(registryModels: readonly IClaudeCliRegistryModel[], m: ModelInfo): IClaudeCliRegistryModel | undefined {
+	const wanted = claudeModelIdentity(m.resolvedModel ?? m.value);
+	return registryModels.find(model => claudeModelIdentity(model.id) === wanted);
+}
+
 /**
  * Project an SDK {@link ModelInfo} into the agent host's
  * {@link IAgentModelInfo} surface for the native (BYO-Anthropic) transport.
  * Carries NO commercial metadata (no `policyState`, no pricing `_meta`) —
  * those are Copilot/CAPI concepts. Reuses the shared effort-schema helpers so
  * the thinking-level picker matches the proxied projection.
+ *
+ * `registryModels`, when the CLI's baked catalog could be read, is what makes an
+ * SDK row and a registry row read as one family rather than two. The SDK names
+ * its alias rows for the alias (`Fable`, `Sonnet`, `Opus (1M context)`) while the
+ * registry names the model (`Fable 5.1`, `Sonnet 5`, `Opus 5`), so an unenriched
+ * merged catalog lists "Fable" next to "Fable 5" as if they were unrelated. The
+ * registry's own `display_name` and limits therefore win here; the SDK's alias
+ * metadata (effort levels, `[1m]` routing id) is untouched.
+ *
+ * Without the registry, context-window limits come from
+ * {@link claudeModelLimitsFallback}, not from `m`: the SDK's `ModelInfo` declares
+ * no window / limit fields of any kind (verified against the vendored
+ * `@anthropic-ai/claude-agent-sdk` typings), so without the fallback every native
+ * row publishes an undefined `maxContextWindow`. That is not cosmetic — it is the
+ * only denominator the context gauge has for a replayed turn, because replayed
+ * usage carries no `_meta.modelContextWindow` and the client resolves the window
+ * by looking the turn's model id up in this catalog. A model neither source can
+ * account for is reported through {@link logService} rather than silently dropped.
  */
-export function fromSdkModelInfo(m: ModelInfo, provider: AgentProvider): IAgentModelInfo {
+export function fromSdkModelInfo(m: ModelInfo, provider: AgentProvider, logService?: ILogService, registryModels?: readonly IClaudeCliRegistryModel[]): IAgentModelInfo {
 	const supportedEfforts = (m.supportedEffortLevels ?? []).filter(isClaudeEffortLevel);
 	const configSchema = createClaudeThinkingLevelSchema(supportedEfforts);
+	const registryModel = registryModels && findClaudeRegistryModel(registryModels, m);
+	// An alias row (`sonnet`) resolves to a concrete model; look the limits up
+	// against that so the alias is not left window-less.
+	const limits = claudeModelLimitsFallback(m.value) ?? (m.resolvedModel ? claudeModelLimitsFallback(m.resolvedModel) : undefined);
+	// The registry publishes the model's real `context.window`; the fallback only
+	// infers one from the id. `opus[1m]` parses as neither a model nor a family, so
+	// the fallback has nothing to say about it and the registry is the only source.
+	const maxContextWindow = registryModel?.maxContextWindow ?? limits?.maxContextWindow;
+	const maxOutputTokens = registryModel?.maxOutputTokens ?? limits?.maxOutputTokens;
+	if (maxContextWindow === undefined) {
+		logService?.warn(`[Claude] No context-window fallback for native model '${m.value}'${m.resolvedModel ? ` (resolves to '${m.resolvedModel}')` : ''}; the context gauge will have no denominator for it`);
+	}
+	const isLongContext = m.value.endsWith(CLAUDE_LONG_CONTEXT_SUFFIX) || (m.resolvedModel?.endsWith(CLAUDE_LONG_CONTEXT_SUFFIX) ?? false);
 	return {
 		provider,
 		// SDK-canonical id (`m.value`, e.g. `claude-sonnet-4-5-20250929`). Native
 		// ids are SDK format end to end; `toSdkModelId` is identity at this seam.
 		id: m.value,
+		name: registryModel
+			? `${registryModel.displayName}${isLongContext ? CLAUDE_LONG_CONTEXT_NAME_SUFFIX : ''}`
+			: m.displayName,
+		...(maxContextWindow !== undefined ? { maxContextWindow } : {}),
+		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+		supportsVision: true,
+		...(configSchema ? { configSchema } : {}),
+	};
+}
+
+/**
+ * Reduce a model id to the form two catalogs can be compared on: the `[1m]`
+ * long-context decoration and the build-date suffix both name the *same* model
+ * as the undecorated id, so `claude-fable-5-1[1m]` and `claude-opus-4-8-20260115`
+ * must not read as models the CLI registry still owes us.
+ */
+function claudeModelIdentity(modelId: string): string {
+	return toSdkModelId(modelId.replace(/\[1m\]$/, ''));
+}
+
+/**
+ * The CLI registry rows the SDK's own catalog does not already cover.
+ *
+ * `Query.supportedModels()` answers with aliases (`sonnet`, `opus[1m]`) whose
+ * `resolvedModel` names the concrete model behind them, so both halves have to
+ * be counted as covered — otherwise the alias row and the registry's concrete
+ * row would publish the same model twice under two names.
+ */
+export function claudeRegistryModelsNotInSdkCatalog(
+	registryModels: readonly IClaudeCliRegistryModel[],
+	sdkModels: readonly ModelInfo[],
+): readonly IClaudeCliRegistryModel[] {
+	const covered = new Set<string>();
+	for (const m of sdkModels) {
+		covered.add(claudeModelIdentity(m.value));
+		if (m.resolvedModel) {
+			covered.add(claudeModelIdentity(m.resolvedModel));
+		}
+	}
+	return registryModels.filter(model => !covered.has(claudeModelIdentity(model.id)));
+}
+
+/**
+ * Project a CLI-registry row into the same {@link IAgentModelInfo} surface
+ * {@link fromSdkModelInfo} produces, so a picker entry sourced from the binary
+ * is indistinguishable from one the SDK enumerated.
+ *
+ * Unlike the SDK's `ModelInfo`, the registry *does* publish real limits
+ * (`context.window`, `max_output_tokens.default`) and a real effort range, so
+ * {@link claudeModelLimitsFallback} is consulted only where the binary left a
+ * field out — never in preference to it.
+ */
+export function fromClaudeCliRegistryModel(m: IClaudeCliRegistryModel, provider: AgentProvider): IAgentModelInfo {
+	const fallback = m.maxContextWindow === undefined ? claudeModelLimitsFallback(m.id) : undefined;
+	const maxContextWindow = m.maxContextWindow ?? fallback?.maxContextWindow;
+	const maxOutputTokens = m.maxOutputTokens ?? fallback?.maxOutputTokens;
+	const configSchema = createClaudeThinkingLevelSchema(m.supportedEfforts.filter(isClaudeEffortLevel));
+	return {
+		provider,
+		id: m.id,
 		name: m.displayName,
-		supportsVision: false,
+		...(maxContextWindow !== undefined ? { maxContextWindow } : {}),
+		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+		supportsVision: true,
 		...(configSchema ? { configSchema } : {}),
 	};
 }
@@ -201,6 +343,7 @@ interface IClaudeChatBacking {
 	/** Model override recorded at creation or by a later {@link IAgentChats.changeModel}. */
 	readonly model?: ModelSelection;
 	readonly sideChat?: IPersistedChat['sideChat'];
+	readonly storage?: ClaudeChatBackingStorage;
 }
 
 /**
@@ -245,6 +388,13 @@ interface IResolvedClaudeChatContext {
 	readonly sdkSessionId: string | undefined;
 	readonly sequencerKey: string;
 	readonly target: ClaudeAgentSession | undefined;
+	/**
+	 * The per-operation host instructions the host attached to this operation.
+	 * A send injects them into model context; a history read hands the same
+	 * strings back so the replay can strip what the SDK persisted as user
+	 * content (see `stripHostInstructions` in the replay mapper).
+	 */
+	readonly hostInstructions: readonly string[] | undefined;
 }
 
 /**
@@ -252,8 +402,13 @@ interface IResolvedClaudeChatContext {
  * orchestrator persists verbatim in its chat catalog — the wire format is
  * unchanged.
  */
-function _toPersistedChat(backing: IClaudeChatBacking): IPersistedChat {
-	return { sdkSessionId: backing.sdkSessionId, ...(backing.model ? { model: backing.model } : {}), ...(backing.sideChat ? { sideChat: backing.sideChat } : {}) };
+function _toPersistedChat(backing: IClaudeChatBacking): IClaudePersistedChatBacking {
+	return {
+		sdkSessionId: backing.sdkSessionId,
+		...(backing.model ? { model: backing.model } : {}),
+		...(backing.sideChat ? { sideChat: backing.sideChat } : {}),
+		storage: backing.storage ?? { kind: 'legacy-local-v0' },
+	};
 }
 
 /**
@@ -350,15 +505,40 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	private readonly _models = observableValue<readonly IAgentModelInfo[]>(this, []);
 	readonly models: IObservable<readonly IAgentModelInfo[]> = this._models;
 	/**
+	 * The subscription catalogs this agent enumerates itself: Copilot-CAPI
+	 * (`proxy`) plus native BYO-Anthropic (`native`), already provider-qualified
+	 * by {@link mergeClaudeModelCatalogs}.
+	 */
+	private _catalogModels: readonly IAgentModelInfo[] = [];
+	/**
+	 * The Claude-family slice of the renderer's BYOK catalog, pushed over the
+	 * bridge. Filtered only — ids, names and metadata are the provider's.
+	 */
+	private _byokModels: readonly IAgentModelInfo[] = [];
+	/** Latest authoritative native account probe, published through the setup seam. */
+	private _nativeAccountStatus: AgentSdkAccountStatus = 'unknown';
+	/** Latest native account payload published to renderer chrome. */
+	private _publishedAccountInfo: IClaudeAccountInfo = { status: 'unknown' };
+	/**
 	 * In-flight {@link refreshModels} call, so overlapping triggers (an auth
 	 * token change, a transport flip, or a periodic tick from the host's
 	 * model-refresh scheduler) collapse into a single enumeration instead of
 	 * racing each other's writes to {@link _models}.
 	 */
 	private _modelRefreshInFlight: Promise<void> | undefined;
+	private _modelRefreshGeneration = 0;
 
 	private _githubToken: string | undefined;
 	private _proxyHandle: IClaudeProxyHandle | undefined;
+	/**
+	 * Memoized handle for the wire-transparent provider proxy, started lazily the
+	 * first time a session resolves onto the `byok` transport. Held as a promise
+	 * so concurrent materializes share one bind, and kept for the agent's whole
+	 * lifetime: every live CLI subprocess is pinned to this bind's port and
+	 * nonce, so it may only be released in {@link dispose}, after the sessions
+	 * are gone (see {@link INativeModelProviderProxyHandle}).
+	 */
+	private _providerProxyHandle: Promise<INativeModelProviderProxyHandle> | undefined;
 	private _serverToolHost: IAgentServerToolHost | undefined;
 
 	/**
@@ -476,7 +656,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	 */
 	private _chatBackingResult(backing: IClaudeChatBacking): IAgentCreateChatResult {
 		return {
-			providerData: encodeProviderData(_toPersistedChat(backing)),
+			providerData: encodeClaudeChatBacking(_toPersistedChat(backing)),
 			backingSession: AgentSession.uri(this.id, backing.sdkSessionId),
 		};
 	}
@@ -515,6 +695,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			sdkSessionId,
 			sequencerKey: sdkSessionId ?? chatKey,
 			target: sdkSessionId ? this._findAnySession(sdkSessionId) : undefined,
+			hostInstructions: resolveAgentHostInstructions(resolved),
 		};
 	}
 
@@ -552,6 +733,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			this._onDidChatProgress.fire(signal);
 			this._emitSpawnedChatEvents(signal);
 		}));
+		entry.addDisposable(session.onDidRateLimitInfo(info => this._updatePublishedRateLimits(info)));
 		entry.addDisposable(session.onDidCustomizationsChange(() => this._onDidCustomizationsChange.fire()));
 		return entry;
 	}
@@ -565,6 +747,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			sdkSessionId: session.sessionId,
 			...(current?.model ? { model: current.model } : {}),
 			...(current?.sideChat ? { sideChat: current.sideChat } : {}),
+			...(current?.storage ? { storage: current.storage } : {}),
 		});
 	}
 
@@ -577,8 +760,8 @@ export class ClaudeAgent extends Disposable implements IAgent {
 
 	/**
 	 * Tear down a chat's live entry only. Every caller that means to also
-	 * forget the chat's backing (a true dispose, not a release/teardown that
-	 * must resume later) does so explicitly — e.g. {@link _disposeChat}.
+	 * forget the chat's backing (a permanent delete, not a release/teardown that
+	 * must resume later) does so explicitly — e.g. {@link _deleteChat}.
 	 * Never touching `_chatBackings` here keeps release/cold-resume uniform
 	 * for every concrete chat backing, since this operation does not encode
 	 * provider-specific persistence classes.
@@ -610,6 +793,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		@ICopilotApiService private readonly _copilotApiService: ICopilotApiService,
 		@IClaudeProxyService private readonly _claudeProxyService: IClaudeProxyService,
 		@IClaudeAgentSdkService private readonly _sdkService: IClaudeAgentSdkService,
+		@IClaudeBackingStore private readonly _backingStore: IClaudeBackingStore,
 		@IAgentSdkDownloader private readonly _agentSdkDownloader: IAgentSdkDownloader,
 		@IAgentHostSessionTitleSignal private readonly _sessionTitleSignal: IAgentHostSessionTitleSignal,
 		@IAgentHostOTelService private readonly _otelService: IAgentHostOTelService,
@@ -621,6 +805,8 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		@IAgentPluginManager private readonly _pluginManager: IAgentPluginManager,
 		@IProductService private readonly _productService: IProductService,
 		@INativeEnvironmentService private readonly _environmentService: INativeEnvironmentService,
+		@IByokLmBridgeRegistry private readonly _byokBridgeRegistry: IByokLmBridgeRegistry,
+		@INativeModelProviderProxyService private readonly _providerProxyService: INativeModelProviderProxyService,
 		@IFileService private readonly _fileService: IFileService,
 	) {
 		super();
@@ -652,13 +838,30 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		// reactive re-resolve — the next session simply reads it live.
 		queueMicrotask(() => { void this._startModelRefresh(); });
 
+		// Configured gateway Claude rows now reach the picker through the
+		// renderer BYOK catalog, so republish whenever a renderer bridge connects,
+		// disconnects, or reports a model change. The read is a cheap synchronous
+		// cache lookup; the registry owns enumeration.
+		this._register(this._byokBridgeRegistry.onDidChangeModels(() => this._refreshByokModels()));
+		this._refreshByokModels();
+
+		// Sign-out rides the root config bag exactly as Codex's does, with the key
+		// cleared as it is consumed so a later identical press still lands.
+		this._register(this._configurationService.onDidRootConfigChange(() => {
+			const signOutRequest = this._configurationService.getRootConfigValues?.()[CLAUDE_ACCOUNT_SIGN_OUT_REQUEST_KEY];
+			if (typeof signOutRequest === 'string' && signOutRequest !== this._lastSignOutRequest) {
+				this._lastSignOutRequest = signOutRequest;
+				this._configurationService.updateRootConfig({ [CLAUDE_ACCOUNT_SIGN_OUT_REQUEST_KEY]: undefined });
+				void this._signOutOfClaude();
+			}
+		}));
+
 		this._sdkSetupChannel = this._register(new AgentSdkSetupChannel({
 			id: this.id,
 			sdkPackage: ClaudeSdkPackage,
-			// Every Claude credential — subscription or `ANTHROPIC_API_KEY` — is
-			// established outside the app, and the SDK exposes no login control
-			// request, so the docs link is the only route this agent can offer.
-			setupInfo: { setupDocsUrl: CLAUDE_SETUP_DOCS_URL },
+			setupInfo: { setupDocsUrl: CLAUDE_SETUP_DOCS_URL, signInProviderName: 'Claude' },
+			signIn: token => launchClaudeOfficialLogin(this._agentSdkDownloader, token),
+			getAccountStatus: () => this._nativeAccountStatus,
 			isSdkLocal: () => this._sdkService.canLoadWithoutDownload(),
 			downloadSdk: () => this._sdkService.ensureAvailable(),
 			restartChatDiscovery: () => this._restartChatDiscovery(),
@@ -667,11 +870,28 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	}
 
 	/**
-	 * Publishes whether the SDK is on disk — and deliberately nothing about the
-	 * account, which the workbench derives from the model list (`ready` + zero
-	 * models → no account). Two wire sources for one truth could disagree.
+	 * Publishes SDK availability and the result of the same first-party account
+	 * check that gates native model publication.
 	 */
 	private readonly _sdkSetupChannel: AgentSdkSetupChannel;
+
+	/** Nonce of the last consumed sign-out request, so one press runs once. */
+	private _lastSignOutRequest: string | undefined;
+
+	/**
+	 * Run the CLI's own `claude auth logout`, then re-probe. Process exit is not
+	 * proof of anything — the account check inside the refresh is what settles
+	 * the published status, exactly as it does after a sign-in.
+	 */
+	private async _signOutOfClaude(): Promise<void> {
+		try {
+			this._logService.info('[Claude] Running the official sign-out at the user\'s request');
+			await launchClaudeOfficialLogout(this._agentSdkDownloader);
+		} catch (error) {
+			this._logService.error(error, '[Claude] Official sign-out process did not complete successfully');
+		}
+		await this._startModelRefresh();
+	}
 
 	/**
 	 * The fallback transport for a session whose model names no provider (model-less
@@ -683,14 +903,17 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	 */
 	private _defaultTransportMode(): ClaudeTransportMode {
 		const allowSignedOutWhenUsable = this._configurationService.getRootValue(agentHostCustomizationConfigSchema, AgentHostConfigKey.AllowSignedOutWhenUsable) === true;
-		return resolveClaudeTransportMode({ allowSignedOutWhenUsable, hasGitHubToken: this._proxyHandle !== undefined, hasExistingSetup: this._nativeAccountSetUp });
+		return resolveClaudeTransportMode({ allowSignedOutWhenUsable, hasGitHubToken: this._proxyHandle !== undefined, hasExistingSetup: this._hasUsableNativeSetup() });
 	}
 
 	/**
-	 * The SDK's last answer to {@link isClaudeAccountSetUp}, kept current by
-	 * {@link _refreshModels}. Starts `false`: unasked is not evidence of an account.
+	 * Whether native Claude can serve right now. This comes from a live SDK
+	 * account probe with provider environment and settings disabled.
 	 */
-	private _nativeAccountSetUp = false;
+	private _hasUsableNativeSetup(): boolean {
+		return this._configurationService.getRootValue(agentHostCustomizationConfigSchema, AgentHostConfigKey.AllowSignedOutWhenUsable) === true
+			&& this._nativeAccountStatus === 'signedIn';
+	}
 
 	// #region Descriptor + auth
 
@@ -711,11 +934,13 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	}
 
 	getProtectedResources(): ProtectedResourceMetadata[] {
-		// Always listed, always optional. Listing it is what lets the host forward a
-		// token to an already-signed-in user (matching ignores `required`); the
-		// unconditional `required: false` is what stops `resolveSignedOutWindowGate`
-		// walling off the whole Agents window before the user reaches a surface that
-		// could explain itself.
+		// Kept in the list but optional, never dropped. Fumie can run Claude on
+		// provider models without GitHub; an empty model catalog already makes the
+		// agent unavailable, so auth metadata must not race the first catalog push.
+		// `authenticateProtectedResources` matches on `resource` and ignores
+		// `required`, so advertising it is what lets the host silently forward a
+		// token to an already-signed-in user — and acquire the proxy handle
+		// Copilot-routed models need — without forcing sign-in on anyone else.
 		const copilotResource = this._gitHubEndpointService.getCopilotResource();
 		return [
 			{ ...copilotResource, required: false },
@@ -725,19 +950,27 @@ export class ClaudeAgent extends Disposable implements IAgent {
 
 	/**
 	 * Resolve the active {@link ClaudeTransport} for a session. The transport is
-	 * derived from `model` via {@link resolveClaudeSessionTransport}: a
-	 * native-Anthropic model routes native and a Copilot-routed model routes
-	 * proxy; a model-less or bare/legacy-id session follows the on-demand
-	 * {@link _defaultTransportMode}. In native mode the transport is always ready (the
-	 * SDK owns credentials); in proxied mode a started proxy handle is required,
-	 * otherwise {@link AHP_AUTH_REQUIRED} is thrown so the client can drive
-	 * Copilot sign-in.
+	 * derived from `model` via {@link resolveClaudeSessionTransport}: a BYOK model
+	 * routes through the BYOK loopback proxy, a native-Anthropic model routes
+	 * native and a Copilot-routed model routes proxy; a model-less or
+	 * bare/legacy-id session follows the on-demand {@link _defaultTransportMode}.
+	 * In native mode the transport is always ready (the SDK owns credentials); in
+	 * BYOK mode the shared loopback bind is started on demand; in proxied mode a
+	 * started proxy handle is required, otherwise {@link AHP_AUTH_REQUIRED} is
+	 * thrown so the client can drive Copilot sign-in.
 	 */
-	private _ensureAuthenticated(model?: ModelSelection): ClaudeTransport {
+	private async _ensureAuthenticated(model?: ModelSelection): Promise<ClaudeTransport> {
 		const transport = resolveClaudeSessionTransport({
 			model,
 			defaultMode: this._defaultTransportMode(),
 		});
+		if (transport === 'byok') {
+			// `resolveClaudeSessionTransport` only answers `byok` for a selection
+			// the same parse recognizes, so the vendor is always there.
+			const { vendor } = parseClaudeByokSelection(model)!;
+			const handle = await this._startProviderProxy();
+			return { kind: 'byok', vendor, baseUrl: handle.providerBaseUrl('messages'), nonce: handle.nonce };
+		}
 		if (transport !== 'proxy') {
 			return { kind: 'native' };
 		}
@@ -750,6 +983,14 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			);
 		}
 		return { kind: 'proxy', handle };
+	}
+
+	/** Lazily bind the wire-transparent provider proxy. */
+	private _startProviderProxy(): Promise<INativeModelProviderProxyHandle> {
+		if (!this._providerProxyHandle) {
+			this._providerProxyHandle = this._providerProxyService.start();
+		}
+		return this._providerProxyHandle;
 	}
 
 	async authenticate(resource: string, token: string): Promise<boolean> {
@@ -766,7 +1007,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			this._proxyHandle = undefined;
 			oldHandle?.dispose();
 			if (changed) {
-				this._models.set([], undefined);
+				this._setCatalogModels([]);
 				void this._startModelRefresh();
 			}
 			this._logService.info(changed ? '[Claude] Auth token cleared' : '[Claude] Auth token unchanged');
@@ -817,7 +1058,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 				staleHandle.dispose();
 				// Drop the superseded account's entitlements; the refresh below re-lists
 				// native-only (no handle) and republishes the protected resources.
-				this._models.set([], undefined);
+				this._setCatalogModels([]);
 			}
 			this._logService.warn('[Claude] Copilot proxy start failed; Copilot-routed models unavailable until the next sign-in', err);
 			void this._startModelRefresh();
@@ -842,10 +1083,59 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		// in — the GitHub session resolves before the Copilot default account does,
 		// so the welcome flow still believes it is signed out.
 		if (oldHandle) {
-			this._models.set([], undefined);
+			this._setCatalogModels([]);
 		}
 		void this._startModelRefresh();
 		return true;
+	}
+
+	/**
+	 * Replace the self-enumerated (proxy + native) half of the catalog and
+	 * republish. The renderer BYOK half is untouched: it is owned by
+	 * {@link _refreshByokModels} and must survive a sign-in/sign-out blank.
+	 */
+	private _setCatalogModels(models: readonly IAgentModelInfo[]): void {
+		this._catalogModels = models;
+		this._publishModels();
+	}
+
+	/**
+	 * Re-emit the merged subscription + BYOK list to the picker. A fresh array
+	 * is allocated each call so the observable always notifies its consumers.
+	 */
+	private _publishModels(): void {
+		this._models.set([...this._catalogModels, ...this._byokModels], undefined);
+	}
+
+	/**
+	 * (Re)publish the provider-compatible slice of the renderer BYOK catalog.
+	 * The provider owns ids, names, grouping and harness compatibility; this
+	 * consumer only projects those bridge fields.
+	 */
+	private _refreshByokModels(): void {
+		this._byokModels = this._byokBridgeRegistry.getModels()
+			.filter(model => !model.supportedHarnesses || model.supportedHarnesses.includes(this.id))
+			.map((m): IAgentModelInfo => {
+				const byokMeta = createAgentModelByokMeta(m.modelIdentifier, m.hidden);
+				const configSchema = createClaudeThinkingLevelSchema((m.supportedReasoningEfforts ?? []).filter(isClaudeEffortLevel));
+				return {
+					provider: this.id,
+					id: getByokLmAgentModelId(m),
+					// The vendor route (and any configured group in it) is ours: the
+					// loopback proxy rewrites the request body to the provider's own
+					// model id before it goes upstream, so that is the id the gateway
+					// serves and echoes back into the SDK's transcript.
+					underlyingModelId: m.id,
+					name: m.name ?? m.id,
+					maxContextWindow: m.maxContextWindowTokens,
+					...(m.maxOutputTokens !== undefined ? { maxOutputTokens: m.maxOutputTokens } : {}),
+					supportsVision: m.supportsVision ?? false,
+					...(configSchema ? { configSchema } : {}),
+					...(byokMeta && { _meta: byokMeta }),
+				};
+			});
+		this._logService.trace(`[Claude] BYOK models refreshed. Count: ${this._byokModels.length}`);
+		this._publishModels();
 	}
 
 	/**
@@ -864,16 +1154,23 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	/**
 	 * Unconditionally begins a refresh, superseding any in-flight one as the
 	 * coalescing target. The superseded request stays harmless: its own
-	 * stale-write guard drops the result if the token or transport moved on.
+	 * generation guard drops the result even when the GitHub token is unchanged.
 	 */
-	private _startModelRefresh(): Promise<void> {
-		const refresh = this._refreshModels().finally(() => {
+	private async _startModelRefresh(): Promise<void> {
+		const generation = ++this._modelRefreshGeneration;
+		const refresh = this._refreshModels(generation).finally(() => {
 			if (this._modelRefreshInFlight === refresh) {
 				this._modelRefreshInFlight = undefined;
 			}
 		});
 		this._modelRefreshInFlight = refresh;
-		return refresh;
+		await refresh;
+		// A caller that deliberately started a fresh check (notably setup after
+		// official login) must not finish against a generation superseded while it
+		// was awaiting. Follow the current tail until no newer check remains.
+		while (this._modelRefreshInFlight) {
+			await this._modelRefreshInFlight;
+		}
 	}
 
 	/**
@@ -882,9 +1179,12 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	 * optional — the proxy catalog needs a GitHub token, the native catalog needs the
 	 * SDK on disk — so a source we can't attempt contributes an empty list rather
 	 * than failing the whole refresh. {@link Promise.allSettled} tolerates one source
-	 * erroring; only when *every* source we attempted fails do we keep the last
-	 * known-good catalog instead of blanking, so a transient double failure never
-	 * wipes the picker.
+	 * erroring; if every attempted source fails, only independently authenticated
+	 * proxy rows from the last catalog survive.
+	 *
+	 * These are the *subscription* catalogs only. Gateway-backed models reach
+	 * the picker through the renderer BYOK bridge, so this agent holds no gateway
+	 * URL or credential of its own.
 	 *
 	 * Gating the native half on the SDK's own account report is deliberate and
 	 * load-bearing, not just an optimization. `supportedModels()` returns a *static*
@@ -895,38 +1195,41 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	 * reads downstream as "usable without GitHub" and would hold the Agents window
 	 * open on an agent that fails on its first turn. An empty catalog is the honest
 	 * signal: it surfaces as "no models" (`SessionTypeAuthRequirement.Unusable`)
-	 * rather than a sign-in prompt that would not help. The empty list is also what
-	 * the window reads account state *from*, so it must never be a guess.
+	 * rather than a sign-in prompt that would not help. The setup surface publishes
+	 * the same account probe separately so proxy or BYOK rows cannot impersonate it.
 	 *
 	 * The native attempt is skipped while the SDK is not on disk: asking it anything
 	 * costs a multi-hundred-megabyte download, and that download is the user's
 	 * explicit choice to make.
 	 */
-	private async _refreshModels(): Promise<void> {
+	private async _refreshModels(generation: number): Promise<void> {
 		const tokenAtStart = this._githubToken;
 		// True only for a dev override, a dev bare import, or an already-cached SDK.
 		const canAttemptNative = await this._sdkService.canLoadWithoutDownload();
-		if (!canAttemptNative) {
-			// No SDK, so no evidence of an account — say so rather than retaining a stale `true`.
-			this._nativeAccountSetUp = false;
-		}
+		const nativeModels = canAttemptNative ? this._fetchNativeModels() : Promise.resolve<IClaudeNativeModelCatalog | undefined>(undefined);
 		const [proxyOutcome, nativeOutcome] = await Promise.allSettled([
 			tokenAtStart ? this._fetchProxyModels(tokenAtStart) : Promise.resolve<readonly IAgentModelInfo[]>([]),
-			canAttemptNative ? this._fetchNativeModels() : Promise.resolve<readonly IAgentModelInfo[]>([]),
+			nativeModels,
 		]);
 		// Stale-write guard: a newer refresh superseded this one while we were
-		// awaiting — the proxy token rotated (sign-in / sign-out). A merged write
-		// here would clobber the catalog that newer refresh published.
-		if (this._githubToken !== tokenAtStart) {
+		// awaiting. This covers a native account transition even when the proxy
+		// token did not rotate.
+		if (generation !== this._modelRefreshGeneration || this._githubToken !== tokenAtStart) {
 			return;
 		}
+		this._nativeAccountStatus = !canAttemptNative
+			? 'unknown'
+			: nativeOutcome.status === 'rejected'
+				? 'error'
+				: nativeOutcome.value?.accountStatus ?? 'unknown';
 		const attempted = (tokenAtStart ? 1 : 0) + (canAttemptNative ? 1 : 0);
 		const failed = (proxyOutcome.status === 'rejected' ? 1 : 0) + (nativeOutcome.status === 'rejected' ? 1 : 0);
 		if (attempted > 0 && failed === attempted) {
-			// Every source we attempted failed — keep the last known-good catalog
-			// rather than blanking. Sources we didn't attempt resolve fulfilled-empty
-			// and are not counted as failures.
-			this._logService.error('[Claude] All attempted model sources failed (merged refresh); keeping last known-good catalog');
+			// A failed native account probe cannot keep advertising old Anthropic
+			// rows. Preserve only the last known proxy half; it has an independent
+			// credential and publication gate.
+			this._logService.error('[Claude] All attempted model sources failed (merged refresh); keeping last known-good proxy catalog only');
+			this._setCatalogModels(this._catalogModels.filter(model => readAgentModelGroupId(model) !== CLAUDE_PROVIDER_ANTHROPIC));
 		} else {
 			// Unwrap each settled fetch: its models on success, or an empty list on
 			// rejection (logged) so the other provider's catalog still publishes.
@@ -938,10 +1241,12 @@ export class ClaudeAgent extends Disposable implements IAgent {
 				return [];
 			};
 			const proxyModels = settledCatalog(proxyOutcome, 'proxy');
-			const nativeModels = settledCatalog(nativeOutcome, 'native');
-			const merged = mergeClaudeModelCatalogs(proxyModels, nativeModels);
+			const nativeCatalog = nativeOutcome.status === 'fulfilled'
+				? nativeOutcome.value?.models ?? []
+				: (this._logService.error(nativeOutcome.reason, '[Claude] Failed to fetch native models (merged refresh); keeping the other provider'), []);
+			const merged = mergeClaudeModelCatalogs(proxyModels, nativeCatalog);
 			this._logService.info(`[Claude] Models refreshed (merged). Count: ${merged.length}, ${merged.map(m => m.name).join(', ')}`);
-			this._models.set(merged, undefined);
+			this._setCatalogModels(merged);
 		}
 		// Last, never first: this is a free republish of "is the SDK on disk" (some
 		// other path may have fetched it), but announcing `ready` before the catalog
@@ -952,43 +1257,134 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	/**
 	 * Native (BYO-Anthropic) model source: enumerate the SDK's built-in /
 	 * subscription models by opening a throwaway {@link IClaudeAgentSdkService.query}
-	 * (workspace-free options that read the user's real `~/.claude` config) and
-	 * calling `Query.supportedModels()` on it, then `close()`. The prompt never
+	 * (workspace-free options rooted at Fumie's own Claude config dir, not the
+	 * user's `~/.claude`) and calling `Query.supportedModels()` on it, then
+	 * `close()`. The prompt never
 	 * yields, so no turn runs and no session transcript is written (verified
 	 * Phase 19 E2E). Projected with no commercial metadata, minus the SDK's
 	 * {@link isSdkDefaultModel} alias row.
 	 *
 	 * `accountInfo()` rides the *same* query, so asking is effectively free — and it
 	 * is the only honest source for "does this user have a Claude setup": a
-	 * `claude login` credential lives in the login keychain, where nothing on the
+	 * `claude auth login` credential lives in the login keychain, where nothing on the
 	 * filesystem can see it. When it says no, the catalog is published empty.
 	 */
-	private async _fetchNativeModels(): Promise<readonly IAgentModelInfo[]> {
+	private async _fetchNativeModels(): Promise<IClaudeNativeModelCatalog> {
 		// A prompt iterable that never yields: enumeration only needs the
 		// control-request channel (`Query.supportedModels()`), not a real turn.
 		const neverYieldingPrompt: AsyncIterable<SDKUserMessage> = {
 			[Symbol.asyncIterator]: () => ({ next: () => new Promise<IteratorResult<SDKUserMessage>>(() => { /* never resolves */ }) }),
 		};
-		const options = buildModelEnumerationOptions();
+		const options = buildModelEnumerationOptions(this._backingStore.subprocessConfigDir);
 		const query = await this._sdkService.query({ prompt: neverYieldingPrompt, options });
 		try {
-			const [account, models] = await Promise.all([query.accountInfo(), query.supportedModels()]);
+			// Usage is a separate, experimental control request. Its failure must
+			// never hide an otherwise valid account or model catalog.
+			const usage = Promise.resolve()
+				.then(() => query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET())
+				.catch(error => {
+					this._logService.warn('[Claude] Native usage snapshot unavailable; continuing without account limits', error);
+					return undefined;
+				});
+			const [account, models, usageSnapshot] = await Promise.all([query.accountInfo(), query.supportedModels(), usage]);
 			const setUp = isClaudeAccountSetUp(account);
-			this._nativeAccountSetUp = setUp;
 			// Origin only — never the credential itself.
-			this._logService.info(`[Claude] Native account check: setUp=${setUp}, provider=${account.apiProvider ?? 'none'}, tokenSource=${account.tokenSource ?? 'absent'}, apiKeySource=${account.apiKeySource ?? 'absent'}`);
+			this._logService.info(`[Claude] Native account check: setUp=${setUp}, provider=${account.apiProvider ?? 'none'}, subscription=${account.subscriptionType ?? 'absent'}, tokenSource=${account.tokenSource ?? 'absent'}, apiKeySource=${account.apiKeySource ?? 'absent'}`);
 			if (!setUp) {
-				return [];
+				this._publishAccountInfo({ status: 'signedOut' });
+				return { accountStatus: 'signedOut', models: [] };
 			}
-			return models
-				.filter(m => !isSdkDefaultModel(m))
-				.map(m => fromSdkModelInfo(m, this.id));
+			const rateLimits = claudeRateLimitsFromUsage(usageSnapshot, message => this._logService.trace(message));
+			// The whole usage chain is otherwise silent, so an account panel with no
+			// usage rows is indistinguishable from an SDK that reported none. Name
+			// the gate and the window keys the snapshot actually carried; the values
+			// themselves show up in the panel.
+			this._logService.info(`[Claude] Native usage snapshot: rate_limits_available=${usageSnapshot?.rate_limits_available ?? 'absent'}, windows=${describeClaudeUsageWindows(usageSnapshot)}, published=${rateLimits ? Object.keys(rateLimits).join('+') : 'none'}`);
+			this._publishAccountInfo({
+				status: 'signedIn',
+				email: account.email,
+				organization: account.organization,
+				subscriptionType: account.subscriptionType,
+				...(rateLimits ? { rateLimits } : {}),
+			});
+			const sdkModels = models.filter(m => !isSdkDefaultModel(m));
+			if (sdkModels.length === 0) {
+				throw new Error('Claude first-party account returned no concrete models');
+			}
+			// One read serves both halves: the registry names and sizes the SDK's own
+			// alias rows, and supplies the previous-generation rows `supportedModels()`
+			// never lists.
+			const registryModels = await this._readCliModelRegistry();
+			// SDK rows first: they are the account's own answer and carry the
+			// alias/effort metadata. The registry only fills in the previous-
+			// generation models `supportedModels()` never lists.
+			const concreteModels = sdkModels.map(m => fromSdkModelInfo(m, this.id, this._logService, registryModels));
+			return { accountStatus: 'signedIn', models: [...concreteModels, ...this._cliRegistryAdditions(registryModels, models)] };
 		} finally {
 			// `close()` terminates the subprocess; aborting the controller is a
 			// belt-and-suspenders teardown for anything `close()` leaves pending.
 			query.close();
 			options.abortController?.abort();
 		}
+	}
+
+	/**
+	 * The model catalog baked into the SDK's own Claude Code executable (see
+	 * `claudeCliModelRegistry.ts` for why the binary is the source and how it is
+	 * parsed), or `undefined` when it cannot be read.
+	 *
+	 * Purely additive and never load-bearing: any failure — no SDK on disk, a
+	 * binary whose layout we no longer recognize — leaves the SDK-only catalog
+	 * exactly as it was, names and limits included. Reached only after a
+	 * `canLoadWithoutDownload()` gate, so resolving the executable cannot trigger
+	 * a download.
+	 */
+	private async _readCliModelRegistry(): Promise<readonly IClaudeCliRegistryModel[] | undefined> {
+		let registryModels: readonly IClaudeCliRegistryModel[] | undefined;
+		try {
+			const executable = await resolveClaudeCliExecutable(this._agentSdkDownloader);
+			registryModels = (await readClaudeCliModelRegistry(executable))?.models;
+		} catch (error) {
+			this._logService.warn('[Claude] CLI model registry unavailable; publishing SDK models only', error);
+			return undefined;
+		}
+		if (!registryModels) {
+			this._logService.warn('[Claude] CLI model registry not recognized in the bundled executable; publishing SDK models only');
+			return undefined;
+		}
+		return registryModels;
+	}
+
+	/** The previous-generation Anthropic rows `Query.supportedModels()` omits, as catalog entries. */
+	private _cliRegistryAdditions(registryModels: readonly IClaudeCliRegistryModel[] | undefined, sdkModels: readonly ModelInfo[]): readonly IAgentModelInfo[] {
+		if (!registryModels) {
+			return [];
+		}
+		const additions = claudeRegistryModelsNotInSdkCatalog(registryModels, sdkModels)
+			.map(m => fromClaudeCliRegistryModel(m, this.id));
+		this._logService.info(`[Claude] CLI model registry: ${registryModels.length} models, ${additions.length} added beyond the SDK catalog${additions.length ? ` (${additions.map(m => m.name).join(', ')})` : ''}`);
+		return additions;
+	}
+
+	/**
+	 * Mirror the probed first-party login into the AHP root state so the
+	 * renderer account chrome can show it (same transient-value channel Codex
+	 * uses for its ChatGPT account).
+	 */
+	private _publishAccountInfo(account: IClaudeAccountInfo): void {
+		this._publishedAccountInfo = account;
+		this._configurationService.publishRootTransientValues?.({ [CLAUDE_ACCOUNT_META_KEY]: account });
+	}
+
+	private _updatePublishedRateLimits(info: SDKRateLimitInfo): void {
+		if (this._publishedAccountInfo.status !== 'signedIn') {
+			return;
+		}
+		const rateLimits = mergeClaudeRateLimitEvent(this._publishedAccountInfo.rateLimits, info);
+		if (rateLimits === this._publishedAccountInfo.rateLimits) {
+			return;
+		}
+		this._publishAccountInfo({ ...this._publishedAccountInfo, rateLimits });
 	}
 
 	/**
@@ -1079,7 +1475,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 				return;
 			}
 
-			const messages = await this._sdkService.getSessionMessages(sdkSessionId, { includeSystemMessages: true });
+			const messages = await this._sdkService.getSessionMessages(sdkSessionId, { includeSystemMessages: true, ...this._routing(sdkSessionId) });
 			const anchor = resolveForkAnchorUuid(messages, turnId);
 			if (anchor === undefined) {
 				throw new Error(`Cannot truncate session ${sdkSessionId}: turn ${turnId} not found in transcript`);
@@ -1110,14 +1506,14 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	 * serializes on {@link _sessionSequencer}.
 	 */
 	private async _removeAllTurns(context: IResolvedClaudeChatContext, sdkSessionId: string, existing: ClaudeAgentSession | undefined): Promise<void> {
-		const info = existing ? undefined : await this._sdkService.getSessionInfo(sdkSessionId);
+		const info = existing ? undefined : await this._sdkService.getSessionInfo(sdkSessionId, this._routing(sdkSessionId));
 		const workingDirectories = existing?.workingDirectories
 			?? (info?.cwd ? [URI.file(info.cwd)] : undefined);
 		await existing?.shutdownLiveQuery();
 		if (existing) {
 			this._deleteSession(existing);
 		}
-		await this._sdkService.deleteSession(sdkSessionId);
+		await this._sdkService.deleteSession(sdkSessionId, this._routing(sdkSessionId));
 		const fresh = await this._createProvisionalChatSession(context.configurationResource, context.chat, context.resource, workingDirectories);
 		await fresh.pruneAllTurns(context.resource);
 		this._logService.info(`[Claude:${sdkSessionId}] truncateChat removed all turns (deleteSession + fresh same-id)`);
@@ -1148,7 +1544,9 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	readonly chats: IAgentChats = {
 		createChat: (chat, context, options) =>
 			this._createChat(chat, resolveAgentChatContext(context, chat), options),
-		disposeChat: (chat, context) => this._disposeChat(chat, context),
+		deleteChat: (chat, context, providerData) => this._deleteChat(chat, context, providerData),
+		disposeChat: (chat, context) => this._deleteChat(chat, context),
+		canReleaseChat: (chat, context) => this._canReleaseChat(chat, context),
 		releaseChat: (chat, context) => this._releaseChat(chat, context),
 		sendMessage: (chatUri, prompt, workingDirectoriesOrDirectory, attachments, turnId, senderClientId, clientTypeOrContext, context) => {
 			const workingDirectories = Array.isArray(workingDirectoriesOrDirectory) ? workingDirectoriesOrDirectory : workingDirectoriesOrDirectory ? [workingDirectoriesOrDirectory] : undefined;
@@ -1238,7 +1636,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		// value: the agent owns transport resolution (it holds the live proxy
 		// handle), the session just consumes it. A later per-session provider
 		// switch is pushed in separately at send time (see `hasPendingTransportSwitch`).
-		const transport = this._ensureAuthenticated(session.provisionalModel);
+		const transport = await this._ensureAuthenticated(session.provisionalModel);
 
 		const canUseTool = this._makeCanUseTool(sessionId, context.configurationResource);
 		const onElicitation = this._makeOnElicitation(sessionId);
@@ -1260,9 +1658,19 @@ export class ClaudeAgent extends Disposable implements IAgent {
 				throw new CancellationError();
 			}
 		} catch (err) {
+			if (!session.isPipelineReady && session.abortController.signal.aborted) {
+				// Startup never committed. Retain its placement/configuration for
+				// the next send; neither a transcript nor an overlay may exist yet.
+				throw new CancellationError();
+			}
 			this._deleteSession(session);
 			throw err;
 		}
+
+		// The conversation now has a real directory — the one `createChat`
+		// could not know for a worktree-isolated session. Correct its receipt
+		// before anything else reads it back.
+		this._restampBackingProjectDir(context.chat, session);
 
 		// Emit the full resolved set (index 0 = process root, 1..N = additional
 		// roots). Falls back to the session's own ordered set when the host
@@ -1283,7 +1691,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		return session;
 	}
 
-	private async _persistSessionOverlay(resource: URI, configResource: URI, session: ClaudeAgentSession, transportKind: ClaudeTransport['kind']): Promise<void> {
+	private async _persistSessionOverlay(resource: URI, configResource: URI, session: ClaudeAgentSession, transportKind?: ClaudeTransport['kind']): Promise<void> {
 		try {
 			await this._metadataStore.write(resource, {
 				customizationDirectory: session.workingDirectory,
@@ -1294,20 +1702,20 @@ export class ClaudeAgent extends Disposable implements IAgent {
 				...(session.provisionalAgent ? { agent: session.provisionalAgent } : {}),
 			});
 		} catch (err) {
-			this._logService.error(`[Claude] Failed to persist customization directory; aborting materialize`, err);
+			this._logService.error(`[Claude] Failed to persist session overlay`, err);
 			throw err;
 		}
 	}
 
 	/**
-	 * Pull `permissionMode` out of the post-validation `IAgentCreateChatOptions.config`
-	 * bag, narrowing the runtime `unknown` value to the SDK's `PermissionMode`
-	 * union (5/6 values, excluding `dontAsk`; sdk.d.ts:1560). Falls back to
-	 * `'default'` when the bag is absent or carries something the schema
-	 * validator shouldn't have accepted (defense-in-depth).
+	 * Pull the approval tier out of the post-validation
+	 * `IAgentCreateChatOptions.config` bag and map it onto the SDK's
+	 * `PermissionMode` union (5/6 values, excluding `dontAsk`; sdk.d.ts:1560).
+	 * Falls back to `'default'` when the bag is absent or carries something the
+	 * schema validator shouldn't have accepted (defense-in-depth).
 	 */
 	private _resolvePermissionMode(config: Record<string, unknown> | undefined): ClaudePermissionMode {
-		return narrowClaudePermissionMode(config?.[ClaudeSessionConfigKey.PermissionMode]) ?? 'default';
+		return claudePermissionModeFromValues(config) ?? 'default';
 	}
 
 	private async _disposeLiveSession(session: ClaudeAgentSession): Promise<void> {
@@ -1351,7 +1759,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		const model = options?.importConversation?.model ?? options?.model;
 		// An inherited model is resolved from the source conversation at materialization.
 		if (model || (!options?.fork && !options?.sideChat)) {
-			this._ensureAuthenticated(model);
+			await this._ensureAuthenticated(model);
 		}
 		const chatKey = chat.toString();
 		// Record this chat's own scope now — the only place a later fork
@@ -1497,7 +1905,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		const backingModel = sourceChat ? this._chatBackings.get(sourceChat.toString())?.model : undefined;
 		const inheritedModel = model ?? liveSource?.provisionalModel ?? sourceOverlay.model ?? backingModel;
 		const agent = options?.agent ?? liveSource?.provisionalAgent ?? sourceOverlay.agent;
-		const permissionMode = narrowClaudePermissionMode(options?.config?.[ClaudeSessionConfigKey.PermissionMode]) ?? liveSource?.permissionModeFallback ?? sourceOverlay.permissionMode;
+		const permissionMode = claudePermissionModeFromValues(options?.config) ?? liveSource?.permissionModeFallback ?? sourceOverlay.permissionMode;
 
 		// Resolve the inherited conversation's working directories now so we
 		// fail fast rather than at the first `sendMessage`. The forked
@@ -1505,7 +1913,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		// from the live source or, when the source is unloaded, its overlay.
 		// The requested set is the last resort — an inherited conversation runs
 		// where its transcript was recorded, not where the request pointed.
-		const sdkInfo = await this._sdkService.getSessionInfo(sdkSessionId);
+		const sdkInfo = await this._sdkService.getSessionInfo(sdkSessionId, this._routing(sdkSessionId));
 		const inheritedDirectories = liveSource?.workingDirectories ?? sourceOverlay.workingDirectories ?? options?.workingDirectories;
 		const workingDirectory = sdkInfo?.cwd ? URI.file(sdkInfo.cwd) : inheritedDirectories?.[0];
 		if (!workingDirectory) {
@@ -1524,7 +1932,12 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			workingDirectories,
 		});
 		const project = await this._resolveProject(workingDirectory);
-		const backing = this._recordChatBacking(chat, { sdkSessionId, ...(inheritedModel ? { model: inheritedModel } : {}), ...(sideChat ? { sideChat } : {}) });
+		const backing = this._recordChatBacking(chat, {
+			sdkSessionId,
+			...(inheritedModel ? { model: inheritedModel } : {}),
+			...(sideChat ? { sideChat } : {}),
+			storage: this._backingStore.newBackingStorage(workingDirectory.fsPath),
+		});
 		this._logService.info(`[Claude] Bound chat ${chat.toString()} to inherited conversation ${sdkSessionId} for scope ${context.configurationResource.toString()}`);
 		return {
 			resolvedWorkingDirectory: workingDirectory,
@@ -1564,7 +1977,12 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		// Only probe for a project when AH resolved a real folder; a scratch dir
 		// is never a code project.
 		const project = requestedWorkingDirectory ? await this._resolveProject(requestedWorkingDirectory) : undefined;
-		const backing = this._recordChatBacking(chat, { sdkSessionId, ...(model ? { model } : {}), ...(sideChat ? { sideChat } : {}) });
+		const backing = this._recordChatBacking(chat, {
+			sdkSessionId,
+			...(model ? { model } : {}),
+			...(sideChat ? { sideChat } : {}),
+			storage: this._backingStore.newBackingStorage(workingDirectory.fsPath),
+		});
 		const session = ClaudeAgentSession.createProvisional(
 			sdkSessionId,
 			chat,
@@ -1589,9 +2007,109 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	}
 
 	/** Record a chat's exact backing, replacing any previous one. */
+	/**
+	 * Address the store that actually holds a chat's transcript.
+	 *
+	 * A chat Fumie created after the store split carries a `fumie-store-v1`
+	 * receipt and lives in Fumie's own namespace; an older one resolves against
+	 * the process-level root, which is the user's native store. Passing the
+	 * routing explicitly at every read is what lets both remain reachable
+	 * without ever flipping `$CLAUDE_CONFIG_DIR` under a concurrent call.
+	 */
+	private _routing(sdkSessionId: string): IClaudeStoreRouting {
+		for (const backing of this._chatBackings.values()) {
+			if (backing.sdkSessionId === sdkSessionId) {
+				return this._backingStore.routing(backing.storage);
+			}
+		}
+		// No receipt in hand. Fumie's store is the only one Fumie writes to, so
+		// it is also the only safe guess: guessing native instead would send a
+		// read of our own transcript into the user's store — the exact crossing
+		// this split exists to make impossible. A genuine legacy chat always
+		// arrives with its decoded receipt (see `_restoreChatBacking`).
+		return { sessionStore: this._backingStore.fumieStore };
+	}
+
 	private _recordChatBacking(chat: URI, backing: IClaudeChatBacking): IClaudeChatBacking {
 		this._chatBackings.set(chat.toString(), backing);
 		return backing;
+	}
+
+	/**
+	 * A receipt's storage with a stale project directory corrected from the
+	 * chat's own overlay.
+	 *
+	 * `createChat` has to name a project directory before the host has
+	 * resolved one. A worktree-isolated session only learns where it runs at
+	 * its first send, so the receipt {@link _bindFreshConversation} mints
+	 * carries the folder the user picked instead of the isolated worktree.
+	 * Both Claude stores are addressed by a project key the SDK derives from
+	 * that directory, so a stale one scopes every later lookup to a project
+	 * that has never held this transcript. That is a permanent miss, not a
+	 * slow one: the session reports itself undescribable on every open, and
+	 * no retry can change the answer.
+	 *
+	 * The overlay records the directory materialize actually ran in (see
+	 * {@link _persistSessionOverlay}), which is the same cwd the SDK derived
+	 * the project key from, so it is the authority whenever the two disagree.
+	 *
+	 * Only ever corrects a directory the receipt already carries. A receipt
+	 * without one deliberately searches every project (see
+	 * `GetSessionInfoOptions.dir` in `sdk.d.ts`), and narrowing that to a
+	 * single directory could only lose transcripts. Best-effort: an
+	 * unreadable overlay leaves the receipt exactly as recorded.
+	 */
+	private async _correctedBackingStorage(resource: URI, storage: ClaudeChatBackingStorage): Promise<ClaudeChatBackingStorage> {
+		if (!storage.projectDir) {
+			return storage;
+		}
+		let overlay: IClaudeSessionOverlay = {};
+		try {
+			overlay = await this._metadataStore.read(resource);
+		} catch (err) {
+			this._logService.warn(`[Claude] overlay read failed while checking the backing project of ${resource.toString()}; using the receipt as recorded`, err);
+			return storage;
+		}
+		const ran = overlay.workingDirectories?.[0]?.fsPath;
+		if (!ran || ran === storage.projectDir) {
+			return storage;
+		}
+		this._logService.info(`[Claude] backing receipt for ${resource.toString()} names project ${storage.projectDir}, but the session ran in ${ran}; reading by the latter`);
+		return storage.kind === 'fumie-store-v1'
+			? { kind: 'fumie-store-v1', projectDir: ran }
+			: { kind: 'legacy-local-v0', projectDir: ran };
+	}
+
+	/**
+	 * Re-stamp a chat's durable receipt with the directory its conversation is
+	 * actually running in.
+	 *
+	 * Materialize is the first moment a worktree-isolated session's real
+	 * directory exists, so it is the first moment its receipt can be right.
+	 * Correcting it here — and letting the host persist it through
+	 * {@link onDidChangeChatData} — is what stops every later cold open from
+	 * depending on {@link _correctedBackingStorage} to repair the same receipt
+	 * again.
+	 *
+	 * Corrects only a directory the receipt already carries, for the same
+	 * reason as {@link _correctedBackingStorage}.
+	 */
+	private _restampBackingProjectDir(chat: URI, session: ClaudeAgentSession): void {
+		const existing = this._chatBackings.get(chat.toString());
+		const storage = existing?.storage;
+		const ran = session.workingDirectory?.fsPath;
+		if (!existing || !storage?.projectDir || !ran || storage.projectDir === ran) {
+			return;
+		}
+		const updated: IClaudeChatBacking = {
+			...existing,
+			storage: storage.kind === 'fumie-store-v1'
+				? { kind: 'fumie-store-v1', projectDir: ran }
+				: { kind: 'legacy-local-v0', projectDir: ran },
+		};
+		this._chatBackings.set(chat.toString(), updated);
+		this._logService.info(`[Claude] chat ${chat.toString()} materialized in ${ran}; its receipt named ${storage.projectDir}, re-stamping it`);
+		this._onDidChangeChatData.fire({ chat, providerData: encodeClaudeChatBacking(_toPersistedChat(updated)) });
 	}
 
 	/** Best-effort git project metadata for a resolved working directory. */
@@ -1605,8 +2123,8 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	}
 
 	/**
-	 * Dispose exactly one chat, tearing down its live SDK session (if any) and
-	 * dropping its backing.
+	 * Permanently delete exactly one chat's SDK session. A cold delete recovers
+	 * only the opaque backing receipt; it never resumes the transcript.
 	 *
 	 * Routed through {@link _sessionSequencer} (keyed on the chat's SDK id) so
 	 * it waits for any in-flight {@link _resolveOrResumeChatSessionLocked} or
@@ -1618,22 +2136,66 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	 * own `resource` (the configuration scope, for a session's primary chat)
 	 * is released right here, once, when that exact chat is disposed.
 	 */
-	private async _disposeChat(chat: URI, operationContext: URI | IAgentChatContext): Promise<void> {
+	private async _deleteChat(chat: URI, operationContext?: URI | IAgentChatContext, providerData?: string): Promise<void> {
 		const chatKey = chat.toString();
-		const initialContext = this._resolveChatContext(chat, operationContext);
+		if (!this._chatBackings.has(chatKey) && providerData !== undefined) {
+			const persisted = decodeClaudeChatBacking(providerData);
+			if (!persisted) {
+				throw new Error(`Cannot delete Claude chat ${chatKey}: invalid provider backing receipt`);
+			}
+			// Preserve this recovered receipt when native deletion fails so the
+			// durable Host transaction can retry the exact SDK session.
+			this._chatBackings.set(chatKey, {
+				sdkSessionId: persisted.sdkSessionId,
+				...(persisted.model ? { model: persisted.model } : {}),
+				...(persisted.sideChat ? { sideChat: persisted.sideChat } : {}),
+				storage: persisted.storage,
+			});
+		}
+		const initialContext = this._resolveChatContext(chat, this._requireChatContext(chat, operationContext, 'deleteChat'));
 		await this._sessionSequencer.queue(initialContext.sequencerKey, async () => {
+			const backing = this._chatBackings.get(chatKey);
 			const target = this._findChatByUri(chatKey);
 			if (target) {
-				await this._disposeLiveSession(target);
+				await target.shutdownLiveQuery();
+				this._deleteSession(target);
+			}
+			if (backing?.sdkSessionId) {
+				await this._sdkService.deleteSession(backing.sdkSessionId, this._backingStore.routing(backing.storage));
 			}
 			this._chatBackings.delete(chatKey);
 			this._chatConfigScopes.delete(chatKey);
 			this._pruneActiveClientHandlesForChat(chat);
 			this._otelService.releaseSessionTraceContext(initialContext.resource.toString());
 		});
-		// The Claude SDK exposes no delete-chat RPC, so the forked /
-		// fresh transcript is left on disk; without a catalog entry it is never
-		// resumed again.
+	}
+
+	/**
+	 * Idle-release veto ({@link IAgentChats.canReleaseChat}). Answers the
+	 * host's generic "may I evict this?" question with Claude's runtime truth,
+	 * so the decision is made *before* Agent Host drops cached session state —
+	 * the release path itself can only decline after that point.
+	 *
+	 * A background subagent runs in-process inside this chat's CLI subprocess,
+	 * so releasing the chat aborts the subprocess and kills it outright (its
+	 * `system.task_notification` can then never arrive — the "running when the
+	 * previous Claude Code process exited" case). Declining here re-arms the
+	 * caller's release grace timer. The SDK's live task state, not elapsed
+	 * task age, determines when it is safe to release.
+	 */
+	private async _canReleaseChat(chat: URI, _operationContext: URI | IAgentChatContext): Promise<boolean> {
+		const target = this._findChatByUri(chat.toString());
+		if (!target || !target.isPipelineReady) {
+			return true;
+		}
+		if (target.hasActiveTurn) {
+			return false;
+		}
+		if (target.hasOpenBackgroundSubagents) {
+			this._logService.info(`[Claude:${target.sessionId}] Deferring idle release while a background subagent is running`);
+			return false;
+		}
+		return true;
 	}
 
 	private async _releaseChat(chat: URI, operationContext: URI | IAgentChatContext): Promise<void> {
@@ -1641,8 +2203,21 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		const initialContext = this._resolveChatContext(chat, operationContext);
 		await this._sessionSequencer.queue(initialContext.sequencerKey, async () => {
 			const target = this._findChatByUri(chatKey);
-			if (!target || !target.isPipelineReady || target.hasActiveTurn) {
+			// `hasOpenBackgroundSubagents` is the second half of the liveness
+			// signal `hasActiveTurn` misses: the prompt queue drains at the end
+			// of the user's turn while background subagents keep running inside
+			// the same subprocess, and `_disposeLiveSession` below aborts it.
+			// Re-checked here (not just in `_canReleaseChat`) because a spawn
+			// can be backgrounded while this call waits on the sequencer, and
+			// because `releaseChat` has callers that never consult the veto.
+			if (!target || (target.isPipelineReady && (target.hasActiveTurn || target.hasOpenBackgroundSubagents))) {
 				return;
+			}
+			if (!target.isPipelineReady) {
+				// A stopped startup still owns watchers, but may have no SDK
+				// transcript. Save its placement before releasing those resources;
+				// a failed write must leave the provisional available for retry.
+				await this._persistSessionOverlay(initialContext.resource, initialContext.configurationResource, target);
 			}
 			this._logService.info(`[Claude:${target.sessionId}] Releasing idle chat from memory (durable state preserved)`);
 			await this._disposeLiveSession(target);
@@ -1669,13 +2244,13 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			this._logService.warn(`[Claude] createChat fork: source ${fork.source.toString()} has no SDK chat; creating fresh chat`);
 			return undefined;
 		}
-		const messages = await this._sdkService.getSessionMessages(sourceSdkId, { includeSystemMessages: true });
+		const messages = await this._sdkService.getSessionMessages(sourceSdkId, { includeSystemMessages: true, ...this._routing(sourceSdkId) });
 		const upToMessageId = resolveForkAnchorUuid(messages, fork.turnId);
 		if (upToMessageId === undefined) {
 			this._logService.warn(`[Claude] createChat fork: turn ${fork.turnId} not found in source ${sourceSdkId}; creating fresh chat`);
 			return undefined;
 		}
-		const { sessionId } = await this._sdkService.forkSession(sourceSdkId, { upToMessageId });
+		const { sessionId } = await this._sdkService.forkSession(sourceSdkId, { upToMessageId, ...this._routing(sourceSdkId) });
 		const anchorIndex = messages.findIndex(message => message.uuid === upToMessageId);
 		const inheritedTurns = mapSessionMessagesToTurns(messages.slice(0, anchorIndex + 1), fork.source, this._logService);
 		return { sessionId, inheritedTurnId: inheritedTurns.at(-1)?.id };
@@ -1706,7 +2281,13 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		if (!sourceSdkId) {
 			return undefined;
 		}
-		const turns = await this._reconstructTurns(sourceSdkId, source, undefined);
+		let turns: readonly Turn[];
+		try {
+			turns = await this._reconstructTurns(sourceSdkId, source, undefined);
+		} catch (err) {
+			this._logService.info(`[Claude] createChat side chat: source ${source.toString()} (sdk ${sourceSdkId}) transcript could not be read`, err);
+			return undefined;
+		}
 		if (turns.length === 0) {
 			this._logService.info(`[Claude] createChat side chat: source ${source.toString()} (sdk ${sourceSdkId}) has no readable transcript to bound context from`);
 			return undefined;
@@ -1731,12 +2312,12 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		const chatSession = existing ?? await this._createProvisionalChatSession(configurationResource, chat, resource, workingDirectories);
 		// Resume when the SDK already has a transcript for this chat
 		// (forked or restored); otherwise materialize a fresh one.
-		const sdkInfo = await this._sdkService.getSessionInfo(chatSession.sessionId);
+		const sdkInfo = await this._sdkService.getSessionInfo(chatSession.sessionId, this._routing(chatSession.sessionId));
 		// Fail fast on a signed-out proxy before materializing, keeping the throw at
 		// this pre-`try` site so the freshly-built chat is left registered for a
 		// retry rather than disposed. The resolved transport is passed into materialize
 		// as a value; a per-session provider switch is pushed in later at send time.
-		const transport = this._ensureAuthenticated(chatSession.provisionalModel);
+		const transport = await this._ensureAuthenticated(chatSession.provisionalModel);
 		const canUseTool = this._makeCanUseTool(chatSession.sessionId, configurationResource);
 		const onElicitation = this._makeOnElicitation(chatSession.sessionId);
 		this._recordChatScope(chat, configurationResource, resource);
@@ -1754,9 +2335,13 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			});
 			await this._persistSessionOverlay(resource, configurationResource, chatSession, transport.kind);
 		} catch (err) {
+			if (!chatSession.isPipelineReady && chatSession.abortController.signal.aborted) {
+				throw new CancellationError();
+			}
 			this._deleteLiveChat(chatKey);
 			throw err;
 		}
+		this._restampBackingProjectDir(chat, chatSession);
 		this._onDidMaterializeChat.fire({
 			chat: context.chat,
 			project: chatSession.project,
@@ -1801,7 +2386,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		} catch (err) {
 			this._logService.warn(`[Claude] chat overlay read failed for ${chat.toString()}; continuing with defaults`, err);
 		}
-		const sdkInfo = await this._sdkService.getSessionInfo(info.sdkSessionId);
+		const sdkInfo = await this._sdkService.getSessionInfo(info.sdkSessionId, this._backingStore.routing(info.storage));
 		// `fallbackWorkingDirectories` is only supplied by remove-all, which
 		// captures the set before deleting the SDK transcript that would
 		// otherwise answer for it.
@@ -1881,7 +2466,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		}
 		const updated: IClaudeChatBacking = { ...existing, model };
 		this._chatBackings.set(chat.toString(), updated);
-		this._onDidChangeChatData.fire({ chat, providerData: encodeProviderData(_toPersistedChat(updated)) });
+		this._onDidChangeChatData.fire({ chat, providerData: encodeClaudeChatBacking(_toPersistedChat(updated)) });
 	}
 
 	/**
@@ -1901,14 +2486,25 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			}
 			const backing = { sdkSessionId: AgentSession.id(resolved.configurationResource) };
 			this._chatBackings.set(chat.toString(), backing);
-			return { providerData: encodeProviderData(_toPersistedChat(backing)) };
+			return { providerData: encodeClaudeChatBacking(_toPersistedChat(backing)) };
 		}
-		const persisted = decodeProviderData(providerData);
+		const persisted = decodeClaudeChatBacking(providerData);
 		if (!persisted) {
-			this._logService.warn(`[Claude] materializeChat: dropping corrupt providerData for ${chat.toString()}`);
-			return;
+			// Returning without a backing leaves a chat that reads as empty and
+			// then fails on its first send; the receipt is durable, so the next
+			// attempt decodes exactly as badly.
+			throw new Error(`[Claude] materializeChat: unreadable backing receipt for ${chat.toString()}`);
 		}
-		this._chatBackings.set(chat.toString(), { sdkSessionId: persisted.sdkSessionId, ...(persisted.model ? { model: persisted.model } : {}), ...(persisted.sideChat ? { sideChat: persisted.sideChat } : {}) });
+		// Repairing the receipt here — not only in `getChatMetadata` — is what
+		// makes every downstream `_routing()` consumer (transcript reads,
+		// truncation, delete) address the same project the session actually
+		// ran in. Without it a repaired session opens but comes back empty.
+		this._chatBackings.set(chat.toString(), {
+			sdkSessionId: persisted.sdkSessionId,
+			...(persisted.model ? { model: persisted.model } : {}),
+			...(persisted.sideChat ? { sideChat: persisted.sideChat } : {}),
+			storage: await this._correctedBackingStorage(resolved.resource, persisted.storage),
+		});
 	}
 
 	/**
@@ -1936,7 +2532,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		const backing = this._chatBackings.get(chatKey) ?? { sdkSessionId: AgentSession.id(configurationResource) };
 		this._chatBackings.set(chatKey, backing);
 		this._recordChatScope(chat, configurationResource, resource);
-		return { providerData: encodeProviderData(_toPersistedChat(backing)) };
+		return { providerData: encodeClaudeChatBacking(_toPersistedChat(backing)) };
 	}
 
 	private async _getChatMessages(chat: URI, context: URI | IAgentChatContext): Promise<readonly Turn[]> {
@@ -1952,37 +2548,77 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	 * surface (`IAgent`) does not include it.
 	 */
 	getSessionForTesting(session: URI): ClaudeAgentSession | undefined {
-		const sess = this._findChatByUri(URI.parse(buildDefaultChatUri(session))) ?? this._findAnySession(AgentSession.id(session));
+		return this._findLiveDefaultChat(session);
+	}
+
+	/**
+	 * The session-scoped runtime for `session`'s default chat, but only once its
+	 * SDK subprocess is actually running. A provisional session (created but
+	 * never materialized) resolves to `undefined`: it has no live control plane
+	 * to talk to.
+	 */
+	private _findLiveDefaultChat(session: URI): ClaudeAgentSession | undefined {
+		const sess = this._findDefaultChat(session);
 		return sess?.isPipelineReady ? sess : undefined;
 	}
 
+	/**
+	 * The session-scoped runtime for `session`'s default chat, live or still
+	 * provisional. `undefined` only when the session has no runtime object at all.
+	 */
+	private _findDefaultChat(session: URI): ClaudeAgentSession | undefined {
+		return this._findChatByUri(URI.parse(buildDefaultChatUri(session))) ?? this._findAnySession(AgentSession.id(session));
+	}
+
+	/**
+	 * Like {@link _findLiveDefaultChat}, but waits out an in-flight materialize
+	 * instead of reporting the provisional session as absent — the first send
+	 * brings the very subprocess the caller wants to talk to. Bounded by `token`
+	 * (the caller owns the budget); `undefined` when the session has no runtime,
+	 * when its materialize failed or was torn down, or when the wait was cut short.
+	 */
+	private async _awaitLiveDefaultChat(session: URI, token: CancellationToken): Promise<ClaudeAgentSession | undefined> {
+		const target = this._findDefaultChat(session);
+		if (!target) {
+			return undefined;
+		}
+		if (!target.isPipelineReady) {
+			this._logService.trace(`[Claude:${target.sessionId}] awaiting the in-flight materialize before addressing the control plane`);
+			await raceCancellation(target.whenPipelineReady, token);
+		}
+		return target.isPipelineReady ? target : undefined;
+	}
+
+	/**
+	 * A history read that resolves is the conversation's real contents: the
+	 * host installs a resolved transcript for the life of the chat entry and
+	 * only retries a rejected one, so every state this provider cannot read
+	 * has to reject rather than answer with no turns.
+	 */
 	private async _readChatMessages(context: IResolvedClaudeChatContext): Promise<readonly Turn[]> {
-		// Don't trigger a cold SDK download just to reconstruct a transcript
-		// during restore (the renderer subscribes to the last-active session
-		// on startup). Mirrors `listSessions` / `getConversationMetadata`: when the
-		// SDK isn't local yet, defer with an empty transcript. The download
-		// fires (with host-level progress) once the user sends the first
-		// message, after which the transcript re-hydrates on the next restore.
+		// Reading the transcript must never be what pulls the SDK down (the
+		// renderer subscribes to the last-active session on startup); the
+		// download is the user's call, made by the first send.
 		if (!(await this._sdkService.canLoadWithoutDownload())) {
-			this._logService.info('[Claude] SDK not downloaded yet; deferring session messages until a session triggers the download');
-			return [];
+			throw new Error(`[Claude] cannot read the transcript for ${context.chatKey}: the SDK is not downloaded yet`);
 		}
 		if (context.spawnedFrom) {
 			return this._readSubagentMessages(context);
 		}
 
 		const sess = context.target;
-		if (sess && !sess.isPipelineReady) {
-			// Provisional session: the SDK chat has never been materialized, so
-			// there is no on-disk transcript to read. Logged because an empty
-			// transcript is otherwise indistinguishable from a failed read.
-			this._logService.info(`[Claude] getMessages: chat ${context.chatKey} is not materialized yet; returning no turns`);
-			return [];
-		}
 		if (!context.sdkSessionId) {
 			return [];
 		}
-		const turns = await this._reconstructTurns(context.sdkSessionId, context.chat, sess?.subagents);
+		// A runtime that never reached its pipeline is either a provisional chat
+		// (no SDK conversation was ever written for this backing, so no turns is
+		// the answer) or a materialize still in flight over a conversation that
+		// does exist — the same lookup the resume path decides on.
+		if (sess && !sess.isPipelineReady && !(await this._sdkService.getSessionInfo(context.sdkSessionId, this._routing(context.sdkSessionId)))) {
+			this._logService.info(`[Claude] getMessages: chat ${context.chatKey} has no SDK conversation yet; returning no turns`);
+			return [];
+		}
+		const turns = await this._reconstructTurns(context.sdkSessionId, context.chat, sess?.subagents, context.hostInstructions);
 		const sideChat = this._chatBackings.get(context.chatKey)?.sideChat;
 		return sliceSideChatTurns(turns, sideChat);
 	}
@@ -2004,18 +2640,24 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			return [];
 		}
 		const parentChat = spawnedFrom.chat;
-		const parentSessionId = this._chatBackings.get(parentChat.toString())?.sdkSessionId;
+		// The parent's receipt addresses both halves of this read: its own
+		// transcript and the subagent rows filed under it. Fumie's store is
+		// keyed by project, so a routing-less read finds nothing there and the
+		// subagent reads as having no transcript at all.
+		const parentBacking = this._chatBackings.get(parentChat.toString());
+		const parentSessionId = parentBacking?.sdkSessionId;
 		if (!parentSessionId) {
 			return [];
 		}
+		const parentRouting = this._backingStore.routing(parentBacking?.storage);
 		const parentSession = this._findAnySession(parentSessionId);
 		const store = new DisposableStore();
 		const subagents = parentSession?.subagents ?? store.add(new SubagentRegistry());
 		try {
 			if (!parentSession) {
-				await this._reconstructTurns(parentSessionId, parentChat, subagents);
+				await this._reconstructTurns(parentSessionId, parentChat, subagents, context.hostInstructions);
 			}
-			return await getSubagentTranscript(context.chat, parentChat, parentSessionId, spawnedFrom.toolCallId, subagents, this._sdkService, this._logService, CancellationToken.None);
+			return await getSubagentTranscript(context.chat, parentChat, parentSessionId, parentRouting, spawnedFrom.toolCallId, subagents, this._sdkService, this._logService, CancellationToken.None);
 		} catch (err) {
 			this._logService.warn(`[Claude] getSubagentTranscript threw for ${context.chatKey}`, err);
 			return [];
@@ -2028,26 +2670,14 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	 * Fetch a chat's SDK transcript ({@link sdkSessionId}) and map it to
 	 * protocol {@link Turn}s routed to {@link routingUri} (the session or chat
 	 * channel URI). When {@link subagents} is supplied, it is primed from the agentId suffixes the
-	 * SDK encoded in Task tool_result blocks. Resilient: any failure warn-logs
-	 * and returns `[]` rather than propagating.
+	 * SDK encoded in Task tool_result blocks. Rejects when the transcript
+	 * cannot be fetched or mapped, so no caller can mistake an unreadable
+	 * conversation for an empty one; a caller that tolerates an unreadable
+	 * source says so at its own call site.
 	 */
-	private async _reconstructTurns(sdkSessionId: string, routingUri: URI, subagents: SubagentRegistry | undefined): Promise<readonly Turn[]> {
-		let messages;
-		try {
-			messages = await this._sdkService.getSessionMessages(sdkSessionId, { includeSystemMessages: true });
-		} catch (err) {
-			this._logService.warn(`[Claude] getSessionMessages SDK fetch failed for ${sdkSessionId}`, err);
-			return [];
-		}
-		let turns: readonly Turn[];
-		try {
-			turns = mapSessionMessagesToTurns(messages, routingUri, this._logService);
-		} catch (err) {
-			// Defensive boundary: a single malformed SDK message must not
-			// blow up the entire transcript read.
-			this._logService.warn(`[Claude] replay mapper threw for ${sdkSessionId}`, err);
-			return [];
-		}
+	private async _reconstructTurns(sdkSessionId: string, routingUri: URI, subagents: SubagentRegistry | undefined, hostInstructions?: readonly string[]): Promise<readonly Turn[]> {
+		const messages = await this._sdkService.getSessionMessages(sdkSessionId, { includeSystemMessages: true, ...this._routing(sdkSessionId) });
+		const turns = mapSessionMessagesToTurns(messages, routingUri, this._logService, hostInstructions);
 		// Always a bug: the SDK handed back a transcript but replay produced
 		// nothing, which surfaces to the user as a chat that opens completely
 		// empty. Warn so the next report is diagnosable from the log alone.
@@ -2064,6 +2694,15 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		return turns;
 	}
 
+	/**
+	 * The native Claude catalog as chat metadata.
+	 *
+	 * This reads the user's own store (the process-level `$CLAUDE_CONFIG_DIR`),
+	 * NOT Fumie's. Two callers remain, and neither surfaces a chat to the user:
+	 * {@link listChatsToMigrate} adopts Fumie's own pre-split sessions, and
+	 * {@link _emitDiscoveryRetractions} unwinds catalog rows an earlier build
+	 * minted from this listing.
+	 */
 	private async _listClaudeCodeChats(): Promise<IAgentChatMetadata[] | undefined> {
 		// SDK is the source of truth; we deliberately do NOT filter entries
 		// that lack a per-session DB — external Claude Code CLI sessions have
@@ -2083,7 +2722,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			// SDK failed to load/enumerate — this is "can't enumerate yet",
 			// not an authoritative empty result, so callers must not treat it
 			// as "no external chats" and should retry later.
-			this._logService.warn('[Claude] SDK listSessions failed; deferring chat discovery', err);
+			this._logService.warn('[Claude] SDK listSessions failed; deferring the native listing', err);
 			return undefined;
 		}
 		return Promise.all(sdkEntries.map(entry => {
@@ -2101,6 +2740,10 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			this._logService.info('[Claude] SDK not downloaded yet; deferring the migratable chat list');
 			return undefined;
 		}
+		// Deliberately the UNFILTERED listing: Fumie's own pre-catalog sessions
+		// were written by the SDK and so read as programmatic (`sdk-ts`) to an
+		// entrypoint-aware listing. Narrowing here would strand exactly the
+		// sessions migration exists to adopt. Only discovery filters.
 		const chats = await this._listClaudeCodeChats();
 		if (!chats) {
 			return undefined;
@@ -2119,19 +2762,19 @@ export class ClaudeAgent extends Disposable implements IAgent {
 				// {@link listChatsToMigrate}. Returning leaves the retry loop happy,
 				// since no amount of retrying will make the user press Download.
 				if (!(await this._sdkService.canLoadWithoutDownload())) {
-					this._logService.info('[Claude] SDK not downloaded yet; deferring chat discovery');
+					this._logService.info('[Claude] SDK not downloaded yet; deferring retraction pass');
 					return;
 				}
-				if (!(await this._emitClaudeCodeChats())) {
+				if (!(await this._emitDiscoveryRetractions())) {
 					throw new Error('Claude chat catalog is not available');
 				}
 			}, 5000, 3)
-				.catch(err => this._logService.warn('[Claude] Chat discovery failed', err));
+				.catch(err => this._logService.warn('[Claude] Discovery retraction failed', err));
 		}
 		return this._claudeCodeChatDiscovery;
 	}
 
-	/** Runs discovery again for whoever is still subscribed, after it deferred for want of an SDK. */
+	/** Runs the retraction pass again, after it deferred for want of an SDK. */
 	private _restartChatDiscovery(): void {
 		if (this._claudeCodeChatDiscovery) {
 			this._claudeCodeChatDiscovery = undefined;
@@ -2139,19 +2782,39 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		}
 	}
 
-	private async _emitClaudeCodeChats(): Promise<boolean> {
+	/**
+	 * Unwind catalog rows an earlier build minted from the user's own Claude
+	 * store, and mint none.
+	 *
+	 * Claude no longer discovers external chats at all: Fumie's transcripts
+	 * live in their own namespace (see {@link ClaudeBackingStore}), so a chat
+	 * in the native store is by construction not Fumie's. That removed the
+	 * question four successive discovery filters kept getting wrong — whether a
+	 * given native session was "really" ours — rather than answering it once
+	 * more.
+	 *
+	 * What is left is bookkeeping. Rows registered before the split are still
+	 * in the catalog, so every native session is offered back as a retraction.
+	 * The orchestrator acts only on rows it holds as `discovery` + `external`
+	 * and never touches an explicit or restored one, so this is safe to emit
+	 * wholesale and idempotent across passes. It can be deleted once no
+	 * installation carries such rows.
+	 */
+	private async _emitDiscoveryRetractions(): Promise<boolean> {
 		try {
-			const chats = await this._listClaudeCodeChats();
-			if (chats) {
-				const limiter = new Limiter<IAgentDiscoveredChat | undefined>(4);
-				const unknown = await Promise.all(chats.map(chat => limiter.queue(async () => {
-					return await this._isKnownClaudeCodeChat(chat) ? undefined : { ...chat, external: true };
-				})));
-				this._onDidDiscoverChats.fire(unknown.filter((chat): chat is IAgentDiscoveredChat => chat !== undefined));
-				return true;
+			const nativeChats = await this._listClaudeCodeChats();
+			if (!nativeChats) {
+				return false;
 			}
+			if (nativeChats.length > 0) {
+				this._logService.trace(`[Claude] retracting ${nativeChats.length} pre-split discovery registration(s)`);
+			}
+			this._onDidDiscoverChats.fire(
+				nativeChats.map((chat): IAgentDiscoveredChat => ({ ...chat, external: true, retract: true })),
+			);
+			return true;
 		} catch (err) {
-			this._logService.warn('[Claude] Failed to emit discovered chats', err);
+			this._logService.warn('[Claude] Failed to emit discovery retractions', err);
 		}
 		return false;
 	}
@@ -2163,6 +2826,52 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		} catch (err) {
 			this._logService.warn(`[Claude] Failed to inspect stored metadata for ${chat.chat.toString()}`, err);
 			return false;
+		}
+	}
+
+	/**
+	 * Generate a short title for a session from the user's first prompt, using
+	 * the session's own backend/model. Runs on the session's already-warm SDK
+	 * subprocess as a Query control request (`persist: false`): no user turn is
+	 * sent, nothing is appended to the harness transcript, and the title is
+	 * returned to the host instead of written into Claude's own session state.
+	 *
+	 * Claude's control request is a purpose-built title generator, so the
+	 * description it takes is the user's prompt itself (truncated) — the
+	 * backend supplies the "name this session" framing, and prefixing another
+	 * instruction here would only compete with it.
+	 *
+	 * The bound Query already runs with the session's current model, so
+	 * `request.modelId` is deliberately ignored: Claude has no per-request
+	 * model override on this control path, and rebinding the Query to another
+	 * model just to name a session would restart the subprocess.
+	 *
+	 * The host names a session off its very first message, which is exactly when
+	 * that session is still being materialized by the send it came with, so this
+	 * waits for the first send's own subprocess ({@link _awaitLiveDefaultChat})
+	 * rather than giving up on a runtime that is seconds away. It never starts a
+	 * second startup and never queues on {@link _sessionSequencer} — a send task
+	 * holds that sequencer for its whole turn. A session that has no runtime at
+	 * all, one whose materialize fails, and a wait the caller's budget cuts
+	 * short all soft-fail with `undefined`, leaving the host's first-message
+	 * placeholder standing.
+	 */
+	async generateTitle(session: URI, request: { readonly prompt: string; readonly modelId?: string }, token: CancellationToken): Promise<string | undefined> {
+		const target = await this._awaitLiveDefaultChat(session, token);
+		if (!target) {
+			this._logService.trace(`[Claude] generateTitle: no live session for ${session.toString()}; keeping the host placeholder`);
+			return undefined;
+		}
+		if (token.isCancellationRequested) {
+			return undefined;
+		}
+		try {
+			const reply = await raceCancellation(target.generateSessionTitle(request.prompt), token);
+			this._logService.info(`[Claude:${target.sessionId}] session title reply: ${reply?.length ?? 0} character(s)`);
+			return reply;
+		} catch (error) {
+			this._logService.warn(`[Claude:${target.sessionId}] backend title generation failed`, error);
+			return undefined;
 		}
 	}
 
@@ -2186,12 +2895,26 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			this._logService.info('[Claude] SDK not downloaded yet; deferring chat metadata until a session triggers the download');
 			return undefined;
 		}
-		const { configurationResource } = resolveAgentChatContext(context, chat);
-		const sessionId = providerData ? decodeProviderData(providerData)?.sdkSessionId : AgentSession.id(configurationResource);
+		const { configurationResource, resource } = resolveAgentChatContext(context, chat);
+		// The receipt in hand outranks {@link _routing}, which can only answer
+		// from backings this process has already bound. Restore asks for
+		// metadata before any of that exists, and Fumie's store is addressed by
+		// project key: routing's receipt-less fallback names the store but not
+		// the project, so the lookup finds nothing and the session reports
+		// itself undescribable — with no working directory, it also lists as an
+		// unknown project — until something else happens to bind it. The
+		// receipt names the project the transcript was written under, once
+		// {@link _correctedBackingStorage} has reconciled it with where the
+		// session actually ran, so a cold restore resolves on the first try.
+		const backing = providerData ? decodeClaudeChatBacking(providerData) : undefined;
+		const sessionId = providerData ? backing?.sdkSessionId : AgentSession.id(configurationResource);
 		if (!sessionId) {
 			return undefined;
 		}
-		const sdkInfo = await this._sdkService.getSessionInfo(sessionId);
+		const routing = backing
+			? this._backingStore.routing(await this._correctedBackingStorage(resource, backing.storage))
+			: this._routing(sessionId);
+		const sdkInfo = await this._sdkService.getSessionInfo(sessionId, routing);
 		if (!sdkInfo) {
 			return undefined;
 		}
@@ -2224,43 +2947,26 @@ export class ClaudeAgent extends Disposable implements IAgent {
 	}
 
 	resolveChatConfig(_params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
-		// Decision B5 (plan section 3.3.5): Claude collapses the platform's
-		// `autoApprove` × `mode` two-axis approval surface onto a single
-		// `permissionMode` axis matching the SDK's native enum. The
+		// Claude advertises the platform's standard `autoApprove` tier so it
+		// shares the product-wide approvals picker; the tier is mapped onto the
+		// SDK's native `permissionMode` at the config read boundary (see
+		// `claudeSessionPermissionMode.ts` / `fumiePermissionTiers.ts`). The
 		// platform `Permissions` key is reused unchanged because the
 		// Claude SDK accepts `allowedTools` / `disallowedTools`
-		// natively. Skipped: AutoApprove, Mode, Isolation, Branch,
-		// BranchNameHint — workbench pickers key off the property names
-		// to decide what to render, so omitting these intentionally
-		// suppresses the default mode/branch UI for Claude sessions.
+		// natively. Skipped: Mode, Isolation, Branch, BranchNameHint —
+		// workbench pickers key off the property names to decide what to
+		// render, so omitting these intentionally suppresses the default
+		// mode/branch UI for Claude sessions.
 		const sessionSchema = createSchema({
-			[ClaudeSessionConfigKey.PermissionMode]: schemaProperty<ClaudePermissionMode>({
-				type: 'string',
-				title: localize('claude.sessionConfig.permissionMode', "Approvals"),
-				description: localize('claude.sessionConfig.permissionModeDescription', "How Claude handles tool approvals."),
-				enum: ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'],
-				enumLabels: [
-					localize('claude.sessionConfig.permissionMode.default', "Ask Before Edits"),
-					localize('claude.sessionConfig.permissionMode.acceptEdits', "Edit Automatically"),
-					localize('claude.sessionConfig.permissionMode.plan', "Plan Mode"),
-					localize('claude.sessionConfig.permissionMode.auto', "Auto Mode"),
-					localize('claude.sessionConfig.permissionMode.bypassPermissions', "Bypass Permissions"),
-				],
-				enumDescriptions: [
-					localize('claude.sessionConfig.permissionMode.defaultDescription', "Claude asks before editing files."),
-					localize('claude.sessionConfig.permissionMode.acceptEditsDescription', "Claude edits files without asking, and asks before using other tools."),
-					localize('claude.sessionConfig.permissionMode.planDescription', "Claude creates a plan before making changes."),
-					localize('claude.sessionConfig.permissionMode.autoDescription', "Claude decides whether to ask for each tool operation."),
-					localize('claude.sessionConfig.permissionMode.bypassPermissionsDescription', "Claude runs all tools without asking."),
-				],
-				default: 'default',
-				sessionMutable: true,
-			}),
+			[SessionConfigKey.AutoApprove]: platformSessionSchema.definition[SessionConfigKey.AutoApprove],
 			[SessionConfigKey.Permissions]: platformSessionSchema.definition[SessionConfigKey.Permissions],
 		});
 
 		const values = sessionSchema.validateOrDefault(_params.config, {
-			[ClaudeSessionConfigKey.PermissionMode]: 'default' satisfies ClaudePermissionMode,
+			// A session persisted before the tier switch carries only the legacy
+			// `permissionMode` key, which `validateOrDefault` drops; fold it onto
+			// the tier it maps to so the picker shows what the session runs at.
+			[SessionConfigKey.AutoApprove]: permissionTierForClaudeMode(_params.config?.[ClaudeSessionConfigKey.PermissionMode]),
 			// Permissions intentionally omitted from defaults — leave
 			// unset so auto-approval falls through to the host-level
 			// default, materializing on the session only once the user
@@ -2275,22 +2981,25 @@ export class ClaudeAgent extends Disposable implements IAgent {
 
 	getInheritedChatConfig(config: Readonly<Record<string, unknown>>): Record<string, unknown> | undefined {
 		const inherited: Record<string, unknown> = {};
-		for (const key of [ClaudeSessionConfigKey.PermissionMode, SessionConfigKey.Permissions]) {
+		for (const key of [SessionConfigKey.AutoApprove, SessionConfigKey.Permissions]) {
 			if (config[key] !== undefined) {
 				inherited[key] = config[key];
 			}
+		}
+		if (inherited[SessionConfigKey.AutoApprove] === undefined && config[ClaudeSessionConfigKey.PermissionMode] !== undefined) {
+			inherited[SessionConfigKey.AutoApprove] = permissionTierForClaudeMode(config[ClaudeSessionConfigKey.PermissionMode]);
 		}
 		return Object.keys(inherited).length > 0 ? inherited : undefined;
 	}
 
 	getAutonomousSessionConfig(_config: Readonly<Record<string, unknown>>): Record<string, unknown> | undefined {
 		return this._configurationService.getRootValue(platformRootSchema, AgentHostAutoApprovePolicyRestrictedConfigKey) !== true
-			? { [ClaudeSessionConfigKey.PermissionMode]: 'auto' satisfies ClaudePermissionMode }
+			? { [SessionConfigKey.AutoApprove]: 'autoApprove' satisfies AutoApproveLevel }
 			: undefined;
 	}
 
 	chatConfigCompletions(_params: IAgentChatConfigCompletionsParams): Promise<SessionConfigCompletionsResult> {
-		// Claude's only schema property is the `permissionMode` static enum,
+		// Claude's only schema property is the `autoApprove` static enum,
 		// so dynamic completion is definitionally empty.
 		return Promise.resolve({ items: [] });
 	}
@@ -2316,6 +3025,14 @@ export class ClaudeAgent extends Disposable implements IAgent {
 			for (const chat of sessions) {
 				if (!chat.isPipelineReady) {
 					chat.abortController.abort();
+				} else if (chat.hasOpenBackgroundSubagents) {
+					// Unlike idle eviction, shutdown does not honour the
+					// background-subagent keepalive: the host process is going
+					// away, so there is nothing left to keep the subprocess
+					// alive for. Logged because this is the one legitimate
+					// source of the "running when the previous Claude Code
+					// process exited" notification users see on the next open.
+					this._logService.warn(`[Claude:${chat.sessionId}] Shutting down with a background subagent still running; it will not survive the process exit`);
 				}
 			}
 
@@ -2346,7 +3063,20 @@ export class ClaudeAgent extends Disposable implements IAgent {
 
 		return this._sessionSequencer.queue(context.sequencerKey, async () => {
 			const current = this._resolveChatContext(chat, sendContext);
-			const session = await this._ensureResolvedChatSession(current, workingDirectories);
+			// A prior Stop may have cancelled a provisional before SDK startup.
+			// Reset only here, under the send sequencer: resetting inside the old
+			// async materialize would revive the request the user cancelled.
+			const retryCancelledStartup = current.target?.resetCancelledProvisional();
+			const session = await (retryCancelledStartup
+				? this._resolveOrResumeChatSessionLocked(current, workingDirectories)
+				: this._ensureResolvedChatSession(current, workingDirectories)).catch(error => {
+					if (isCancellationError(error)) {
+						// No call to session.send has happened: the user's message
+						// cannot be recovered from the SDK transcript after release.
+						throw new AgentMessageNotSubmittedError();
+					}
+					throw error;
+				});
 			// The send carries the host's latest customization snapshot. An
 			// absent snapshot means the host has published none yet, which must
 			// not be read as "this session has no customizations" — keep the
@@ -2355,9 +3085,9 @@ export class ClaudeAgent extends Disposable implements IAgent {
 				session.setHostCustomizations(current.customizations);
 			}
 			const sideChat = this._chatBackings.get(current.chatKey)?.sideChat;
-			const turns = sideChat ? await this._reconstructTurns(session.sessionId, current.chat, session.subagents) : [];
+			const turns = sideChat ? await this._reconstructTurns(session.sessionId, current.chat, session.subagents, current.hostInstructions) : [];
 			const sdkPrompt = prepareSideChatPrompt(prompt, turns, sideChat);
-			const switchTransport = session.hasPendingTransportSwitch ? this._ensureAuthenticated(session.provisionalModel) : undefined;
+			const switchTransport = session.hasPendingTransportSwitch ? await this._ensureAuthenticated(session.provisionalModel) : undefined;
 			await session.send(this._buildSdkPrompt(session.sessionId, sdkPrompt, attachments, effectiveTurnId), effectiveTurnId, current.configurationResource, workingDirectories, switchTransport, resolveAgentHostInstructions(operationContext), clientTelemetryContext);
 			if (workingDirectories) {
 				await this._metadataStore.write(current.resource, { workingDirectories });
@@ -2418,6 +3148,17 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		// very turn it's trying to cancel. Calling `chat.abort()` directly
 		// rejects the in-flight deferred, which lets the queued sendMessage
 		// task complete and frees the sequencer for the next caller.
+		//
+		// Nor would `interrupt()` spare a running background subagent, which is
+		// the other reason one might reach for it: the CLI only spares
+		// background tasks on interrupt when the consumer declared
+		// `Options.perTaskStopAffordance`, and that declaration is a promise to
+		// render a per-task stop control wired to `stop_task` (sdk.d.ts). This
+		// consumer renders none and never calls `Query.stopTask`, so declaring
+		// it would leave a runaway task unstoppable short of ending the session.
+		// Stop therefore still takes the subprocess and everything in it; what
+		// no longer does is an ordinary send (see
+		// `ClaudeAgentSession._rebindForSyncedState`).
 		const sess = this._findChatByUri(chat);
 		if (!sess) {
 			return;
@@ -2696,6 +3437,11 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		super.dispose();
 		this._proxyHandle?.dispose();
 		this._proxyHandle = undefined;
+		// Same ordering invariant for the BYOK bind: released only after every
+		// session wrapper (and its CLI subprocess) is gone.
+		const providerProxyHandle = this._providerProxyHandle;
+		this._providerProxyHandle = undefined;
+		providerProxyHandle?.then(handle => handle.dispose(), () => { /* the lazy start rejected; nothing to release */ });
 		this._githubToken = undefined;
 		this._models.set([], undefined);
 	}

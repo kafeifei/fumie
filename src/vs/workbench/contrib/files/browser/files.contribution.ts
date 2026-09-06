@@ -375,7 +375,11 @@ configurationRegistry.registerConfiguration({
 		'files.simpleDialog.enable': {
 			'type': 'boolean',
 			'description': nls.localize('files.simpleDialog.enable', "Enables the simple file dialog for opening and saving files and folders. The simple file dialog replaces the system file dialog when enabled."),
-			'default': false
+			'default': false,
+			// Agents always uses the native OS dialog (Finder / NSOpenPanel). Ignore
+			// user and throwaway-profile overrides so editor-workbench automation
+			// can still enable the simple dialog without leaking it into Agents.
+			agentsWindow: { default: false, readOnly: true },
 		},
 		'files.participants.timeout': {
 			type: 'number',

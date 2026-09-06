@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { DeferredPromise } from '../../../../../base/common/async.js';
 import { Emitter } from '../../../../../base/common/event.js';
 import { DisposableStore, IDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { constObservable, observableValue } from '../../../../../base/common/observable.js';
@@ -96,6 +97,7 @@ class FakeSessionsTasksService implements Partial<ISessionsTasksService> {
 	readonly stoppedTasks: { label: string; sessionId: string }[] = [];
 	private readonly _tasks = new Map<string, readonly ISessionTaskWithTarget[]>();
 	runTaskFails = false;
+	runTaskBarrier: DeferredPromise<void> | undefined;
 
 	setTasks(sessionId: string, tasks: readonly ISessionTaskWithTarget[]): void {
 		this._tasks.set(sessionId, tasks);
@@ -110,6 +112,7 @@ class FakeSessionsTasksService implements Partial<ISessionsTasksService> {
 		if (this.runTaskFails) {
 			throw new Error('simulated launch failure');
 		}
+		await this.runTaskBarrier?.p;
 		return toDisposable(() => this.stoppedTasks.push({ label: task.label, sessionId: session.sessionId }));
 	}
 }
@@ -118,8 +121,16 @@ class FakeSessionsManagementService implements Partial<ISessionsManagementServic
 	declare readonly _serviceBrand: undefined;
 	readonly sessionStartedEmitter = new Emitter<ISession>();
 	readonly sessionsChangedEmitter = new Emitter<ISessionsChangeEvent>();
+	readonly sessionWillArchiveEmitter = new Emitter<ISession>();
+	readonly sessionUnarchivedEmitter = new Emitter<ISession>();
+	readonly sessionWillDeleteEmitter = new Emitter<ISession>();
+	readonly sessionTeardownFailedEmitter = new Emitter<ISession>();
 	readonly onDidStartSession = this.sessionStartedEmitter.event;
 	readonly onDidChangeSessions = this.sessionsChangedEmitter.event;
+	readonly onWillArchiveSession = this.sessionWillArchiveEmitter.event;
+	readonly onDidUnarchiveSession = this.sessionUnarchivedEmitter.event;
+	readonly onWillDeleteSession = this.sessionWillDeleteEmitter.event;
+	readonly onDidFailSessionTeardown = this.sessionTeardownFailedEmitter.event;
 	getSessions(): ISession[] { return []; }
 }
 
@@ -148,6 +159,9 @@ suite('WorktreeCreatedTaskDispatcher', () => {
 	teardown(() => {
 		mgmt.sessionStartedEmitter.dispose();
 		mgmt.sessionsChangedEmitter.dispose();
+		mgmt.sessionWillArchiveEmitter.dispose();
+		mgmt.sessionUnarchivedEmitter.dispose();
+		mgmt.sessionWillDeleteEmitter.dispose();
 		store.clear();
 	});
 
@@ -313,6 +327,60 @@ suite('WorktreeCreatedTaskDispatcher', () => {
 		assert.deepStrictEqual(tasks.stoppedTasks, [{ label: 'setup', sessionId: 'a' }]);
 	});
 
+	test('stops dispatched tasks synchronously before archive and delete', async () => {
+		createDispatcher();
+		const archive = makeSession({ id: 'archive' }).session;
+		const remove = makeSession({ id: 'delete' }).session;
+		tasks.setTasks(archive.sessionId, [entry('setup', 'worktreeCreated')]);
+		tasks.setTasks(remove.sessionId, [entry('setup', 'worktreeCreated')]);
+
+		mgmt.sessionStartedEmitter.fire(archive);
+		mgmt.sessionStartedEmitter.fire(remove);
+		await settle();
+
+		mgmt.sessionWillArchiveEmitter.fire(archive);
+		mgmt.sessionWillDeleteEmitter.fire(remove);
+
+		assert.deepStrictEqual(tasks.stoppedTasks, [
+			{ label: 'setup', sessionId: 'archive' },
+			{ label: 'setup', sessionId: 'delete' },
+		]);
+
+		mgmt.sessionTeardownFailedEmitter.fire(archive);
+		mgmt.sessionTeardownFailedEmitter.fire(remove);
+		await settle();
+		assert.deepStrictEqual(tasks.ranTasks, [
+			{ label: 'setup', sessionId: 'archive' },
+			{ label: 'setup', sessionId: 'delete' },
+			{ label: 'setup', sessionId: 'archive' },
+			{ label: 'setup', sessionId: 'delete' },
+		]);
+	});
+
+	test('runs worktreeCreated tasks once again after a successful unarchive', async () => {
+		createDispatcher();
+		const { session, workspace, isArchived } = makeSession({ id: 'a' });
+		tasks.setTasks(session.sessionId, [entry('setup', 'worktreeCreated')]);
+
+		mgmt.sessionStartedEmitter.fire(session);
+		await settle();
+		mgmt.sessionWillArchiveEmitter.fire(session);
+		isArchived.set(true, undefined);
+		workspace.set(makeWorkspace(false), undefined);
+
+		mgmt.sessionUnarchivedEmitter.fire(session);
+		mgmt.sessionUnarchivedEmitter.fire(session);
+		await settle();
+		isArchived.set(false, undefined);
+		workspace.set(makeWorkspace(true), undefined);
+		await settle();
+
+		assert.deepStrictEqual(tasks.ranTasks, [
+			{ label: 'setup', sessionId: 'a' },
+			{ label: 'setup', sessionId: 'a' },
+		]);
+	});
+
 	test('stops dispatched tasks when a started session is removed', async () => {
 		createDispatcher();
 		const { session, workspace } = makeSession({ id: 'a', hasWorktree: false });
@@ -329,16 +397,16 @@ suite('WorktreeCreatedTaskDispatcher', () => {
 		assert.deepStrictEqual(tasks.stoppedTasks, [{ label: 'setup', sessionId: 'a' }]);
 	});
 
-	test('stops a task that finishes launching after the session is archived', async () => {
+	test('stops a task that finishes launching after archive begins even when the backend fails', async () => {
 		createDispatcher();
-		const { session, workspace, isArchived } = makeSession({ id: 'a', hasWorktree: false });
+		const { session } = makeSession({ id: 'a' });
 		tasks.setTasks(session.sessionId, [entry('setup', 'worktreeCreated')]);
+		tasks.runTaskBarrier = new DeferredPromise<void>();
 
 		mgmt.sessionStartedEmitter.fire(session);
-		// Archive before the worktree appears so the task is launched against an
-		// already-archived session.
-		isArchived.set(true, undefined);
-		workspace.set(makeWorkspace(true), undefined);
+		await settle();
+		mgmt.sessionWillArchiveEmitter.fire(session);
+		await tasks.runTaskBarrier.complete(undefined);
 		await settle();
 
 		assert.deepStrictEqual(tasks.ranTasks, [{ label: 'setup', sessionId: 'a' }]);

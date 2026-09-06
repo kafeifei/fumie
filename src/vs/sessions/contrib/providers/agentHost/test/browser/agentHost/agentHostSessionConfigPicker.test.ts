@@ -8,7 +8,8 @@ import { Emitter, Event } from '../../../../../../../base/common/event.js';
 import { observableValue } from '../../../../../../../base/common/observable.js';
 import { mock } from '../../../../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../../base/test/common/utils.js';
-import { isIMenuItem, MenuId, MenuRegistry } from '../../../../../../../platform/actions/common/actions.js';
+import { IActionViewItemFactory, IActionViewItemService } from '../../../../../../../platform/actions/browser/actionViewItemService.js';
+import { isIMenuItem, MenuId, MenuItemAction, MenuRegistry } from '../../../../../../../platform/actions/common/actions.js';
 import { IActionListDelegate } from '../../../../../../../platform/actionWidget/browser/actionList.js';
 import { IActionWidgetService } from '../../../../../../../platform/actionWidget/browser/actionWidget.js';
 import { SessionConfigKey } from '../../../../../../../platform/agentHost/common/sessionConfigKeys.js';
@@ -17,17 +18,26 @@ import { IConfigurationService } from '../../../../../../../platform/configurati
 import { IContextKeyService } from '../../../../../../../platform/contextkey/common/contextkey.js';
 import { IDialogService } from '../../../../../../../platform/dialogs/common/dialogs.js';
 import { IHoverService } from '../../../../../../../platform/hover/browser/hover.js';
+import { IInstantiationService } from '../../../../../../../platform/instantiation/common/instantiation.js';
 import { TestInstantiationService } from '../../../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
 import { IStorageService } from '../../../../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../../../../platform/telemetry/common/telemetry.js';
 import { NullTelemetryService } from '../../../../../../../platform/telemetry/common/telemetryUtils.js';
+import { IsSessionsWindowContext } from '../../../../../../../workbench/common/contextkeys.js';
+import { AttachContextAction } from '../../../../../../../workbench/contrib/chat/browser/actions/chatContextActions.js';
+import { ChatContextKeys } from '../../../../../../../workbench/contrib/chat/common/actions/chatContextKeys.js';
+import { ChatAgentLocation } from '../../../../../../../workbench/contrib/chat/common/constants.js';
 import { IWorkbenchLayoutService } from '../../../../../../../workbench/services/layout/browser/layoutService.js';
 import { Menus } from '../../../../../../browser/menus.js';
 import { IAgentHostSessionsProvider, LOCAL_AGENT_HOST_PROVIDER_ID } from '../../../../../../common/agentHostSessionsProvider.js';
 import { ISessionsProvidersService } from '../../../../../../services/sessions/browser/sessionsProvidersService.js';
+import { ISessionContext } from '../../../../../../services/sessions/browser/sessionContext.js';
 import { IActiveSession } from '../../../../../../services/sessions/common/sessionsManagement.js';
 import { ISessionsProvider } from '../../../../../../services/sessions/common/sessionsProvider.js';
-import { AgentHostSessionConfigPicker, IConfigPickerItem } from '../../../browser/agentHostSessionConfigPicker.js';
+import { MobilePermissionPicker } from '../../../../copilotChatSessions/browser/mobilePermissionPicker.js';
+import { AgentHostPermissionPickerActionItem } from '../../../browser/agentHostPermissionPickerActionItem.js';
+import { AgentHostPermissionPickerDelegate } from '../../../browser/agentHostPermissionPickerDelegate.js';
+import { AgentHostSessionConfigPicker, AgentHostSessionConfigPickerContribution, IConfigPickerItem, PickerActionViewItem } from '../../../browser/agentHostSessionConfigPicker.js';
 
 const SESSION_ID = 'local-agent-host:s1';
 
@@ -145,6 +155,22 @@ class CapturingActionWidgetHolder {
 	delegate: IActionListDelegate<IConfigPickerItem> | undefined;
 }
 
+class CapturingActionViewItemService implements IActionViewItemService {
+	declare readonly _serviceBrand: undefined;
+	readonly onDidChange = Event.None;
+	readonly factories = new Map<string, IActionViewItemFactory>();
+
+	register(menu: MenuId, commandId: string | MenuId, provider: IActionViewItemFactory) {
+		const key = `${menu.id}/${commandId instanceof MenuId ? commandId.id : commandId}`;
+		this.factories.set(key, provider);
+		return { dispose: () => this.factories.delete(key) };
+	}
+
+	lookUp(menu: MenuId, commandId: string | MenuId): IActionViewItemFactory | undefined {
+		return this.factories.get(`${menu.id}/${commandId instanceof MenuId ? commandId.id : commandId}`);
+	}
+}
+
 function setupServices(store: Pick<ReturnType<typeof ensureNoDisposablesAreLeakedInTestSuite>, 'add'>) {
 	const emitter = store.add(new Emitter<string>());
 	const provider = new FakeProvider(emitter);
@@ -192,7 +218,7 @@ suite('Agent Host Session Config Picker', () => {
 
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('places mode immediately before approvals in secondary toolbars', () => {
+	test('keeps Interactive off the Agents composer; permissions share the secondary row with context usage', () => {
 		const summarize = (menu: MenuId, ids: readonly string[]) => MenuRegistry.getMenuItems(menu)
 			.filter(isIMenuItem)
 			.filter(item => ids.includes(item.command.id))
@@ -218,7 +244,6 @@ suite('Agent Host Session Config Picker', () => {
 		}, {
 			newSessionPrimary: [],
 			newSessionSecondary: [
-				{ id: 'sessions.agentHost.newSessionModePicker', order: 0 },
 				{ id: 'sessions.agentHost.newSessionApprovePicker', order: 1 },
 				{ id: 'sessions.agentHost.newSessionPermissionModePicker', order: 2 },
 			],
@@ -229,6 +254,84 @@ suite('Agent Host Session Config Picker', () => {
 				{ id: 'sessions.agentHost.runningSessionPermissionModePicker', order: 11 },
 			],
 		});
+	});
+
+	test('moves attachment actions to the Sessions footer while preserving editor chat and capability gates', () => {
+		const action = new AttachContextAction();
+		const menuItems = Array.isArray(action.desc.menu) ? action.desc.menu : [];
+		const visibleMenus = (sessionsWindow: boolean, supportsAttachments: boolean) => {
+			const values = new Map<string, unknown>([
+				[IsSessionsWindowContext.key, sessionsWindow],
+				[ChatContextKeys.location.key, ChatAgentLocation.Chat],
+				[ChatContextKeys.inQuickChat.key, false],
+				[ChatContextKeys.lockedToCodingAgent.key, true],
+				[ChatContextKeys.agentSupportsAttachments.key, supportsAttachments],
+			]);
+			return menuItems.filter(item => item.when?.evaluate({ getValue: <T>(key: string) => values.get(key) as T | undefined })).map(item => item.id);
+		};
+		assert.deepStrictEqual(visibleMenus(true, true), [MenuId.ChatInputSecondary]);
+		assert.deepStrictEqual(visibleMenus(false, true), [MenuId.ChatInput]);
+		assert.deepStrictEqual(visibleMenus(true, false), []);
+		assert.deepStrictEqual(visibleMenus(false, false), []);
+	});
+
+	test('uses one permission factory for new and running composers, with a phone-only sheet adapter', () => {
+		const actionViewItems = new CapturingActionViewItemService();
+		const mainContainer = document.createElement('div');
+		const layoutService = { mainContainer } as unknown as IWorkbenchLayoutService;
+		store.add(new AgentHostSessionConfigPickerContribution(actionViewItems, layoutService));
+
+		const newFactory = actionViewItems.lookUp(Menus.NewSessionControl, 'sessions.agentHost.newSessionApprovePicker');
+		const runningPrimaryFactory = actionViewItems.lookUp(MenuId.ChatInput, 'sessions.agentHost.runningSessionConfigPicker');
+		const runningSecondaryFactory = actionViewItems.lookUp(MenuId.ChatInputSecondary, 'sessions.agentHost.runningSessionConfigPicker');
+		assert.ok(newFactory);
+		assert.strictEqual(runningPrimaryFactory, newFactory);
+		assert.strictEqual(runningSecondaryFactory, newFactory);
+
+		const session = observableValue<IActiveSession | undefined>('permissionSession', { providerId: LOCAL_AGENT_HOST_PROVIDER_ID, sessionId: SESSION_ID } as IActiveSession);
+		const desktopItem = { kind: 'desktop' };
+		const mobileDelegate = { dispose: () => { } };
+		const mobilePicker = { render: () => { }, dispose: () => { } };
+		const calls: { readonly ctor: unknown; readonly args: readonly unknown[] }[] = [];
+		const instantiationService = {
+			invokeFunction: (fn: (accessor: { get(service: unknown): unknown }) => unknown) => fn({
+				get: service => {
+					assert.strictEqual(service, ISessionContext);
+					return { session };
+				},
+			}),
+			createInstance: (ctor: unknown, ...args: unknown[]) => {
+				calls.push({ ctor, args });
+				if (ctor === AgentHostPermissionPickerActionItem) {
+					return desktopItem;
+				}
+				if (ctor === AgentHostPermissionPickerDelegate) {
+					return mobileDelegate;
+				}
+				if (ctor === MobilePermissionPicker) {
+					return mobilePicker;
+				}
+				throw new Error(`Unexpected constructor: ${String(ctor)}`);
+			},
+		} as unknown as IInstantiationService;
+		const action = Object.create(MenuItemAction.prototype) as MenuItemAction;
+
+		const desktopResult = newFactory(action, {}, instantiationService, 1);
+		assert.strictEqual(desktopResult, desktopItem);
+		assert.strictEqual(calls[0].ctor, AgentHostPermissionPickerActionItem);
+		assert.strictEqual(calls[0].args[0], action);
+		assert.strictEqual((calls[0].args[1] as { compact: { get(): boolean }; listOptions: { minWidth: number } }).compact.get(), true);
+		assert.strictEqual((calls[0].args[1] as { listOptions: { minWidth: number } }).listOptions.minWidth, 255);
+		assert.strictEqual(calls[0].args[2], session);
+
+		calls.length = 0;
+		mainContainer.classList.add('phone-layout');
+		const mobileResult = newFactory(action, {}, instantiationService, 1);
+		assert.ok(mobileResult instanceof PickerActionViewItem);
+		store.add(mobileResult);
+		assert.deepStrictEqual(calls.map(call => call.ctor), [AgentHostPermissionPickerDelegate, MobilePermissionPicker]);
+		assert.strictEqual(calls[0].args[0], session);
+		assert.strictEqual(calls[1].args[0], mobileDelegate);
 	});
 
 	test('a picker recreated on a session switch still renders the provider-seeded chips (disabled) while resolving', () => {
@@ -264,6 +367,22 @@ suite('Agent Host Session Config Picker', () => {
 		assert.strictEqual(isolationSlot(second.container)!.classList.contains('resolving'), false, 'isolation re-enables after resolve');
 		assert.strictEqual(branchSlot(second.container)!.classList.contains('resolving'), false, 'branch re-enables after resolve');
 		assert.strictEqual(branchLabel(second.container), 'dev', 'branch label reflects the resolved value');
+	});
+
+	test('renders Branch before Worktree with exact copy across re-resolves', () => {
+		const services = setupServices(store);
+		const { provider } = services;
+		provider.set(makeRepoConfig('main', 'worktree'), false);
+		const { container } = renderPicker(store, services);
+		const pickerContainer = container.querySelector<HTMLElement>('.sessions-chat-agent-host-config')!;
+		const order = () => Array.from(pickerContainer.children).map(child => child === branchSlot(container) ? 'branch' : child === isolationSlot(container) ? 'worktree' : 'other');
+
+		assert.deepStrictEqual(order(), ['branch', 'worktree']);
+		assert.strictEqual(isolationSlot(container)!.querySelector<HTMLElement>('.sessions-chat-dropdown-label')?.textContent, 'Worktree');
+		assert.strictEqual(isolationSlot(container)!.querySelector<HTMLElement>('.monaco-checkbox')?.getAttribute('aria-label'), 'Worktree');
+
+		provider.set(makeRepoConfig('main', 'folder'), false);
+		assert.deepStrictEqual(order(), ['branch', 'worktree']);
 	});
 
 	test('keeps the isolation checkbox node and focus stable while config resolves', () => {

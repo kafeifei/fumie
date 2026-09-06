@@ -11,6 +11,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../base/test/comm
 import { isIMenuItem, MenuId, MenuRegistry } from '../../../platform/actions/common/actions.js';
 import { CommandsRegistry } from '../../../platform/commands/common/commands.js';
 import { ServicesAccessor } from '../../../platform/instantiation/common/instantiation.js';
+import product from '../../../platform/product/common/product.js';
 import { ToggleAuxiliaryBarAction } from '../../../workbench/browser/parts/auxiliarybar/auxiliaryBarActions.js';
 import { PanelVisibleContext, SecondarySideBarVisibleContext } from '../../../workbench/common/contextkeys.js';
 import { Parts } from '../../../workbench/services/layout/browser/layoutService.js';
@@ -44,7 +45,7 @@ suite('Sessions - Layout Actions', () => {
 		assert.strictEqual(toggleAlwaysOnTop.group, 'navigation');
 	});
 
-	test('bottom panel layout action replaces the terminal action in the session title bar', () => {
+	test('bottom panel layout action owns the Fumie title bar while non-minimal shells retain the terminal action', () => {
 		const items = MenuRegistry.getMenuItems(Menus.TitleBarSessionMenu).filter(isIMenuItem);
 		const panelActions = items
 			.filter(item => item.command.id === TOGGLE_PANEL_ACTION_ID)
@@ -79,7 +80,9 @@ suite('Sessions - Layout Actions', () => {
 					when: `!isAuxiliaryWindow && !${PanelVisibleContext.key} && !sessionsIsPhoneLayout && !sessionsWelcomeVisible`,
 				},
 			],
-			terminalActionPresent: false,
+			// Fumie owns this title-bar slot through the generic panel toggle. The
+			// legacy terminal shortcut remains available only to non-minimal shells.
+			terminalActionPresent: product.sessionsMinimalShell !== true,
 		});
 	});
 

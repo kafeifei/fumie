@@ -626,12 +626,12 @@ configurationRegistry.registerConfiguration({
 			enum: [ChatPermissionLevel.Default, ChatPermissionLevel.AutoApprove, ChatPermissionLevel.Autopilot],
 			enumItemLabels: [
 				nls.localize('chat.permissions.default.default.label', "Default Permissions"),
-				nls.localize('chat.permissions.default.autoApprove.label', "Bypass Approvals"),
+				nls.localize('chat.permissions.default.autoApprove.label', "Full Access"),
 				nls.localize('chat.permissions.default.autopilot.label', "Autopilot (Preview)"),
 			],
 			enumDescriptions: [
 				nls.localize('chat.permissions.default.default.description', "Start new chat sessions with Default Permissions."),
-				nls.localize('chat.permissions.default.autoApprove.description', "Start new chat sessions in Bypass Approvals mode."),
+				nls.localize('chat.permissions.default.autoApprove.description', "Start new chat sessions with Full Access."),
 				nls.localize('chat.permissions.default.autopilot.description', "Start new chat sessions in Autopilot mode."),
 			],
 			description: nls.localize('chat.permissions.default.settingDescription', "Controls the default permissions picker mode for new local chat sessions. You can still change the permission mode per session, and each session remembers the permission mode that was used. If enterprise policy disables auto approval, new sessions use Default Permissions."),
@@ -640,7 +640,7 @@ configurationRegistry.registerConfiguration({
 		[ChatConfiguration.AssistedPermissionsEnabled]: {
 			type: 'boolean',
 			default: product.quality !== 'stable',
-			description: nls.localize('chat.assistedPermissions.enabled', "Controls whether Assisted permissions is shown in Agent Host approval pickers."),
+			description: nls.localize('chat.assistedPermissions.enabled', "Controls whether Auto-Review is shown in Agent Host approval pickers."),
 			tags: ['experimental'],
 			experiment: {
 				mode: 'auto'
@@ -674,9 +674,9 @@ configurationRegistry.registerConfiguration({
 					type: 'string',
 					enum: [ChatDefaultPermissionLevel.Manual, ChatDefaultPermissionLevel.Assisted, ChatDefaultPermissionLevel.AllowAll],
 					enumDescriptions: [
-						nls.localize('chat.defaultConfiguration.approvals.manual', "Manual permissions — asks when approval settings don't apply."),
-						nls.localize('chat.defaultConfiguration.approvals.assisted', "Assisted permissions — evaluates risk before running tools."),
-						nls.localize('chat.defaultConfiguration.approvals.allowAll', "Allow All — runs tool calls without asking."),
+						nls.localize('chat.defaultConfiguration.approvals.default', "Default Permissions — ask when needed."),
+						nls.localize('chat.defaultConfiguration.approvals.assisted', "Auto-Review — review tool calls automatically."),
+						nls.localize('chat.defaultConfiguration.approvals.allowAll', "Full Access — run tools without asking."),
 					],
 					default: ChatDefaultPermissionLevel.Manual,
 					description: nls.localize('chat.defaultConfiguration.approvals.description', "The starting approval behavior for new agent sessions. If enterprise policy disables auto approval, new sessions use Manual permissions."),
@@ -2241,6 +2241,9 @@ configurationRegistry.registerConfiguration({
 			description: nls.localize('chat.disableAIFeatures', "Disable and hide built-in AI features provided by GitHub Copilot, including chat and inline suggestions."),
 			default: false,
 			scope: ConfigurationScope.WINDOW,
+			// Fumie: the Agents window is the AI surface — its model providers (BYOK) live in the chat
+			// extension, so a user-scope opt-out meant for editor windows must not disable it here.
+			agentsWindow: { default: false, readOnly: true },
 		},
 		[ChatConfiguration.TitleBarSignInEnabled]: {
 			type: 'boolean',

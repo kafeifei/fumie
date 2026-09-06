@@ -116,15 +116,11 @@ export class AgentHostPermissionPickerDelegate extends Disposable implements IPe
 	getPermissionLevelMeta(level: ChatPermissionLevel, meta: IPermissionLevelMeta): IPermissionLevelMeta {
 		switch (level) {
 			case ChatPermissionLevel.Default:
-				return {
-					...meta,
-					label: localize('agentHostPermissionPicker.manual.label', "Manual permissions"),
-					detail: localize('agentHostPermissionPicker.askWhenNeeded.detail', "Asks when approval settings don't apply"),
-				};
+				return { ...meta, label: localize('agentHostPermissionPicker.default.label', "Default Permissions"), detail: localize('agentHostPermissionPicker.default.detail', "Ask when needed") };
 			case ChatPermissionLevel.Assisted:
-				return { ...meta, detail: localize('agentHostPermissionPicker.approveWhenSafe.detail', "Evaluates risk before running tools") };
+				return { ...meta, label: localize('agentHostPermissionPicker.autoReview.label', "Auto-Review"), detail: localize('agentHostPermissionPicker.autoReview.detail', "Review tool calls automatically"), hover: localize('agentHostPermissionPicker.autoReview.hover', "Reviews each tool call and asks when uncertain.") };
 			case ChatPermissionLevel.AutoApprove:
-				return { ...meta, detail: localize('agentHostPermissionPicker.allowAll.detail', "Runs tool calls without asking") };
+				return { ...meta, label: localize('agentHostPermissionPicker.fullAccess.label', "Full Access"), detail: localize('agentHostPermissionPicker.fullAccess.detail', "Run tools without asking") };
 			case ChatPermissionLevel.Autopilot:
 				return meta;
 		}
@@ -188,11 +184,11 @@ export class AgentHostPermissionPickerDelegate extends Disposable implements IPe
 	getPermissionLevelHover(level: ChatPermissionLevel, _meta: IPermissionLevelMeta): string {
 		switch (level) {
 			case ChatPermissionLevel.Default:
-				return localize('agentHostPermissionPicker.defaultApprovalsHover', "Copilot asks before running tools unless your configured settings allow the tool.");
+				return localize('agentHostPermissionPicker.defaultApprovalsHover', "Uses approval rules and asks when needed.");
 			case ChatPermissionLevel.AutoApprove:
-				return localize('agentHostPermissionPicker.autoApproveHover', "Copilot runs all tools without asking for approval.");
+				return localize('agentHostPermissionPicker.autoApproveHover', "Runs tool calls without asking.");
 			case ChatPermissionLevel.Assisted:
-				return localize('agentHostPermissionPicker.assistedHover', "An LLM judge evaluates each tool call. Tools it doesn't approve require your approval.");
+				return localize('agentHostPermissionPicker.assistedHover', "Reviews each tool call and asks when uncertain.");
 			case ChatPermissionLevel.Autopilot:
 				return localize('agentHostPermissionPicker.autopilotApprovalsHover', "Copilot runs tools without asking for approval and continues until the task is done.");
 		}

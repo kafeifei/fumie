@@ -146,6 +146,17 @@ class SessionsSetUpWidget extends Disposable {
 	}
 
 	private _start(): void {
+		if (this.productService.sessionsRequireDefaultAccount === false) {
+			// The minimal shell intentionally skips the default-account flow, but
+			// the Agents workspace persists `chat.disableAIFeatures` at workspace
+			// scope. Agent Host uses that setting as a hard runtime gate, so merely
+			// skipping sign-in would also disable the Codex/Claude backends after a
+			// clean build. Enable the local AI surface without invoking any account
+			// provider, then release the setup barrier.
+			void this._ensureAIFeaturesEnabled().finally(() => this.onCompleted());
+			return;
+		}
+
 		if (!this.productService.defaultChatAgent?.chatExtensionId) {
 			this.onCompleted();
 			return;

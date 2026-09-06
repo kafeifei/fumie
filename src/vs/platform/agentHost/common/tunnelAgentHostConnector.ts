@@ -15,6 +15,7 @@ import {
 	TUNNEL_AGENT_HOST_PORT,
 	TUNNEL_GATEWAY_MIN_PROTOCOL_VERSION,
 	TUNNEL_GATEWAY_SELECT_PATH,
+	TUNNEL_LAUNCHER_LABEL,
 	TUNNEL_MIN_PROTOCOL_VERSION,
 	TunnelTags,
 	type ITunnelConnectResult,
@@ -128,14 +129,54 @@ export async function deriveConnectionToken(tunnelId: string): Promise<string> {
 }
 
 /**
+ * The Dev Tunnels list request behind a tunnel enumeration.
+ *
+ * The {@link TUNNEL_LAUNCHER_LABEL} filter is what keeps a listing meant for
+ * connecting down to the tunnels this app can actually reach. A listing meant
+ * to account for the user's tunnel allowance must not filter at all: every
+ * tunnel on the account counts towards the cap, whatever created it and
+ * whatever it was labelled.
+ */
+export function tunnelListRequestOptions(includeAllTunnels: boolean | undefined): {
+	labels?: string[];
+	requireAllLabels?: boolean;
+	includePorts: boolean;
+	tokenScopes: string[];
+} {
+	return includeAllTunnels
+		? { includePorts: true, tokenScopes: ['connect'] }
+		: { labels: [TUNNEL_LAUNCHER_LABEL], requireAllLabels: true, includePorts: true, tokenScopes: ['connect'] };
+}
+
+/**
+ * Maps dev-tunnels descriptors to the tunnel information shared with clients.
+ *
+ * A tunnel below {@link TUNNEL_MIN_PROTOCOL_VERSION} cannot serve an agent
+ * host, so a listing meant for connecting drops it; one meant to account for
+ * the allowance keeps it, for the same reason it does not filter by label.
+ */
+export function toTunnelInfos(tunnels: readonly ITunnelDescriptor[], includeAllTunnels: boolean | undefined): ITunnelInfo[] {
+	const infos: ITunnelInfo[] = [];
+	for (const tunnel of tunnels) {
+		const info = parseTunnelInfo(tunnel);
+		if (info && (includeAllTunnels || info.protocolVersion >= TUNNEL_MIN_PROTOCOL_VERSION)) {
+			infos.push(info);
+		}
+	}
+	return infos;
+}
+
+/**
  * Maps a dev-tunnels descriptor to the tunnel information shared with clients.
+ *
+ * Returns `undefined` only for a descriptor with no stable identity. The
+ * protocol-version floor belongs to the caller — see {@link toTunnelInfos} —
+ * because a tunnel that cannot be connected to is still one the account is
+ * paying for out of its allowance.
  */
 export function parseTunnelInfo(tunnel: ITunnelDescriptor): ITunnelInfo | undefined {
 	const labels = tunnel.labels ?? [];
 	const tags = new TunnelTags(labels);
-	if (tags.protocolVersion < TUNNEL_MIN_PROTOCOL_VERSION) {
-		return undefined;
-	}
 
 	const { tunnelId, clusterId } = tunnel;
 	if (!tunnelId || !clusterId) {

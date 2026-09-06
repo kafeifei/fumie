@@ -35,9 +35,39 @@ export interface IChatTodoListService {
 
 export class ChatTodoListStorage implements IChatTodoListStorage {
 	private memento: Memento<Record<string, IChatTodo[]>>;
+	private migrationMemento: Memento<{ legacyCodexPlanTodosRemoved?: boolean }>;
 
 	constructor(@IStorageService storageService: IStorageService) {
 		this.memento = new Memento('chat-todo-list', storageService);
+		this.migrationMemento = new Memento('chat-todo-list-fumie-migrations', storageService);
+		this.removeLegacyCodexPlanTodos();
+	}
+
+	/**
+	 * Fumie previously projected Codex `update_plan` notifications into this
+	 * persistent workbench store. Codex owns those lists as per-turn items, so
+	 * remove that obsolete projection once without touching other providers'
+	 * genuine todo-tool state.
+	 */
+	private removeLegacyCodexPlanTodos(): void {
+		const migrations = this.migrationMemento.getMemento(StorageScope.WORKSPACE, StorageTarget.MACHINE);
+		if (migrations.legacyCodexPlanTodosRemoved) {
+			return;
+		}
+
+		const storage = this.memento.getMemento(StorageScope.WORKSPACE, StorageTarget.MACHINE);
+		let changed = false;
+		for (const key of Object.keys(storage)) {
+			if (key.startsWith('agent-host-codex:')) {
+				delete storage[key];
+				changed = true;
+			}
+		}
+		if (changed) {
+			this.memento.saveMemento();
+		}
+		migrations.legacyCodexPlanTodosRemoved = true;
+		this.migrationMemento.saveMemento();
 	}
 
 	private getSessionData(sessionResource: URI): IChatTodo[] {

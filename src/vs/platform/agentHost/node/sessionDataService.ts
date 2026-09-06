@@ -44,7 +44,8 @@ class SessionDatabaseCollection extends ReferenceCollection<ISessionDatabase> {
 
 /**
  * Implementation of {@link ISessionDataService} that stores per-session data
- * under `{userDataPath}/agentSessionData/{sessionId}/`.
+ * under `{userDataPath}/agentSessionData/{sessionId}/` unless the product
+ * supplies an explicit session-data home.
  */
 export class SessionDataService implements ISessionDataService {
 	declare readonly _serviceBrand: undefined;
@@ -62,8 +63,9 @@ export class SessionDataService implements ISessionDataService {
 		@IFileService private readonly _fileService: IFileService,
 		@ILogService private readonly _logService: ILogService,
 		getDbPath?: (key: string) => string, // for testing
+		sessionDataHome?: URI,
 	) {
-		this._basePath = URI.joinPath(userDataPath, 'agentSessionData');
+		this._basePath = sessionDataHome ?? URI.joinPath(userDataPath, 'agentSessionData');
 		this._databases = new SessionDatabaseCollection(
 			getDbPath ?? (key => URI.joinPath(this._basePath, key, SESSION_DB_FILENAME).fsPath),
 			this._logService,
@@ -141,6 +143,7 @@ export class SessionDataService implements ISessionDataService {
 			}
 		} catch (err) {
 			this._logService.warn(`[SessionDataService] Failed to delete session data: ${dir.toString()}`, err);
+			throw err;
 		}
 	}
 

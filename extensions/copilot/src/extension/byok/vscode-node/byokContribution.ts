@@ -12,7 +12,6 @@ import { IInstantiationService } from '../../../util/vs/platform/instantiation/c
 import { BYOKKnownModels, isClientBYOKAllowed } from '../../byok/common/byokProvider';
 import { IExtensionContribution } from '../../common/contributions';
 import { AbstractLanguageModelChatProvider } from './abstractLanguageModelChatProvider';
-import { AnthropicLMProvider } from './anthropicProvider';
 import { AzureBYOKModelProvider } from './azureProvider';
 import { BYOKStorageService, IBYOKStorageService } from './byokStorageService';
 import { CustomEndpointBYOKModelProvider } from './customEndpointProvider';
@@ -48,13 +47,11 @@ export class BYOKContrib extends Disposable implements IExtensionContribution {
 	private _buildProviders(): void {
 		const instantiationService = this._instantiationService;
 
-		const anthropic = instantiationService.createInstance(AnthropicLMProvider, undefined, this._byokStorageService);
 		const gemini = instantiationService.createInstance(GeminiNativeBYOKLMProvider, undefined, this._byokStorageService);
 		const xai = instantiationService.createInstance(XAIBYOKLMProvider, {}, this._byokStorageService);
 		const openai = instantiationService.createInstance(OAIBYOKLMProvider, {}, this._byokStorageService);
 
 		this._providers.set(OllamaLMProvider.providerId, instantiationService.createInstance(OllamaLMProvider, this._byokStorageService));
-		this._providers.set(AnthropicLMProvider.providerId, anthropic);
 		this._providers.set(GeminiNativeBYOKLMProvider.providerId, gemini);
 		this._providers.set(XAIBYOKLMProvider.providerId, xai);
 		this._providers.set(OAIBYOKLMProvider.providerId, openai);
@@ -64,7 +61,6 @@ export class BYOKContrib extends Disposable implements IExtensionContribution {
 		this._providers.set(CustomEndpointBYOKModelProvider.providerId, instantiationService.createInstance(CustomEndpointBYOKModelProvider, this._byokStorageService));
 
 		this._knownModelsRefreshTargets = [
-			[AnthropicLMProvider.providerName, anthropic],
 			[GeminiNativeBYOKLMProvider.providerName, gemini],
 			[XAIBYOKLMProvider.providerName, xai],
 			[OAIBYOKLMProvider.providerName, openai],

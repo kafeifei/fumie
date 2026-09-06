@@ -31,12 +31,17 @@ positions are fixed by the Agents Window rather than user settings.
 | Part | Ownership |
 |------|-----------|
 | Title bar | Window navigation and window-scoped actions |
-| Sidebar | Sessions list and Sessions-owned sidebar views |
+| Sidebar | Sessions list, Sessions-owned sidebar views, account/status controls, and Settings |
 | Sessions Part | One or more visible session surfaces |
 | Editor | File, browser, diff, and other editor inputs |
 | Auxiliary Bar | Session details such as changes and files |
 | Panel | Terminal and other panel views |
 | Custom View Grid | Full-surface contributed views that replace session content |
+
+The Sidebar owns a persistent footer. On desktop it hosts the combined
+account/status trigger and Settings entry. Phone layouts retain the compact
+account entry and omit Settings. These are Sidebar contributions; the title bar
+remains limited to window navigation and window-scoped actions.
 
 The Sessions Part contains its own horizontal grid. Its leaves are not workbench
 editor groups.
@@ -101,6 +106,14 @@ capability is disabled, which removes editor split/grid commands, keybindings,
 menus, and split drop targets; the part also rejects group creation and
 multi-group layout requests from open-to-side and programmatic paths. The
 independent chat grid remains supported.
+
+The group's editor-title toolbar renders `Menus.SessionsEditorTitle` instead of
+`MenuId.EditorTitle`. `EditorTitleMenuBridgeContribution` mirrors only
+extension-contributed `editor/title` items into it; core actions are never
+bridged, so the buttons the single-tab strip needs — Close, Close (dirty) and
+Unpin — are registered on `Menus.SessionsEditorTitle` explicitly, reusing the
+upstream commands, icons and `when` clauses. An editor that cannot be closed
+(the Changes and Files placeholder tabs) therefore still shows no close button.
 
 The durable state and transition catalog lives in
 [SINGLE_PANE_SCENARIOS.md](SINGLE_PANE_SCENARIOS.md). Implementation behavior is

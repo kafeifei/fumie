@@ -3,67 +3,51 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Codicon } from '../../../../base/common/codicons.js';
-import { URI } from '../../../../base/common/uri.js';
 import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
+import { URI } from '../../../../base/common/uri.js';
 import { ServicesAccessor } from '../../../../editor/browser/editorExtensions.js';
 import { localize, localize2 } from '../../../../nls.js';
-import { Action2, registerAction2 } from '../../../../platform/actions/common/actions.js';
+import { Action2, MenuId, registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { IFileDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
-import { ILabelService } from '../../../../platform/label/common/label.js';
-import { IQuickInputService, IQuickPickItem, IQuickPickSeparator } from '../../../../platform/quickinput/common/quickInput.js';
 import { IsSessionsWindowContext } from '../../../../workbench/common/contextkeys.js';
 import { CHAT_CATEGORY } from '../../../../workbench/contrib/chat/browser/actions/chatActions.js';
-import { ISessionsRecentWorkspacesService } from '../../../services/sessions/browser/sessionsRecentWorkspacesService.js';
 import { ISessionsService } from '../../../services/sessions/browser/sessionsService.js';
+import { NEW_SESSION_PICK_FOLDER_ACTION_ID } from '../common/constants.js';
 
-export interface IFolderQuickPickItem extends IQuickPickItem {
-	readonly folderUri?: URI;
-	/** The provider that previously resolved this folder, so re-picking it keeps the same provider association. */
-	readonly providerId?: string;
-	readonly browse?: boolean;
+/** Native OS folder dialog used by Cmd+O and the Agents titlebar folder chip. */
+export async function pickNativeSessionFolder(
+	fileDialogService: IFileDialogService,
+	defaultUri?: URI,
+): Promise<URI | undefined> {
+	const result = await fileDialogService.showOpenDialog({
+		canSelectFolders: true,
+		canSelectFiles: false,
+		canSelectMany: false,
+		title: localize('sessions.newSession.pickFolder.title', "Select Folder"),
+		defaultUri,
+	});
+	return result?.[0];
 }
 
-/** Builds the flat folder quick pick list: own recents, then VS Code recents (deduplicated), then Browse. */
-export function buildFolderQuickPickItems(
-	recentWorkspacesService: ISessionsRecentWorkspacesService,
-	labelService: ILabelService,
-): (IFolderQuickPickItem | IQuickPickSeparator)[] {
-	const recents = recentWorkspacesService.getRecentWorkspaces();
-
-	const items: (IFolderQuickPickItem | IQuickPickSeparator)[] = [];
-	if (recents.length > 0) {
-		items.push({ type: 'separator', label: localize('sessions.newSession.pickFolderQuickPick.recent', "Recent") });
-		for (const { workspace, providerId } of recents) {
-			const folderUri = workspace.folders[0]?.root;
-			if (!folderUri) {
-				continue;
-			}
-			items.push({
-				folderUri,
-				providerId,
-				label: `$(${workspace.icon.id}) ${workspace.label}`,
-				description: labelService.getUriLabel(folderUri, { relative: false }),
-			});
-		}
-		items.push({ type: 'separator', label: '' });
+/** Opens the native folder dialog and starts a new session in the chosen folder. */
+export async function pickFolderAndOpenNewSession(
+	fileDialogService: IFileDialogService,
+	sessionsService: ISessionsService,
+): Promise<void> {
+	const folderUri = await pickNativeSessionFolder(fileDialogService);
+	if (!folderUri) {
+		return;
 	}
 
-	items.push({
-		label: `$(${Codicon.folderOpened.id}) ${localize('sessions.newSession.pickFolderQuickPick.browse', "Browse...")}`,
-		browse: true,
-	});
-
-	return items;
+	await sessionsService.openNewSession({ folderUri });
 }
 
-/** Alternative entry point to the new-session workspace picker via {@link IQuickInputService.pick}. */
-class NewSessionPickFolderQuickPickAction extends Action2 {
+class NewSessionPickFolderAction extends Action2 {
 
 	constructor() {
 		super({
-			id: 'workbench.action.sessions.newSession.pickFolderQuickPick',
+			id: NEW_SESSION_PICK_FOLDER_ACTION_ID,
 			title: localize2('sessions.newSession.pickFolderQuickPick.label', "New Session in Folder..."),
 			category: CHAT_CATEGORY,
 			f1: true,
@@ -73,43 +57,23 @@ class NewSessionPickFolderQuickPickAction extends Action2 {
 				when: IsSessionsWindowContext,
 				primary: KeyMod.CtrlCmd | KeyCode.KeyO,
 			},
+			menu: {
+				// Native macOS File menu accelerator. File > Open... must not
+				// keep Cmd+O (or steal Cmd+N) in the Agents window.
+				id: MenuId.MenubarFileMenu,
+				group: '2_open',
+				order: 1,
+				when: IsSessionsWindowContext,
+			},
 		});
 	}
 
 	override async run(accessor: ServicesAccessor): Promise<void> {
-		const quickInputService = accessor.get(IQuickInputService);
-		const sessionsService = accessor.get(ISessionsService);
-		const recentWorkspacesService = accessor.get(ISessionsRecentWorkspacesService);
-		const labelService = accessor.get(ILabelService);
-		const fileDialogService = accessor.get(IFileDialogService);
-
-		const items = buildFolderQuickPickItems(recentWorkspacesService, labelService);
-
-		const picked = await quickInputService.pick(items, {
-			placeHolder: localize('sessions.newSession.pickFolderQuickPick.placeholder', "Select a folder to start a new session in"),
-			matchOnDescription: true,
-		});
-		if (!picked) {
-			return;
-		}
-
-		let folderUri = picked.folderUri;
-		let providerId = picked.providerId;
-		if (picked.browse) {
-			const result = await fileDialogService.showOpenDialog({
-				canSelectFolders: true,
-				canSelectFiles: false,
-				canSelectMany: false,
-			});
-			folderUri = result?.[0];
-			providerId = undefined;
-		}
-		if (!folderUri) {
-			return;
-		}
-
-		await sessionsService.openNewSession({ folderUri, providerId });
+		await pickFolderAndOpenNewSession(
+			accessor.get(IFileDialogService),
+			accessor.get(ISessionsService),
+		);
 	}
 }
 
-registerAction2(NewSessionPickFolderQuickPickAction);
+registerAction2(NewSessionPickFolderAction);

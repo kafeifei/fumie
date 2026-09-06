@@ -3,12 +3,15 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import './media/responseSelectionSideChat.css';
 import * as dom from '../../../../base/browser/dom.js';
+import { disposableTimeout } from '../../../../base/common/async.js';
 import { Disposable, IDisposable, MutableDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { KeyCode } from '../../../../base/common/keyCodes.js';
 import { clamp } from '../../../../base/common/numbers.js';
 import { localize } from '../../../../nls.js';
+import { IClipboardService } from '../../../../platform/clipboard/common/clipboardService.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { editorSelectionBackground, editorSelectionForeground } from '../../../../platform/theme/common/colors/editorColors.js';
@@ -96,8 +99,12 @@ function getVisibleBoundingRect(range: Range): { top: number; bottom: number; le
  */
 export class ResponseSelectionSideChatController extends Disposable {
 
+	private readonly _overlay: HTMLElement;
+	private readonly _copyButton: HTMLButtonElement;
 	private readonly _input: FeedbackInputWidget;
 	private _resolved: IResolvedResponseSelection | undefined;
+	/** Live range used to position the overlay (resolved markdown or any transcript selection). */
+	private _range: Range | undefined;
 	/** Range currently painted via the CSS custom highlight, if any. */
 	private _paintedRange: Range | undefined;
 	/** Pins the transcript while a selection or the question input is active. */
@@ -105,6 +112,7 @@ export class ResponseSelectionSideChatController extends Disposable {
 	private _chat: IChat | undefined;
 	/** Bumped on a genuine chat navigation/force-dismiss so a stale submission's completion/error handler can no-op. */
 	private _generation = 0;
+	private readonly _copyReset = this._register(new MutableDisposable());
 
 	constructor(
 		private readonly _widget: IChatWidget,
@@ -113,8 +121,29 @@ export class ResponseSelectionSideChatController extends Disposable {
 		@ISessionsPartService private readonly _sessionsPartService: ISessionsPartService,
 		@ILogService private readonly _logService: ILogService,
 		@INotificationService private readonly _notificationService: INotificationService,
+		@IClipboardService private readonly _clipboardService: IClipboardService,
 	) {
 		super();
+
+		this._overlay = document.createElement('div');
+		this._overlay.classList.add('fumie-chat-selection-overlay');
+		this._overlay.hidden = true;
+
+		this._copyButton = document.createElement('button');
+		this._copyButton.type = 'button';
+		this._copyButton.className = 'fumie-chat-selection-copy';
+		this._copyButton.textContent = localize('sessions.selection.copy', "Copy");
+		this._copyButton.addEventListener('mousedown', e => {
+			// Keep the transcript selection so click can copy it.
+			e.preventDefault();
+			e.stopPropagation();
+		});
+		this._copyButton.addEventListener('click', e => {
+			e.preventDefault();
+			e.stopPropagation();
+			void this._copySelection();
+		});
+		this._overlay.appendChild(this._copyButton);
 
 		this._input = this._register(new FeedbackInputWidget({
 			placeholder: localize('sessions.selectionSideChat.placeholder', "Ask Question"),
@@ -126,7 +155,8 @@ export class ResponseSelectionSideChatController extends Disposable {
 				keybindingLabel: localize('sessions.selectionSideChat.enter', "Enter"),
 			},
 		}));
-		this._widget.domNode.appendChild(this._input.domNode);
+		this._overlay.appendChild(this._input.domNode);
+		this._widget.domNode.appendChild(this._overlay);
 
 		this._register(this._input.onDidTriggerPrimary(() => this._submit()));
 		this._register(dom.addStandardDisposableListener(this._input.inputElement, 'keydown', e => {
@@ -162,7 +192,10 @@ export class ResponseSelectionSideChatController extends Disposable {
 		// (a scrollable code block within a response).
 		this._register(this._widget.onDidScroll(() => this._reposition()));
 		this._register(dom.addDisposableListener(this._widget.domNode, 'scroll', () => this._reposition(), true));
-		this._register(toDisposable(() => this._paintHighlight(undefined)));
+		this._register(toDisposable(() => {
+			this._paintHighlight(undefined);
+			this._overlay.remove();
+		}));
 	}
 
 	/**
@@ -185,10 +218,10 @@ export class ResponseSelectionSideChatController extends Disposable {
 		// The browser collapses the document selection the moment the "Ask
 		// Question" textarea receives focus (textareas don't participate in
 		// the Selection API). Ignore selectionchange entirely while focus is
-		// inside the input so typing doesn't dismiss the widget it just
-		// captured; a real outside invalidation is handled once focus
-		// actually leaves (the next selectionchange runs with focus outside).
-		if (dom.isAncestorOfActiveElement(this._input.domNode)) {
+		// inside the overlay so typing or clicking Copy doesn't dismiss the
+		// widget; a real outside invalidation is handled once focus actually
+		// leaves (the next selectionchange runs with focus outside).
+		if (dom.isAncestorOfActiveElement(this._overlay)) {
 			this._syncHighlight();
 			return;
 		}
@@ -200,12 +233,28 @@ export class ResponseSelectionSideChatController extends Disposable {
 			return;
 		}
 		const resolved = resolveResponseSelection(this._widget);
-		if (!resolved) {
-			this._dismiss();
+		if (resolved) {
+			this._resolved = resolved;
+			this._range = resolved.range;
+			this._showFor(true);
 			return;
 		}
-		this._resolved = resolved;
-		this._showFor();
+		const range = this._transcriptSelectionRange();
+		if (range) {
+			this._resolved = undefined;
+			this._range = range;
+			this._showFor(false);
+			return;
+		}
+		this._dismiss();
+	}
+
+	private _transcriptSelectionRange(): Range | undefined {
+		if (!this._hasTranscriptSelection()) {
+			return undefined;
+		}
+		const selection = dom.getWindow(this._widget.domNode).getSelection();
+		return selection?.getRangeAt(0).cloneRange();
 	}
 
 	/**
@@ -267,25 +316,30 @@ export class ResponseSelectionSideChatController extends Disposable {
 		this._paintedRange = range;
 	}
 
-	private _showFor(): void {
-		this._input.show();
-		this._input.autoSize();
-		this._input.updateActionEnabled();
+	private _showFor(showAsk: boolean): void {
+		this._overlay.hidden = false;
+		if (showAsk) {
+			this._input.show();
+			this._input.autoSize();
+			this._input.updateActionEnabled();
+		} else {
+			this._input.hide();
+		}
 		this._syncHighlight();
 		this._reposition();
 	}
 
 	/**
-	 * Re-anchors the input to the (live) selection range. Called on every
+	 * Re-anchors the overlay to the (live) selection range. Called on every
 	 * transcript scroll so the overlay tracks the text it belongs to instead of
 	 * staying pinned where the selection used to be.
 	 */
 	private _reposition(): void {
-		const resolved = this._resolved;
-		if (!resolved) {
+		const range = this._range;
+		if (!range) {
 			return;
 		}
-		const selectionRect = getVisibleBoundingRect(resolved.range);
+		const selectionRect = getVisibleBoundingRect(range);
 		if (!selectionRect) {
 			// The transcript is virtualized, so scrolling far enough removes the
 			// selected row. Removing a node re-homes any live range onto the
@@ -296,7 +350,7 @@ export class ResponseSelectionSideChatController extends Disposable {
 			this._dismiss();
 			return;
 		}
-		this._input.show();
+		this._overlay.hidden = false;
 
 		// The overlay is a child of the widget, so its coordinates are relative
 		// to that, but it is confined to the scrollable transcript: once the
@@ -305,25 +359,25 @@ export class ResponseSelectionSideChatController extends Disposable {
 		const originRect = this._widget.domNode.getBoundingClientRect();
 		const bounds = this._transcriptBounds();
 		const gap = 4;
-		const inputWidth = this._input.domNode.offsetWidth;
-		const inputHeight = this._input.domNode.offsetHeight;
+		const overlayWidth = this._overlay.offsetWidth;
+		const overlayHeight = this._overlay.offsetHeight;
 
 		const minLeft = bounds.left - originRect.left;
-		const maxLeft = Math.max(minLeft, minLeft + bounds.width - inputWidth);
+		const maxLeft = Math.max(minLeft, minLeft + bounds.width - overlayWidth);
 		const left = clamp(selectionRect.left - originRect.left, minLeft, maxLeft);
 
 		const minTop = bounds.top - originRect.top;
-		const maxTop = Math.max(minTop, minTop + bounds.height - inputHeight);
+		const maxTop = Math.max(minTop, minTop + bounds.height - overlayHeight);
 		let top = selectionRect.bottom - originRect.top + gap;
 		if (top > maxTop) {
 			// Not enough room below the selection: prefer placing it above instead.
-			const aboveTop = selectionRect.top - originRect.top - inputHeight - gap;
+			const aboveTop = selectionRect.top - originRect.top - overlayHeight - gap;
 			top = aboveTop >= minTop ? aboveTop : maxTop;
 		}
 		top = clamp(top, minTop, maxTop);
 
-		this._input.domNode.style.top = `${top}px`;
-		this._input.domNode.style.left = `${left}px`;
+		this._overlay.style.top = `${top}px`;
+		this._overlay.style.left = `${left}px`;
 	}
 
 	/**
@@ -355,18 +409,38 @@ export class ResponseSelectionSideChatController extends Disposable {
 			// A genuine navigation: bump the generation so a stale submission's completion/error handler no-ops.
 			this._generation++;
 		}
-		const hadFocus = dom.isAncestorOfActiveElement(this._input.domNode);
+		const hadFocus = dom.isAncestorOfActiveElement(this._overlay);
 		this._resolved = undefined;
+		this._range = undefined;
 		this._paintHighlight(undefined);
 		this._updateAutoScrollHold();
 		this._input.setBusy(false);
 		this._input.hide();
 		this._input.clearInput();
+		this._overlay.hidden = true;
+		this._copyReset.clear();
+		this._copyButton.textContent = localize('sessions.selection.copy', "Copy");
 		if (hadFocus) {
 			// Hiding the focused input would otherwise leave focus stranded on
 			// the body; return it to the transcript it was invoked from.
 			this._widget.focusResponseItem(true);
 		}
+	}
+
+	private async _copySelection(): Promise<void> {
+		const text = (this._resolved?.text ?? this._nativeSelectionText()).trimEnd();
+		if (!text) {
+			return;
+		}
+		await this._clipboardService.writeText(text);
+		this._copyButton.textContent = localize('sessions.selection.copied', "Copied");
+		this._copyReset.value = disposableTimeout(() => {
+			this._copyButton.textContent = localize('sessions.selection.copy', "Copy");
+		}, 1200);
+	}
+
+	private _nativeSelectionText(): string {
+		return dom.getWindow(this._widget.domNode).getSelection()?.toString() ?? '';
 	}
 
 	private _submit(): void {

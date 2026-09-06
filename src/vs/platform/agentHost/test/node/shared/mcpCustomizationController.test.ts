@@ -59,7 +59,7 @@ function harness(store: Pick<DisposableStore, 'add'>, opts: {
 		pluginMcpServerSources: opts.pluginMcpServerSources,
 		resolveEnablement: opts.resolveEnablement,
 	}, stateManager);
-	return { controller, actions };
+	return { controller, actions, stateManager, session };
 }
 
 function server(name: string, state: McpServerState): ISdkMcpServer {
@@ -324,6 +324,85 @@ suite('McpCustomizationController', () => {
 			.filter(a => a.type === ActionType.SessionCustomizationUpdated)
 			.map(a => (a as { customization: { id: string } }).customization.id);
 		assert.deepStrictEqual(ids, [expectedId, expectedId, expectedId]);
+	});
+
+	test('runtime-first server converges to a plugin child published later', () => {
+		const { controller, actions, stateManager, session } = harness(store);
+		store.add(controller);
+
+		controller.applyOne(server('fs', starting()));
+		const topLevel = controller.topLevelCustomizations()[0];
+		assert.ok(topLevel);
+
+		// This is the production event order: runtime inventory first creates a
+		// temporary top-level entry, then a client customization publication adds
+		// the durable plugin child while the controller still holds that entry.
+		stateManager.dispatchServerAction(session, {
+			type: ActionType.SessionCustomizationsChanged,
+			customizations: [...PLUGIN_CUSTOMIZATIONS, topLevel],
+		});
+		actions.length = 0;
+
+		controller.applyOne(server('fs', ready()));
+
+		assert.deepStrictEqual(actions, [
+			{
+				type: ActionType.SessionCustomizationRemoved,
+				id: 'mcp-top-level:copilot:session-1:fs',
+			},
+			{
+				type: ActionType.SessionMcpServerStateChanged,
+				id: 'mcp-child:demo:fs',
+				state: { kind: McpServerStatus.Ready },
+				channel: MCP_FS_CHANNEL,
+			},
+		]);
+		for (const action of actions) {
+			stateManager.dispatchServerAction(session, action);
+		}
+
+		assert.deepStrictEqual(controller.topLevelCustomizations(), []);
+		assert.deepStrictEqual(controller.runtimeStates.get(), new Map([
+			['mcp-child:demo:fs', { state: { kind: McpServerStatus.Ready }, channel: MCP_FS_CHANNEL }],
+		]));
+		assert.deepStrictEqual(getEffectiveMcpServerCustomizations(
+			stateManager.getSessionState(session)?.customizations ?? [],
+		).map(({ server: customization }) => customization.id), ['mcp-child:demo:fs']);
+
+		actions.length = 0;
+		controller.applyOne(server('fs', errored('after migration')));
+		controller.remove('fs');
+		assert.deepStrictEqual(actions.map(action => action.type === ActionType.SessionMcpServerStateChanged ? action.id : undefined), [
+			'mcp-child:demo:fs',
+			'mcp-child:demo:fs',
+		]);
+		assert.deepStrictEqual(controller.topLevelCustomizations(), []);
+	});
+
+	test('restored duplicate state converges to the child without prior live memory', () => {
+		const duplicateTopLevel: McpServerCustomization = {
+			type: CustomizationType.McpServer,
+			id: 'mcp-top-level:copilot:session-1:fs',
+			uri: 'mcp-top-level:copilot:session-1:fs',
+			name: 'fs',
+			state: starting(),
+		};
+		const { controller, actions, stateManager, session } = harness(store, {
+			customizations: [...PLUGIN_CUSTOMIZATIONS, duplicateTopLevel],
+		});
+		store.add(controller);
+
+		controller.applyOne(server('fs', ready()));
+
+		assert.deepStrictEqual(actions.map(action => action.type), [
+			ActionType.SessionCustomizationRemoved,
+			ActionType.SessionMcpServerStateChanged,
+		]);
+		for (const action of actions) {
+			stateManager.dispatchServerAction(session, action);
+		}
+		assert.strictEqual(controller.customizationIdForServer('fs'), 'mcp-child:demo:fs');
+		assert.deepStrictEqual(controller.topLevelCustomizations(), []);
 	});
 
 	test('bare server publishes reducer-backed enablement across runtime updates', () => {

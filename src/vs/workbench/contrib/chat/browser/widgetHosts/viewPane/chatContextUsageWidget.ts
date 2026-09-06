@@ -20,6 +20,7 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../../../
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { ChatContextKeys } from '../../../common/actions/chatContextKeys.js';
 import { ChatConfiguration } from '../../../common/constants.js';
+import { IChatUsage } from '../../../common/chatService/chatService.js';
 import { IChatRequestModel, IChatResponseModel } from '../../../common/model/chatModel.js';
 import { ILanguageModelConfigurationSchema, ILanguageModelsService } from '../../../common/languageModels.js';
 import { ChatContextUsageDetails, IChatContextUsageData } from './chatContextUsageDetails.js';
@@ -58,6 +59,20 @@ export function resolveContextWindowInputTokens(
 }
 
 /**
+ * Denominator of last resort: the context window the backend reported for the
+ * model call that served the request ({@link IChatUsage.modelContextWindow}).
+ *
+ * @internal - exported for testing
+ */
+export function reportedContextWindow(usage: IChatUsage | undefined): { maxOutputTokens: number | undefined; totalContextWindow: number } | undefined {
+	const reported = usage?.modelContextWindow;
+	if (!reported || reported.totalTokens <= 0) {
+		return undefined;
+	}
+	return { maxOutputTokens: reported.maxOutputTokens, totalContextWindow: reported.totalTokens };
+}
+
+/**
  * Equality comparer for {@link IChatContextUsageData} used to suppress redundant updates.
  *
  * @internal - exported for testing
@@ -75,6 +90,9 @@ export function isSameContextUsageData(a: IChatContextUsageData | undefined, b: 
 		&& a.percentage === b.percentage
 		&& a.outputBufferPercentage === b.outputBufferPercentage
 		&& a.sessionCost === b.sessionCost
+		&& a.cachedPromptTokens === b.cachedPromptTokens
+		&& equals(a.modelTotals, b.modelTotals, (x, y) =>
+			x.model === y.model && x.inputTokens === y.inputTokens && x.cachedTokens === y.cachedTokens && x.outputTokens === y.outputTokens)
 		&& equals(a.promptTokenDetails, b.promptTokenDetails, (x, y) =>
 			x.category === y.category && x.label === y.label && x.percentageOfPrompt === y.percentageOfPrompt);
 }
@@ -223,12 +241,34 @@ export class ChatContextUsageWidget extends Disposable {
 					this.hide();
 				} else if (this._currentData.get()) {
 					this.show();
+				} else {
+					this._showPlaceholderOrHide();
 				}
 			}
 		}));
 
 		// Set up hover - will be configured when data is available
 		this.setupHover();
+	}
+
+	private _sessionsWindowMode = false;
+
+	/**
+	 * Agents-window presentation: the widget stays visible before the session
+	 * has reported any usage (ring-only placeholder instead of appearing only
+	 * after the first reported response), and the external percentage label is
+	 * suppressed — the number lives in the details popup instead. Other chat
+	 * surfaces keep the upstream appear-on-data, hover-percentage behavior.
+	 */
+	setSessionsWindowMode(value: boolean): void {
+		if (this._sessionsWindowMode === value) {
+			return;
+		}
+		this._sessionsWindowMode = value;
+		this.percentageLabel.style.display = value ? 'none' : '';
+		if (value && !this._currentData.get()) {
+			this.renderPlaceholder();
+		}
 	}
 
 	setChatWidget(widget: IChatWidget): void {
@@ -261,7 +301,8 @@ export class ChatContextUsageWidget extends Disposable {
 	};
 
 	private _createDetails(): ChatContextUsageDetails | undefined {
-		if (!this._isVisible.get() || !this._currentData.get()) {
+		// No data gate: with no data the details render their placeholder state.
+		if (!this._isVisible.get()) {
 			return undefined;
 		}
 		if (!this._contextUsageDetails.value) {
@@ -315,30 +356,57 @@ export class ChatContextUsageWidget extends Disposable {
 		if (!lastRequest) {
 			// New/empty chat session clear everything
 			this._currentData.set(undefined, undefined);
-			this.hide();
+			this._showPlaceholderOrHide();
 			return;
 		}
 
-		if (!lastRequest.response || !lastRequest.modelId) {
-			// Pending request keep old data visible if available
+		// The gauge describes the session's context occupancy, which the LAST
+		// request does not always carry: an interrupted or errored trailing
+		// turn, a reconnect's synthetic empty response, or a system turn all
+		// have no usage. Derive from the most recent usage-bearing request so
+		// an earlier turn's known occupancy is never blanked by a data-less
+		// tail; keep following the last request so live usage takes over the
+		// moment it arrives.
+		const target = this._latestUsageRequest(lastRequest) ?? lastRequest;
+		const response = target.response;
+		if (!response) {
 			if (!this._currentData.get()) {
-				this.hide();
+				this._showPlaceholderOrHide();
 			}
 			return;
 		}
-
-		const response = lastRequest.response;
-		const modelId = lastRequest.modelId;
 		this._currentResponse = response;
-		this._currentModelId = modelId;
+		this._currentModelId = target.modelId;
 
 		// Update immediately if usage data is already available
-		this.updateFromResponse(response, modelId);
+		this.updateFromResponse(response, target.modelId);
 
-		// Subscribe to response changes to update whenever usage data changes
-		this._lastRequestDisposable.value = response.onDidChange(() => {
-			this.updateFromResponse(response, modelId);
-		});
+		// Live updates arrive on the last request's response; once it reports
+		// usage it becomes the usage-bearing request. Other change events
+		// (e.g. session cost) re-render the current target.
+		const liveResponse = lastRequest.response;
+		if (liveResponse) {
+			this._lastRequestDisposable.value = liveResponse.onDidChange(() => {
+				if (liveResponse.usage) {
+					this._currentResponse = liveResponse;
+					this._currentModelId = lastRequest.modelId;
+					this.updateFromResponse(liveResponse, lastRequest.modelId);
+				} else if (this._currentResponse) {
+					this.updateFromResponse(this._currentResponse, this._currentModelId);
+				}
+			});
+		}
+	}
+
+	/** The most recent request in the session whose response reported usage. */
+	private _latestUsageRequest(lastRequest: IChatRequestModel): IChatRequestModel | undefined {
+		const requests = lastRequest.session.getRequests();
+		for (let i = requests.length - 1; i >= 0; i--) {
+			if (requests[i].response?.usage) {
+				return requests[i];
+			}
+		}
+		return undefined;
 	}
 
 	updateSessionCost(sessionCost: number): void {
@@ -362,7 +430,7 @@ export class ChatContextUsageWidget extends Disposable {
 		this._modelConfigurationResolver = resolver;
 		this._modelConfigurationListener.value = onDidChange(modelId => {
 			const affectsDisplayedModel = this._currentModelId === modelId || this._selectedModelId === modelId;
-			if (this._currentResponse && this._currentModelId && affectsDisplayedModel) {
+			if (this._currentResponse && affectsDisplayedModel) {
 				this.updateFromResponse(this._currentResponse, this._currentModelId);
 			}
 		});
@@ -379,7 +447,7 @@ export class ChatContextUsageWidget extends Disposable {
 			return;
 		}
 		this._selectedModelId = modelId;
-		if (this._currentResponse && this._currentModelId) {
+		if (this._currentResponse) {
 			this.updateFromResponse(this._currentResponse, this._currentModelId);
 		}
 	}
@@ -414,7 +482,7 @@ export class ChatContextUsageWidget extends Disposable {
 		return { maxOutputTokens, totalContextWindow };
 	}
 
-	private updateFromResponse(response: IChatResponseModel, modelId: string): void {
+	private updateFromResponse(response: IChatResponseModel, modelId: string | undefined): void {
 		const usage = response.usage;
 
 		// When a meta-model (e.g. "auto") routes to a concrete model, the
@@ -424,10 +492,15 @@ export class ChatContextUsageWidget extends Disposable {
 		// The denominator (context window) follows the currently selected model so switching models updates the widget
 		// immediately; the numerator (usage) still comes from the last response. A meta-model such as "auto" has no
 		// context window of its own, so fall back to the model that actually served the request (see issue #321781).
-		const contextWindow = this.resolveContextWindow(this._selectedModelId) ?? this.resolveContextWindow(effectiveModelId);
+		// When the catalog has no window metadata at all (e.g. host-managed gateway models register with neither
+		// `maxPromptTokens` nor `maxOutputTokens`), the backend-reported window of the call that served the request
+		// is the only denominator available.
+		const contextWindow = this.resolveContextWindow(this._selectedModelId)
+			?? this.resolveContextWindow(effectiveModelId)
+			?? reportedContextWindow(usage);
 		if (!usage || !contextWindow) {
 			if (!this._currentData.get()) {
-				this.hide();
+				this._showPlaceholderOrHide();
 			}
 			return;
 		}
@@ -454,6 +527,8 @@ export class ChatContextUsageWidget extends Disposable {
 			usedTokens, completionTokens, totalContextWindow,
 			percentage, outputBufferPercentage,
 			promptTokenDetails, sessionCost: response.session.sessionCost,
+			cachedPromptTokens: usage.cachedPromptTokens,
+			modelTotals: usage.modelTotals,
 		});
 		this.show();
 	}
@@ -476,6 +551,25 @@ export class ChatContextUsageWidget extends Disposable {
 		} else if (data.percentage >= 75) {
 			this.domNode.classList.add('warning');
 		}
+	}
+
+	/** Placeholder or hidden, per {@link setSessionsWindowMode}. */
+	private _showPlaceholderOrHide(): void {
+		if (this._sessionsWindowMode) {
+			this.renderPlaceholder();
+		} else {
+			this.hide();
+		}
+	}
+
+	/** Empty gauge: ring at zero, `–` label. The details popup explains. */
+	private renderPlaceholder(): void {
+		this._currentData.set(undefined, undefined);
+		this.progressIndicator.setProgress(0);
+		this.percentageLabel.textContent = '–';
+		this.domNode.classList.remove('warning', 'error');
+		this.domNode.setAttribute('aria-label', localize('contextUsageNoData', "Context window usage: not yet reported"));
+		this.show();
 	}
 
 	private show(): void {

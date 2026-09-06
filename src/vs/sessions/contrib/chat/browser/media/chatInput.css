@@ -5,7 +5,7 @@
 
 .new-chat-input-container {
 	width: 100%;
-	max-width: 800px;
+	max-width: var(--sessions-new-chat-max-width, 640px);
 	margin-top: 12px;
 	box-sizing: border-box;
 	display: none;
@@ -25,7 +25,7 @@
 
 .new-session-feedback-banners {
 	width: 100%;
-	max-width: 800px;
+	max-width: var(--sessions-new-chat-max-width, 640px);
 }
 
 /* Clear of the picker above only while showing a banner. Prefixed with the stack
@@ -69,7 +69,7 @@
 .new-chat-input-area {
 	position: relative;
 	width: 100%;
-	max-width: 800px;
+	max-width: var(--sessions-new-chat-max-width, 640px);
 	box-sizing: border-box;
 	border: 1px solid var(--vscode-agentsChatInput-border);
 	border-radius:
@@ -179,6 +179,22 @@
 	flex: 1;
 }
 
+/* Attachment and permission controls sit below the input. */
+.sessions-chat-composer-controls {
+	display: flex;
+	align-items: center;
+	gap: var(--vscode-spacing-size40);
+	min-width: 0;
+	min-height: 22px;
+	margin-top: 6px;
+	padding: 0 6px 6px;
+	color: var(--vscode-icon-foreground);
+}
+
+.sessions-chat-composer-controls > .new-chat-session-controls {
+	min-width: 0;
+}
+
 /* Voice mode controls (mic / stop / settings / disconnect) */
 .sessions-chat-voice-toolbar {
 	display: flex;
@@ -192,7 +208,8 @@
 /* Match the send button's control tier (22×22, fully rounded) and the compact
 	glyph size used by the pickers, so the voice controls, the dictation mic and
 	Send all read as one row. */
-.sessions-chat-voice-toolbar .monaco-action-bar .action-item > .action-label {
+.sessions-chat-voice-toolbar .monaco-action-bar .action-item > .action-label,
+.sessions-chat-dictation-toolbar .monaco-action-bar .action-item > .action-label {
 	box-sizing: border-box;
 	width: 22px;
 	height: 22px;
@@ -321,85 +338,34 @@
 	gap: 2px;
 }
 
-/* Send button - wraps a Button widget. Circular, matching the send button in the
-	editor chat composer (chat.css) and the Agents window's active chat. */
+/* Send uses the same ActionBar item as existing chats. */
 .sessions-chat-send-button {
 	display: flex;
 	align-items: center;
-	justify-content: center;
 	flex-shrink: 0;
-	position: relative;
-	width: 22px;
-	height: 22px;
-	border-radius: var(--vscode-cornerRadius-circle);
 }
 
-.sessions-chat-send-button .monaco-button {
-	display: flex;
-	align-items: center;
-	justify-content: center;
+.sessions-chat-send-button .chat-submit-button > .action-label {
+	box-sizing: border-box;
 	width: 22px;
 	height: 22px;
-	min-width: 22px;
 	padding: 0;
-	font-size: var(--vscode-codiconFontSize-compact);
+	justify-content: center;
 	border-radius: var(--vscode-cornerRadius-circle);
-	color: var(--vscode-icon-foreground);
-	background: transparent;
-	border: none;
-	cursor: pointer;
-	position: relative;
-	z-index: 1;
-	transition: background-color 250ms ease, color 250ms ease;
-}
-
-.sessions-chat-send-button .monaco-button.disabled {
-	cursor: default;
-}
-
-/* Focus indicator drawn on the wrapper so it sits cleanly around the
-	22x22 button surface (the inner Button widget doesn't draw its own
-	focus border). */
-.sessions-chat-send-button:has(.monaco-button:not(.disabled):focus-visible) {
-	outline: 1px solid var(--vscode-focusBorder);
-	outline-offset: 1px;
-}
-
-/* Suppress the inner button's default focus outline so it doesn't double up
-	with the wrapper outline above. */
-.sessions-chat-send-button .monaco-button:focus,
-.sessions-chat-send-button .monaco-button:focus-visible {
-	outline: none !important;
-	box-shadow: none !important;
-}
-
-.monaco-workbench .sessions-chat-send-button .monaco-button.codicon[class*='codicon-']::before,
-.monaco-workbench .sessions-chat-send-button .monaco-button .codicon[class*='codicon-']::before {
-	display: inline-block;
 	font-size: var(--vscode-codiconFontSize-compact);
-	transform: translateY(0.5px);
 }
 
-/* Ensure no underline / link decoration ever shows under the codicon glyph
-	(the button is rendered as an <a> tag). */
-.monaco-workbench .sessions-chat-send-button a.monaco-button,
-.monaco-workbench .sessions-chat-send-button a.monaco-button:hover,
-.monaco-workbench .sessions-chat-send-button a.monaco-button:focus,
-.monaco-workbench .sessions-chat-send-button a.monaco-button:active,
-.monaco-workbench .sessions-chat-send-button a.monaco-button.disabled {
-	text-decoration: none !important;
-}
-
-/* Idle: solid primary button background. */
-.sessions-chat-send-button .monaco-button:not(.disabled) {
+.sessions-chat-send-button .chat-submit-button:not(.disabled) > .action-label {
 	background: var(--vscode-button-background);
-	color: var(--vscode-button-foreground) !important;
-	transition: background-color 120ms ease;
+	color: var(--vscode-button-foreground);
 }
 
-.sessions-chat-send-button:has(.monaco-button:not(.disabled):hover) .monaco-button,
-.sessions-chat-send-button:has(.monaco-button:not(.disabled):focus-visible) .monaco-button {
+.sessions-chat-send-button .chat-submit-button:not(.disabled) > .action-label:hover {
 	background: var(--vscode-button-hoverBackground);
+}
+
+.sessions-chat-dictation-toolbar.hidden {
+	display: none;
 }
 
 /* Loading spinner in toolbar */
@@ -655,4 +621,3 @@
 .sessions-chat-attachment-remove:hover {
 	background-color: var(--vscode-toolbar-hoverBackground);
 }
-

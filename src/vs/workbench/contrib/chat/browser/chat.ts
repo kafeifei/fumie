@@ -29,6 +29,7 @@ import { ChatAgentLocation, ChatModeKind } from '../common/constants.js';
 import { ChatAttachmentModel } from './attachments/chatAttachmentModel.js';
 import { IChatEditorOptions } from './widgetHosts/editor/chatEditor.js';
 import { ChatInputPart } from './widget/input/chatInputPart.js';
+import type { IModelPickerDelegateAdapter } from './widget/input/modelPicker/modelPickerActionItem.js';
 import { ChatWidget, IChatWidgetContrib } from './widget/chatWidget.js';
 import { ICodeBlockActionContext, ICodeBlockRenderOptions } from './widget/chatContentParts/codeBlockPart.js';
 import { AgentSessionTarget } from './agentSessions/agentSessions.js';
@@ -307,6 +308,9 @@ export interface IChatWidgetViewOptions {
 	 * the user wants to send a request to a specific workspace.
 	 */
 	workspacePickerDelegate?: IWorkspacePickerDelegate;
+
+	/** Optional presentation adapter applied to the native model-picker delegate. */
+	modelPickerDelegateAdapter?: IModelPickerDelegateAdapter;
 
 	/**
 	 * Optional handler for chat submission.

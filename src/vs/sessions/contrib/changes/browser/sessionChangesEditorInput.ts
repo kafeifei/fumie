@@ -90,8 +90,8 @@ export class SessionChangesEditorInput extends DockedEditorInput {
 		return this.innerInput;
 	}
 
-	async getViewModel(): Promise<MultiDiffEditorViewModel> {
-		return this.innerInput.getViewModel();
+	async getViewModel(options?: { readonly waitForDiffOr1s?: boolean }): Promise<MultiDiffEditorViewModel> {
+		return this.innerInput.getViewModel(options);
 	}
 
 	clear(): void {

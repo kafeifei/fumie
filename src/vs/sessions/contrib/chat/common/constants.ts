@@ -4,3 +4,4 @@
  *--------------------------------------------------------------------------------------------*/
 
 export const NEW_SESSION_ACTION_ID = 'workbench.action.sessions.newChat';
+export const NEW_SESSION_PICK_FOLDER_ACTION_ID = 'workbench.action.sessions.newSession.pickFolderQuickPick';

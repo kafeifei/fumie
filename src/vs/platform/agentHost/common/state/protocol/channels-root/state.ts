@@ -93,14 +93,23 @@ export interface AgentInfo {
 
 /**
  * Static capabilities an {@link AgentInfo} advertises. Modelled after MCP
- * capabilities: each field is opt-in and its presence (an empty object `{}`)
- * signals support, while absence means the feature is unsupported and the
- * corresponding client commands MUST NOT be used. Sub-fields carry
- * per-capability options.
+ * capabilities: feature fields are opt-in and their presence signals support,
+ * while descriptive fields document how an existing surface behaves. See each
+ * field for its absence semantics. Sub-fields carry per-capability options.
  *
  * @category Root State
  */
 export interface AgentCapabilities {
+	/**
+	 * Describes whether this agent owns a standalone model catalog or projects
+	 * models from shared catalogs. Clients may use projected models for session
+	 * selection, but SHOULD NOT present the projection as an independently
+	 * manageable provider.
+	 *
+	 * When absent, clients SHOULD treat the catalog as `owned` for backwards
+	 * compatibility with agents published before this capability existed.
+	 */
+	modelCatalog?: 'owned' | 'projected';
 	/**
 	 * The agent can host more than one concurrent chat per session. When absent,
 	 * clients MUST NOT call `createChat` to open chats beyond the default one the
@@ -195,6 +204,19 @@ export interface MultipleWorkingDirectoriesCapability {
 export interface SessionModelInfo {
 	/** Model identifier */
 	id: string;
+	/**
+	 * The raw model id as the agent's own runtime reports it in usage and
+	 * transcripts, when it differs from {@link id}.
+	 *
+	 * An agent may decorate the ids it publishes — a provider qualification, a
+	 * BYOK vendor route — so a picker row carries the routing with it. Its
+	 * runtime knows nothing of that decoration and keeps naming the bare model,
+	 * so a client matching a reported model back to this catalog has no way to
+	 * recognize it. Publishing the undecorated id alongside the decorated one is
+	 * what makes that translation possible without a client parsing an id shape
+	 * only the agent owns. Absent when the agent publishes the raw id as-is.
+	 */
+	underlyingModelId?: string;
 	/** Provider this model belongs to */
 	provider: string;
 	/** Human-readable model name */

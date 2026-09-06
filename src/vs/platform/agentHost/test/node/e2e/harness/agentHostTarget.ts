@@ -38,6 +38,8 @@ export interface IAgentHostTargetLaunchOptions {
 	readonly claudeSdkRoot?: string;
 	/** Optional dev override for a locally installed Codex SDK root. */
 	readonly codexSdkRoot?: string;
+	/** Optional dev override for a locally built Kimi SDK root. */
+	readonly kimiSdkRoot?: string;
 	/** Optional agent-host log level (`--log <level>`); `trace` also raises the bundled SDK/CLI to its most verbose. */
 	readonly logLevel?: string;
 	/** Optional environment overrides for implementation lifecycle test hooks. */
@@ -73,6 +75,7 @@ export const vscodeAgentHostTarget: IAgentHostTarget = {
 			existingCapiReplay: options.existingCapiReplay,
 			claudeSdkRoot: options.claudeSdkRoot,
 			codexSdkRoot: options.codexSdkRoot,
+			kimiSdkRoot: options.kimiSdkRoot,
 			logLevel: options.logLevel,
 			env: options.env,
 		});

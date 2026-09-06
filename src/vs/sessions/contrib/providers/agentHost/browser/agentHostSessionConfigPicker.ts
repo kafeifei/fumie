@@ -36,6 +36,7 @@ import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase 
 import { type IChatInputPickerOptions } from '../../../../../workbench/contrib/chat/browser/widget/input/chatInputPickerActionItem.js';
 import { Menus } from '../../../../browser/menus.js';
 import { SessionProviderIdContext, IsPhoneLayoutContext, IsQuickChatSessionContext } from '../../../../common/contextkeys.js';
+import { IsSessionsWindowContext } from '../../../../../workbench/common/contextkeys.js';
 import { IWorkbenchLayoutService } from '../../../../../workbench/services/layout/browser/layoutService.js';
 import { reportNewChatPickerClosed } from '../../../chat/browser/newChatPickerTelemetry.js';
 import { ISessionsProvidersService } from '../../../../services/sessions/browser/sessionsProvidersService.js';
@@ -44,7 +45,6 @@ import { ISessionContext } from '../../../../services/sessions/browser/sessionCo
 import { ISessionsService } from '../../../../services/sessions/browser/sessionsService.js';
 import type { ISessionsProvider } from '../../../../services/sessions/common/sessionsProvider.js';
 import { type IAgentHostSessionsProvider, isAgentHostProvider, LOCAL_AGENT_HOST_PROVIDER_ID, REMOTE_AGENT_HOST_PROVIDER_RE } from '../../../../common/agentHostSessionsProvider.js';
-import { PermissionPicker } from '../../copilotChatSessions/browser/permissionPicker.js';
 import { MobilePermissionPicker } from '../../copilotChatSessions/browser/mobilePermissionPicker.js';
 import { isPhoneLayout } from '../../../../browser/parts/mobile/mobileLayout.js';
 import { showMobilePickerSheet, IMobilePickerSheetItem, IMobilePickerSheetSearchSource } from '../../../../browser/parts/mobile/mobilePickerSheet.js';
@@ -459,7 +459,13 @@ export class AgentHostSessionConfigPicker extends Disposable {
 				renderedIsolationCheckbox = true;
 				continue;
 			}
-			const slot = dom.append(this._container, dom.$('.sessions-chat-picker-slot'));
+			const slot = dom.$('.sessions-chat-picker-slot');
+			const stableIsolationSlot = this._isolationCheckbox.value?.slot;
+			if (property === SessionConfigKey.Branch && stableIsolationSlot?.parentElement === this._container) {
+				this._container.insertBefore(slot, stableIsolationSlot);
+			} else {
+				dom.append(this._container, slot);
+			}
 			if (property === SessionConfigKey.Isolation) {
 				this._renderDisposables.add(markOnboardingTarget(slot, 'sessions.newSession.isolation'));
 			}
@@ -503,15 +509,15 @@ export class AgentHostSessionConfigPicker extends Disposable {
 	/**
 	 * Order the schema properties for rendering. The base implementation
 	 * enforces a stable visual sequence for well-known properties:
-	 * Isolation (worktree/folder) first, then Branch. Any other properties
+	 * Branch first, then Isolation (the Worktree checkbox). Any other properties
 	 * keep their original schema order after these two. Subclasses can
 	 * override to impose a different deterministic visual sequence
 	 * (e.g. the mobile chip row groups Approvals | Branch | Worktree).
 	 */
 	protected _orderProperties(properties: ReadonlyArray<[string, SessionConfigPropertySchema]>): ReadonlyArray<[string, SessionConfigPropertySchema]> {
 		const order = new Map<string, number>([
-			[SessionConfigKey.Isolation, 0],
-			[SessionConfigKey.Branch, 1],
+			[SessionConfigKey.Branch, 0],
+			[SessionConfigKey.Isolation, 1],
 		]);
 		return properties
 			.map(([key, schema], index) => ({ key, schema, index }))
@@ -574,7 +580,7 @@ export class AgentHostSessionConfigPicker extends Disposable {
 	}
 
 	private _renderIsolationCheckbox(sessionId: string, schema: SessionConfigPropertySchema, value: unknown | undefined, isReadOnly: boolean, isLoading: boolean): void {
-		const label = localize('agentHostSessionConfig.isolation.worktree', "New Worktree");
+		const label = localize('agentHostSessionConfig.isolation.worktree', "Worktree");
 		const worktreeIndex = schema.enum?.indexOf('worktree') ?? -1;
 		const tooltip = (worktreeIndex >= 0 ? schema.enumDescriptions?.[worktreeIndex] : undefined) ?? schema.description ?? schema.title;
 
@@ -582,7 +588,7 @@ export class AgentHostSessionConfigPicker extends Disposable {
 		if (!control || control.sessionId !== sessionId) {
 			control = new IsolationCheckboxControl(sessionId, label, this._hoverService, checked => this._applyIsolationValue(sessionId, checked));
 			this._isolationCheckbox.value = control;
-			this._container?.prepend(control.slot);
+			this._container?.append(control.slot);
 		}
 		control.update(value === 'worktree', isReadOnly, isLoading, tooltip);
 	}
@@ -1009,7 +1015,7 @@ export class PickerActionViewItem extends BaseActionViewItem {
 	}
 }
 
-class AgentHostSessionConfigPickerContribution extends Disposable implements IWorkbenchContribution {
+export class AgentHostSessionConfigPickerContribution extends Disposable implements IWorkbenchContribution {
 	static readonly ID = 'sessions.contrib.agentHostSessionConfigPicker';
 
 	constructor(
@@ -1017,6 +1023,7 @@ class AgentHostSessionConfigPickerContribution extends Disposable implements IWo
 		@IWorkbenchLayoutService private readonly _layoutService: IWorkbenchLayoutService,
 	) {
 		super();
+		const permissionPickerFactory = this._createPermissionPickerFactory();
 		// The mode-picker factories below pick the mobile subclass at
 		// view-item construction time when the viewport is phone, and
 		// the desktop class otherwise. The session-config picker
@@ -1061,7 +1068,7 @@ class AgentHostSessionConfigPickerContribution extends Disposable implements IWo
 		this._register(actionViewItemService.register(
 			Menus.NewSessionControl,
 			NEW_SESSION_APPROVE_PICKER_ID,
-			(_action, _options, scopedInstantiationService) => this._createNewSessionPermissionPicker(scopedInstantiationService),
+			permissionPickerFactory,
 		));
 		this._register(actionViewItemService.register(
 			Menus.NewSessionControl,
@@ -1080,9 +1087,22 @@ class AgentHostSessionConfigPickerContribution extends Disposable implements IWo
 			},
 		));
 		this._register(actionViewItemService.register(
+			MenuId.ChatInput,
+			RUNNING_SESSION_CONFIG_PICKER_ID,
+			permissionPickerFactory,
+		));
+		this._register(actionViewItemService.register(
 			MenuId.ChatInputSecondary,
 			RUNNING_SESSION_CONFIG_PICKER_ID,
-			this._createRunningSessionPermissionPickerFactory(),
+			permissionPickerFactory,
+		));
+		this._register(actionViewItemService.register(
+			MenuId.ChatInput,
+			RUNNING_SESSION_PERMISSION_MODE_PICKER_ID,
+			(_action, _options, scopedInstantiationService) => {
+				const { session } = scopedInstantiationService.invokeFunction(accessor => accessor.get(ISessionContext));
+				return new PickerActionViewItem(scopedInstantiationService.createInstance(AgentHostClaudePermissionModePicker, session));
+			},
 		));
 		this._register(actionViewItemService.register(
 			MenuId.ChatInputSecondary,
@@ -1090,6 +1110,14 @@ class AgentHostSessionConfigPickerContribution extends Disposable implements IWo
 			(_action, _options, scopedInstantiationService) => {
 				const { session } = scopedInstantiationService.invokeFunction(accessor => accessor.get(ISessionContext));
 				return new PickerActionViewItem(scopedInstantiationService.createInstance(AgentHostClaudePermissionModePicker, session));
+			},
+		));
+		this._register(actionViewItemService.register(
+			MenuId.ChatInput,
+			RUNNING_SESSION_CODEX_APPROVALS_PICKER_ID,
+			(_action, _options, scopedInstantiationService) => {
+				const { session } = scopedInstantiationService.invokeFunction(accessor => accessor.get(ISessionContext));
+				return new PickerActionViewItem(scopedInstantiationService.createInstance(AgentHostCodexApprovalsPicker, session));
 			},
 		));
 		this._register(actionViewItemService.register(
@@ -1102,30 +1130,17 @@ class AgentHostSessionConfigPickerContribution extends Disposable implements IWo
 		));
 	}
 
-	/**
-	 * On the new-chat page (left of the toolbar), use the sessions
-	 * {@link PermissionPicker} so the styling matches the surrounding sessions
-	 * pickers (font size, padding, icon size).
-	 */
-	private _createNewSessionPermissionPicker(instantiationService: IInstantiationService): PickerActionViewItem {
-		const { session } = instantiationService.invokeFunction(accessor => accessor.get(ISessionContext));
-		const delegate = instantiationService.createInstance(AgentHostPermissionPickerDelegate, session);
-		const picker = instantiationService.createInstance(MobilePermissionPicker, delegate);
-		return new PickerActionViewItem(picker, delegate);
-	}
-
-	/**
-	 * Inside a running chat widget (`ChatInputSecondary`), use the workbench
-	 * {@link PermissionPickerActionItem} so it matches the rest of the
-	 * chat-input secondary toolbar (which is what the extension-host CLI
-	 * already uses).
-	 */
-	private _createRunningSessionPermissionPickerFactory(): IActionViewItemFactory {
+	private _createPermissionPickerFactory(): IActionViewItemFactory {
 		return (action, _options, instantiationService) => {
+			const { session } = instantiationService.invokeFunction(accessor => accessor.get(ISessionContext));
+			if (isPhoneLayout(this._layoutService)) {
+				const delegate = instantiationService.createInstance(AgentHostPermissionPickerDelegate, session);
+				const picker = instantiationService.createInstance(MobilePermissionPicker, delegate);
+				return new PickerActionViewItem(picker, delegate);
+			}
 			if (!(action instanceof MenuItemAction)) {
 				return undefined;
 			}
-			const { session } = instantiationService.invokeFunction(accessor => accessor.get(ISessionContext));
 			const pickerOptions: IChatInputPickerOptions = {
 				compact: constObservable(true),
 				listOptions: { minWidth: 255 },
@@ -1208,7 +1223,7 @@ registerAction2(class extends Action2 {
 	override async run(): Promise<void> { }
 });
 
-// ---- New session mode picker (NewSessionControl) ----
+// ---- New session mode picker (hidden in Agents composer; Interactive/Plan/Autopilot is not a harness chip) ----
 
 const NEW_SESSION_MODE_PICKER_ID = 'sessions.agentHost.newSessionModePicker';
 
@@ -1218,18 +1233,6 @@ registerAction2(class extends Action2 {
 			id: NEW_SESSION_MODE_PICKER_ID,
 			title: localize2('agentHostNewSessionModePicker', "Agent Mode"),
 			f1: false,
-			menu: [{
-				id: Menus.NewSessionControl,
-				group: 'navigation',
-				order: 0,
-				// On phone the {@link MobileChatInputConfigPicker} replaces
-				// this picker with a unified mode + model bottom sheet, so
-				// gate this desktop-only Action out of phone layouts.
-				when: ContextKeyExpr.and(
-					ContextKeyExpr.or(IsActiveSessionLocalAgentHost, IsActiveSessionRemoteAgentHost),
-					IsPhoneLayoutContext.negate(),
-				),
-			}],
 		});
 	}
 
@@ -1320,7 +1323,7 @@ registerAction2(class extends Action2 {
 				group: 'navigation',
 				order: 9,
 				// Hide the agent mode picker while a delegation (continue in) target is pending.
-				when: ContextKeyExpr.and(ChatContextKeyExprs.isAgentHostSession, ChatContextKeys.hasPendingDelegationTarget.negate()),
+				when: ContextKeyExpr.and(ChatContextKeyExprs.isAgentHostSession, ChatContextKeys.hasPendingDelegationTarget.negate(), IsSessionsWindowContext.negate()),
 			}],
 		});
 	}

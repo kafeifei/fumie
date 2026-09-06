@@ -395,7 +395,28 @@ export function formatResponseTokenStats(modelTotals: readonly IChatUsageModelTo
 	return { markdown, markdownNotSupportedFallback, footerAriaLabel };
 }
 
+/**
+ * Whether this part stands for a subagent that is still running. Background
+ * subagents outlive the turn that spawned them: the host keeps streaming their
+ * tool call after the parent response completes, so such a part is the only
+ * anchor the user has for work that is still happening.
+ */
+export function isRunningSubagentPart(part: IChatRendererContent): boolean {
+	if (part.kind !== 'toolInvocation' && part.kind !== 'toolInvocationSerialized') {
+		return false;
+	}
+	if (part.toolSpecificData?.kind !== 'subagent' || !isParentSubagentTool(part)) {
+		return false;
+	}
+	return part.toolSpecificData.isActive ?? !IChatToolInvocation.isComplete(part);
+}
+
 export function shouldCollapseCompletedResponsePart(part: IChatRendererContent): boolean {
+	// A subagent that is still working must stay outside the disclosure, or the
+	// user loses every trace of it the moment they send the next message.
+	if (isRunningSubagentPart(part)) {
+		return false;
+	}
 	return (part.kind !== 'toolInvocation' && part.kind !== 'toolInvocationSerialized') || !toolInvocationHasMcpAppData(part);
 }
 
@@ -683,6 +704,13 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 	 * by screen readers
 	 */
 	private readonly _announcedToolProgressKeys = new Set<string>();
+
+	/**
+	 * Set while a response row is being rendered. Out-of-band disclosure
+	 * refreshes stand down then, because the render pass recomputes the
+	 * disclosure itself once its content and parts agree again.
+	 */
+	private _isRenderingContentDiff = false;
 
 	constructor(
 		editorOptions: ChatEditorOptions,
@@ -1687,6 +1715,15 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 	}
 
 	private renderChatResponseBasic(element: IChatResponseViewModel, index: number, templateData: IChatListItemTemplate) {
+		this._isRenderingContentDiff = true;
+		try {
+			this.doRenderChatResponseBasic(element, index, templateData);
+		} finally {
+			this._isRenderingContentDiff = false;
+		}
+	}
+
+	private doRenderChatResponseBasic(element: IChatResponseViewModel, index: number, templateData: IChatListItemTemplate) {
 		templateData.rowContainer.classList.toggle('chat-response-loading', (isResponseVM(element) && !element.isComplete));
 
 		this.finalizeCompletedResponseParts(element, templateData);
@@ -1737,7 +1774,7 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 			lastThinking.finalizeTitleIfDefault();
 			lastThinking.markAsInactive();
 		}
-		this.finalizeAllSubagentParts(templateData, true);
+		this.finalizeAllSubagentParts(templateData, true, !element.isCanceled);
 	}
 
 	private shouldShowWorkingProgress(element: IChatResponseViewModel, partsToRender: IChatRendererContent[], moreContentAvailable: boolean, templateData: IChatListItemTemplate): IChatWorkingProgress | undefined {
@@ -3181,7 +3218,13 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		return undefined;
 	}
 
-	private finalizeAllSubagentParts(templateData: IChatListItemTemplate, force: boolean = false): void {
+	/**
+	 * @param keepRunningSubagents Spares subagents the host still reports as
+	 * running even when `force` is set. Background subagents keep working after
+	 * the turn that launched them completes, so ending that turn must not retire
+	 * their pill; a cancelled turn stops them, so it passes `false`.
+	 */
+	private finalizeAllSubagentParts(templateData: IChatListItemTemplate, force: boolean = false, keepRunningSubagents: boolean = false): void {
 		if (!templateData.renderedParts) {
 			return;
 		}
@@ -3189,7 +3232,13 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		// Finalize all active subagent parts (there can be multiple parallel subagents)
 		// Skip subagents that still have tools waiting for confirmation
 		for (const part of templateData.renderedParts) {
-			if (part instanceof ChatSubagentContentPart && part.getIsActive() && (force || !part.shouldRemainActive()) && (force || !part.hasToolsWaitingForConfirmation)) {
+			if (!(part instanceof ChatSubagentContentPart) || !part.getIsActive()) {
+				continue;
+			}
+			if (keepRunningSubagents && part.shouldRemainActive()) {
+				continue;
+			}
+			if (force || (!part.shouldRemainActive() && !part.hasToolsWaitingForConfirmation)) {
 				part.markAsInactive(force);
 			}
 		}
@@ -3229,6 +3278,19 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 			this._announcedToolProgressKeys,
 		);
 		this.beginSubagentToolPresentationBatch(subagentPart, batchedSubagentParts);
+
+		// A background subagent settles after its turn was rendered. Re-run the
+		// disclosure then, so the finished pill folds into the turn's collapsed
+		// steps instead of lingering below them forever.
+		const element = context.element;
+		if (isResponseVM(element)) {
+			templateData.elementDisposables.add(subagentPart.onDidChangeActiveState(() => {
+				if (!this._isRenderingContentDiff) {
+					this.updateCompletedResponseDisclosure(element, templateData.renderedContent ?? [], templateData, false);
+				}
+			}));
+		}
+
 		// Enable carousel mode before appendToolInvocation creates an inline part.
 		this.maybeRouteSubagentToolToCarousel(toolInvocation, subagentPart, context, templateData, codeBlockStartIndex);
 

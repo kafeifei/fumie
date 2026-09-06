@@ -45,7 +45,18 @@ suite('agent SDK version pins stay in lockstep', () => {
 		const expected: typeof actual = {};
 
 		for (const sdk of getSdks()) {
-			const { name, version } = getAgentMeta(sdk);
+			const meta = getAgentMeta(sdk);
+			const { name, version } = meta;
+			if (meta.kind === 'source') {
+				actual[sdk] = {
+					name,
+					buildPin: version,
+					runtimePin: meta.commit,
+					lockPin: meta.packageManager,
+				};
+				expected[sdk] = { ...actual[sdk] };
+				continue;
+			}
 			actual[sdk] = {
 				name,
 				buildPin: version,
@@ -65,7 +76,7 @@ suite('agent SDK version pins stay in lockstep', () => {
 		assert.deepStrictEqual(
 			actual,
 			expected,
-			`An agent SDK version pin drifted. The build pin in build/agent-sdk/agents/<sdk>/package.json must match the runtime pin in repo-root package.json devDependencies and the resolved version in agents/<sdk>/package-lock.json. See "Bumping an SDK version" in build/agent-sdk/README.md.`,
+			`An agent SDK version pin drifted. npm SDK pins must match repo-root devDependencies and agents/<sdk>/package-lock.json. Source SDKs must declare an exact commit and package-manager version. See "Bumping an SDK version" in build/agent-sdk/README.md.`,
 		);
 	});
 });

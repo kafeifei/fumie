@@ -19,7 +19,13 @@ import { ExplorerFolderContext } from '../../../../workbench/contrib/files/commo
 import { IExplorerService } from '../../../../workbench/contrib/files/browser/files.js';
 import { OpenEditorCommandId } from '../../../../workbench/contrib/searchEditor/browser/constants.js';
 import { resolveResourcesForSearchIncludes } from '../../../../workbench/services/search/common/queryBuilder.js';
+import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../../workbench/common/contributions.js';
 import { SESSIONS_FILES_VIEW_ID } from '../../files/browser/filesView.js';
+import { AgentHostSearchProviderContribution } from './agentHostSearchProvider.js';
+
+// Every entry point below opens the Search Editor, so they all reach
+// `ISearchService.textSearch` and all need the agent-host provider.
+registerWorkbenchContribution2(AgentHostSearchProviderContribution.ID, AgentHostSearchProviderContribution, WorkbenchPhase.BlockRestore);
 
 KeybindingsRegistry.registerKeybindingRule({
 	id: OpenEditorCommandId,

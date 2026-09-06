@@ -21,6 +21,7 @@ import { cancelOnDispose } from '../../../../base/common/cancellation.js';
 
 export class MultiDiffEditorViewModel extends Disposable {
 	private readonly _documents: IObservable<readonly RefCounted<IDocumentDiffItem>[] | 'loading'>;
+	private readonly _isComplete: IObservable<boolean>;
 
 	private readonly _documentsArr = derived(this, reader => {
 		const result = this._documents.read(reader);
@@ -40,10 +41,14 @@ export class MultiDiffEditorViewModel extends Disposable {
 
 	public async waitForDiffOr1s(): Promise<void> {
 		if (this._documents.get() === 'loading') {
-			await waitForState(this._documents, documents => documents !== 'loading');
+			await waitForState(this._documents, documents => documents !== 'loading', undefined, cancelOnDispose(this._store));
 		}
 
 		await this._waitForNewDiffs.get().promise;
+	}
+
+	public async waitForComplete(): Promise<void> {
+		await waitForState(this._isComplete, isComplete => isComplete, undefined, cancelOnDispose(this._store));
 	}
 
 	public collapseAll(): void {
@@ -103,6 +108,9 @@ export class MultiDiffEditorViewModel extends Disposable {
 		});
 
 		const resolved = new ObservableResolvedPromise(this._waitForNewDiffs, [] as readonly RefCounted<DocumentDiffItemViewModel>[], this._store);
+		this._isComplete = this.model.isComplete
+			? observableFromValueWithChangeEvent(this.model, this.model.isComplete)
+			: constObservable(true);
 
 		this.items = derived(this, reader => {
 			const resolvedItems = resolved.lastResolved.read(reader);
@@ -112,9 +120,15 @@ export class MultiDiffEditorViewModel extends Disposable {
 			});
 		});
 
-		this.isLoading = derived(this, reader =>
-			this._documents.read(reader) === 'loading' || resolved.isResolving.read(reader)
-		);
+		this.isLoading = derived(this, reader => {
+			const documents = this._documents.read(reader);
+			if (documents === 'loading' || !this._isComplete.read(reader) || resolved.isResolving.read(reader)) {
+				return true;
+			}
+			const items = this.items.read(reader);
+			return documents.length !== items.length
+				|| documents.some((document, index) => items[index]?.documentDiffItem !== document.object);
+		});
 	}
 }
 

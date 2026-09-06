@@ -230,6 +230,7 @@ import '../workbench/services/agentHost/electron-browser/agentHostService.js';
 import '../platform/agentHost/electron-browser/sshRemoteAgentHostService.js';
 import '../platform/agentHost/electron-browser/wslRemoteAgentHostService.js';
 import './contrib/providers/remoteAgentHost/electron-browser/tunnelAgentHostService.js';
+import './services/remoteAgentHostInventory/browser/remoteAgentHostInventoryService.js';
 import './contrib/providers/remoteAgentHost/browser/remoteAgentHost.contribution.js';
 import './contrib/providers/remoteAgentHost/browser/remoteAgentHostTerminal.contribution.js';
 import './contrib/providers/remoteAgentHost/browser/tunnelAgentHost.contribution.js';
@@ -240,7 +241,6 @@ import './contrib/providers/remoteAgentHost/electron-browser/forgetSSHHostKeyCom
 // Copilot cloud sandbox connections (copilot-developer-cli) over a Web PubSub AHP relay
 import './contrib/providers/remoteAgentHost/browser/cloudSandboxAgentHost.contribution.js';
 // Chat
-import './contrib/agentFeedback/browser/agentFeedback.contribution.js';
 import './contrib/chat/electron-browser/chat.contribution.js';
 
 // Local Agent Host
@@ -253,6 +253,11 @@ import './contrib/providers/agentHost/browser/agentMergeActions.js';
 import './contrib/providers/agentHost/browser/agentHostSkillButtons.js';
 import './contrib/providers/agentHost/browser/openSubagentChat.js';
 import './contrib/providers/agentHost/electron-browser/agentHost.contribution.js';
+
+// Claude / Codex subscriptions as providers the user can add in Manage Models.
+// Local-only, like the agent host whose published catalog they read from.
+import './contrib/providers/subscriptionModels/browser/subscriptionModels.contribution.js';
+// Custom model endpoints use the BYOK provider catalog
 
 // Tunnel Host (allow remote connections to local agent host)
 import './contrib/tunnelHost/electron-browser/tunnelHost.contribution.js';

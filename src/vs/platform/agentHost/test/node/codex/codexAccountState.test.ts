@@ -5,7 +5,7 @@
 
 import * as assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
-import { codexAccountRateLimitFromResponse, codexAccountStateFromResponse } from '../../../node/codex/codexAccountState.js';
+import { codexAccountRateLimitFromResponse, codexAccountStateFromResponse, describeCodexRateLimitWindows, shouldApplyCodexRateLimits, type ICodexAccountState } from '../../../node/codex/codexAccountState.js';
 
 suite('CodexAccountState', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -43,7 +43,7 @@ suite('CodexAccountState', () => {
 		);
 	});
 
-	test('prefers the Codex weekly rate-limit window', () => {
+	test('keeps both windows of the Codex rate-limit snapshot', () => {
 		assert.deepStrictEqual(codexAccountRateLimitFromResponse({
 			rateLimits: {
 				limitId: null,
@@ -70,10 +70,11 @@ suite('CodexAccountState', () => {
 				},
 			},
 			rateLimitResetCredits: null,
+			accountId: null,
+			rateLimitUpsell: null,
 		}), {
-			usedPercent: 42.4,
-			windowDurationMins: 7 * 24 * 60,
-			resetsAt: 300,
+			primary: { usedPercent: 21, windowDurationMins: 300, resetsAt: 200 },
+			secondary: { usedPercent: 42.4, windowDurationMins: 7 * 24 * 60, resetsAt: 300 },
 		});
 	});
 
@@ -92,7 +93,37 @@ suite('CodexAccountState', () => {
 			},
 			rateLimitsByLimitId: null,
 			rateLimitResetCredits: null,
-		}), { usedPercent: 100, windowDurationMins: undefined, resetsAt: undefined });
+			accountId: null,
+			rateLimitUpsell: null,
+		}), { primary: { usedPercent: 100, windowDurationMins: undefined, resetsAt: undefined } });
+	});
+
+	test('reports nothing when the snapshot carries no usable window', () => {
+		const emptySnapshot = {
+			limitId: null,
+			limitName: null,
+			primary: null,
+			secondary: null,
+			credits: null,
+			individualLimit: null,
+			spendControlReached: null,
+			planType: null,
+			rateLimitReachedType: null,
+		};
+		assert.strictEqual(codexAccountRateLimitFromResponse({
+			rateLimits: emptySnapshot,
+			rateLimitsByLimitId: null,
+			rateLimitResetCredits: null,
+			accountId: null,
+			rateLimitUpsell: null,
+		}), undefined);
+		assert.strictEqual(codexAccountRateLimitFromResponse({
+			rateLimits: { ...emptySnapshot, primary: { usedPercent: Number.NaN, windowDurationMins: 300, resetsAt: 100 } },
+			rateLimitsByLimitId: null,
+			rateLimitResetCredits: null,
+			accountId: null,
+			rateLimitUpsell: null,
+		}), undefined);
 	});
 
 	test('falls back when the Codex bucket has no windows', () => {
@@ -122,6 +153,35 @@ suite('CodexAccountState', () => {
 				},
 			},
 			rateLimitResetCredits: null,
-		}), { usedPercent: 30, windowDurationMins: 10080, resetsAt: 400 });
+			accountId: null,
+			rateLimitUpsell: null,
+		}), { primary: { usedPercent: 30, windowDurationMins: 10080, resetsAt: 400 } });
+	});
+
+	test('only the newest rate-limit refresh may write its response', () => {
+		const signedIn: ICodexAccountState = { usageSource: 'openai', status: 'signedIn', authType: 'chatgpt', email: 'private@example.com' };
+		const context = {
+			requestGeneration: 3,
+			latestGeneration: 3,
+			connectionMatches: true,
+			account: signedIn,
+			accountEmail: 'private@example.com',
+		};
+
+		assert.strictEqual(shouldApplyCodexRateLimits(context), true);
+		// A response overtaken by a newer refresh must not clobber it, even though
+		// every other condition still holds.
+		assert.strictEqual(shouldApplyCodexRateLimits({ ...context, latestGeneration: 4 }), false);
+		assert.strictEqual(shouldApplyCodexRateLimits({ ...context, connectionMatches: false }), false);
+		assert.strictEqual(shouldApplyCodexRateLimits({ ...context, accountEmail: 'other@example.com' }), false);
+		assert.strictEqual(shouldApplyCodexRateLimits({ ...context, account: { ...signedIn, authType: 'apiKey' } }), false);
+		assert.strictEqual(shouldApplyCodexRateLimits({ ...context, account: { usageSource: 'openai', status: 'signedOut' } }), false);
+	});
+
+	test('names the window slots an accepted snapshot carried', () => {
+		assert.strictEqual(describeCodexRateLimitWindows(undefined), 'none');
+		assert.strictEqual(describeCodexRateLimitWindows({ primary: { usedPercent: 30 } }), 'primary');
+		assert.strictEqual(describeCodexRateLimitWindows({ secondary: { usedPercent: 30 } }), 'secondary');
+		assert.strictEqual(describeCodexRateLimitWindows({ primary: { usedPercent: 30 }, secondary: { usedPercent: 40 } }), 'primary+secondary');
 	});
 });

@@ -15,6 +15,7 @@ import {
 	IByokLmChatRequest,
 	IByokLmChatResult,
 	IByokLmModelInfo,
+	IByokLmProviderConfiguration,
 } from './agentHostByokLm.js';
 
 /**
@@ -37,6 +38,7 @@ export const AGENT_HOST_CLIENT_BYOK_LM_CHANNEL = 'agentHostClientByokLm';
 export function createAgentHostClientByokLmConnection(channel: IChannel): IByokLmBridgeConnection {
 	return {
 		chat: (request) => channel.call('chat', request) as Promise<IByokLmChatResult>,
+		resolveProviderConfiguration: modelIdentifier => channel.call('resolveProviderConfiguration', modelIdentifier) as Promise<IByokLmProviderConfiguration | undefined>,
 		onDidChangeModels: channel.listen<IByokLmModelInfo[]>('models'),
 	};
 }
@@ -90,6 +92,7 @@ export class AgentHostClientByokLmChannel implements IServerChannel {
 				try {
 					const models = await this._handler.listModels(CancellationToken.None);
 					if (!store.isDisposed) {
+						this._logService.trace(`AgentHostClientByokLmChannel: publishing ${models.length} model(s)`);
 						emitter.fire(models);
 					}
 				} catch (err) {
@@ -106,6 +109,10 @@ export class AgentHostClientByokLmChannel implements IServerChannel {
 		switch (command) {
 			case 'chat': {
 				const result = await this._handler.chat(arg as IByokLmChatRequest, CancellationToken.None);
+				return result as T;
+			}
+			case 'resolveProviderConfiguration': {
+				const result = await this._handler.resolveProviderConfiguration?.(arg as string, CancellationToken.None);
 				return result as T;
 			}
 		}

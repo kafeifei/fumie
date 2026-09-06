@@ -73,6 +73,76 @@ suite('ByokLmBridgeRegistry', () => {
 		reg.dispose();
 	});
 
+	test('whenModelsAvailable ignores startup-empty snapshots and resolves on the first model', async () => {
+		const registry = new ByokLmBridgeRegistry();
+		const conn = pushable();
+		const reg = store.add(registry.register('renderer', conn.connection));
+		let resolved = false;
+		void registry.whenModelsAvailable.then(() => { resolved = true; });
+
+		conn.push([]);
+		await Promise.resolve();
+		assert.strictEqual(resolved, false);
+
+		conn.push([{ vendor: 'customendpoint', id: 'gpt-5.6-sol' }]);
+		await registry.whenModelsAvailable;
+		assert.strictEqual(resolved, true);
+
+		reg.dispose();
+	});
+
+	test('whenInitialSnapshot resolves on an authoritative empty catalog', async () => {
+		const registry = new ByokLmBridgeRegistry();
+		const conn = pushable();
+		store.add(registry.register('renderer', conn.connection));
+		let modelsAvailable = false;
+		void registry.whenModelsAvailable.then(() => { modelsAvailable = true; });
+
+		conn.push([]);
+		await registry.whenInitialSnapshot;
+		await Promise.resolve();
+
+		assert.deepStrictEqual({ models: registry.getModels(), modelsAvailable }, {
+			models: [],
+			modelsAvailable: false,
+		});
+	});
+
+	test('waitForInitialSnapshot is scoped to the named renderer connection', async () => {
+		const registry = new ByokLmBridgeRegistry();
+		const first = pushable();
+		const second = pushable();
+		store.add(registry.register('first', first.connection));
+		store.add(registry.register('second', second.connection));
+		const secondReady = registry.waitForInitialSnapshot('second');
+		let secondResolved = false;
+		void secondReady?.then(() => { secondResolved = true; });
+
+		first.push([{ vendor: 'customendpoint', id: 'claude' }]);
+		await Promise.resolve();
+		assert.strictEqual(secondResolved, false);
+
+		second.push([]);
+		await secondReady;
+		assert.strictEqual(secondResolved, true);
+	});
+
+	test('waitForInitialSnapshot also enforces registration-before-handshake ordering', async () => {
+		const registry = new ByokLmBridgeRegistry();
+		const ready = registry.waitForInitialSnapshot('renderer');
+		let resolved = false;
+		void ready.then(() => { resolved = true; });
+		const conn = pushable();
+
+		store.add(registry.register('renderer', conn.connection));
+		await Promise.resolve();
+		assert.strictEqual(resolved, false);
+
+		conn.push([{ vendor: 'customendpoint', id: 'claude' }]);
+		await ready;
+		assert.strictEqual(resolved, true);
+	});
+
 	test('a window that pushed empty does not shadow a peer that has models, even when it connected first', () => {
 		const registry = new ByokLmBridgeRegistry();
 		// The Agents app connects first and pushes empty (its BYOK extension has
@@ -208,6 +278,23 @@ suite('ByokLmBridgeRegistry', () => {
 			}],
 		});
 
+		reg.dispose();
+	});
+
+	test('treats maximum output tokens as model metadata', () => {
+		const registry = new ByokLmBridgeRegistry();
+		const conn = pushable();
+		const reg = store.add(registry.register('client-a', conn.connection));
+		conn.push([{ vendor: 'acme', id: 'model', maxOutputTokens: 8_192 }]);
+
+		let changes = 0;
+		store.add(registry.onDidChangeModels(() => { changes++; }));
+		conn.push([{ vendor: 'acme', id: 'model', maxOutputTokens: 16_384 }]);
+
+		assert.deepStrictEqual({ changes, models: registry.getModels() }, {
+			changes: 1,
+			models: [{ vendor: 'acme', id: 'model', maxOutputTokens: 16_384 }],
+		});
 		reg.dispose();
 	});
 });

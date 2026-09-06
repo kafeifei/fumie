@@ -20,27 +20,41 @@ import { IUriIdentityService } from '../../../../platform/uriIdentity/common/uri
 import { IWorkbenchLayoutService } from '../../../../workbench/services/layout/browser/layoutService.js';
 import { ISessionsProvidersService } from '../../../services/sessions/browser/sessionsProvidersService.js';
 import { ISessionsRecentWorkspacesService } from '../../../services/sessions/browser/sessionsRecentWorkspacesService.js';
-import { IAgentHostFilterService } from '../../../services/agentHostFilter/common/agentHostFilter.js';
+import { AgentHostFilterScope, IAgentHostFilterService } from '../../../services/agentHostFilter/common/agentHostFilter.js';
+import { isAgentHostProviderId, LOCAL_AGENT_HOST_PROVIDER_ID } from '../../../common/agentHostSessionsProvider.js';
 import { IWorkspacePickerItem, IWorkspacePickerOptions, WorkspacePicker } from './sessionWorkspacePicker.js';
 import { showMobileWorkspacePickerSheet, shouldUseMobileWorkspacePickerSheet } from './mobile/mobileWorkspacePickerSheet.js';
+
+/**
+ * Whether a workspace provider belongs to the given machine scope. The `all`
+ * scope takes every agent-host provider — on web, where this picker lives,
+ * that is the union of the known remote hosts — so the picker keeps working
+ * when the user is not scoped to a single machine.
+ */
+export function isProviderInMachineScope(scope: AgentHostFilterScope, providerId: string): boolean {
+	if (scope.kind === 'host') {
+		return providerId === scope.providerId;
+	}
+	if (scope.kind === 'local') {
+		return providerId === LOCAL_AGENT_HOST_PROVIDER_ID;
+	}
+	return isAgentHostProviderId(providerId);
+}
 
 /**
  * Web variant of {@link WorkspacePicker} for the Agents window's
  * vscode.dev / insiders.vscode.dev surface. Two responsibilities on
  * top of the desktop picker:
  *
- *  1. Scopes its contents to the host currently selected in the agent
- *     host filter — recent workspaces for that host plus a single
- *     "Select Folder..." entry that invokes the host's browse action.
+ *  1. Scopes its contents to the machine scope of the agent host filter —
+ *     recent workspaces of the in-scope hosts plus one "Select Folder..."
+ *     entry per host that can browse. In the "All Machines" scope every
+ *     agent-host provider qualifies.
  *  2. On phone-layout viewports renders the picker as a bottom sheet
  *     (via `showMobileWorkspacePickerSheet`) instead of the desktop
  *     action-widget popup. Falls through to `super.showPicker()` on
  *     non-phone viewports, so a single instance works correctly
  *     across rotation across the phone breakpoint.
- *
- * Falls back to the Copilot local provider when no host is selected
- * (e.g. on Electron desktop, where the host filter UI is not
- * surfaced).
  */
 export class WebWorkspacePicker extends WorkspacePicker {
 
@@ -65,7 +79,7 @@ export class WebWorkspacePicker extends WorkspacePicker {
 		super(
 			{
 				...options,
-				sessionWorkspaceProviderFilter: providerId => providerId === _agentHostFilterService.selectedProviderId,
+				sessionWorkspaceProviderFilter: providerId => isProviderInMachineScope(_agentHostFilterService.scope, providerId),
 			},
 			actionWidgetService,
 			uriIdentityService,
@@ -82,15 +96,15 @@ export class WebWorkspacePicker extends WorkspacePicker {
 			notificationService,
 		);
 
-		// When the scoped host changes, if the current selection no longer
-		// belongs to the selected host, reset it: prefer the most recent
-		// workspace for the new host, otherwise clear the selection.
+		// When the machine scope changes, if the current selection no longer
+		// belongs to it, reset it: prefer the most recent workspace in the
+		// new scope, otherwise clear the selection.
 		this._register(this._agentHostFilterService.onDidChange(() => this._onScopedHostChanged()));
 	}
 
 	protected override _showTabs(): boolean {
-		// Scoped picker is already filtered to a single host — the categorical
-		// tab bar would be redundant.
+		// The picker is already filtered to the machine scope — the
+		// categorical tab bar would be redundant.
 		return false;
 	}
 
@@ -117,9 +131,8 @@ export class WebWorkspacePicker extends WorkspacePicker {
 	}
 
 	private _onScopedHostChanged(): void {
-		const scopedProviderId = this._agentHostFilterService.selectedProviderId;
 		const currentResolved = this.selectedResolved;
-		if (currentResolved && scopedProviderId !== undefined && currentResolved.providerId === scopedProviderId) {
+		if (currentResolved && this._isInScope(currentResolved.providerId)) {
 			this._onDidChangeSelection.fire();
 			return;
 		}
@@ -127,20 +140,17 @@ export class WebWorkspacePicker extends WorkspacePicker {
 		this._resetAutomaticSelection();
 	}
 
+	/** Whether a registered provider is part of the current machine scope. */
+	private _isInScope(providerId: string): boolean {
+		return isProviderInMachineScope(this._agentHostFilterService.scope, providerId)
+			&& !!this.sessionsProvidersService.getProvider(providerId);
+	}
+
 	protected override _buildItems(): IActionListItem<IWorkspacePickerItem>[] {
 		const items: IActionListItem<IWorkspacePickerItem>[] = [];
 
-		const scopedProviderId = this._agentHostFilterService.selectedProviderId;
-		if (scopedProviderId === undefined) {
-			return [];
-		}
-		const provider = this.sessionsProvidersService.getProvider(scopedProviderId);
-		if (!provider) {
-			return items;
-		}
-
-		// 1. Recent workspaces for the scoped provider
-		const recents = this._getRecentWorkspaces().filter(w => w.providerId === scopedProviderId);
+		// 1. Recent workspaces of every in-scope provider
+		const recents = this._getRecentWorkspaces().filter(w => this._isInScope(w.providerId));
 		for (const { workspace, providerId } of recents) {
 			const folderUri = workspace.folders[0]?.root;
 			if (!folderUri) {
@@ -157,18 +167,34 @@ export class WebWorkspacePicker extends WorkspacePicker {
 			});
 		}
 
-		// 2. "Select Folder..." — dispatches the scoped provider's first browse action
-		const allBrowseActions = this._getAllBrowseActions();
-		const browseIndex = allBrowseActions.findIndex(a => a.providerId === scopedProviderId);
-		if (browseIndex >= 0 && !this._isProviderUnavailable(scopedProviderId)) {
-			if (items.length > 0) {
-				items.push({ kind: ActionListItemKind.Separator, label: '' });
+		// 2. "Select Folder..." — dispatches each in-scope provider's first
+		// browse action. One entry per provider: in a single-host scope that
+		// is the host's own browse action, in the "All Machines" scope one
+		// per host, disambiguated by the provider name.
+		const browseEntries: { readonly index: number; readonly providerId: string }[] = [];
+		const seenProviders = new Set<string>();
+		this._getAllBrowseActions().forEach((action, index) => {
+			if (seenProviders.has(action.providerId)
+				|| !this._isInScope(action.providerId)
+				|| this._isProviderUnavailable(action.providerId)) {
+				return;
 			}
+			seenProviders.add(action.providerId);
+			browseEntries.push({ index, providerId: action.providerId });
+		});
+
+		if (browseEntries.length > 0 && items.length > 0) {
+			items.push({ kind: ActionListItemKind.Separator, label: '' });
+		}
+		for (const { index, providerId } of browseEntries) {
 			items.push({
 				kind: ActionListItemKind.Action,
 				label: localize('scopedWorkspacePicker.selectFolder', "Select Folder..."),
+				description: browseEntries.length > 1
+					? this.sessionsProvidersService.getProvider(providerId)?.label
+					: undefined,
 				group: { title: '', icon: Codicon.folderOpened },
-				item: { browseActionIndex: browseIndex },
+				item: { browseActionIndex: index },
 			});
 		}
 

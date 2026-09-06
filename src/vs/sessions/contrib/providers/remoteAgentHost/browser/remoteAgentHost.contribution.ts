@@ -28,12 +28,16 @@ import { IDefaultAccountService } from '../../../../../platform/defaultAccount/c
 import { IInstantiationService, ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { INotificationService } from '../../../../../platform/notification/common/notification.js';
+import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { Registry } from '../../../../../platform/registry/common/platform.js';
 import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../../../workbench/common/contributions.js';
 import { registerAction2 } from '../../../../../platform/actions/common/actions.js';
 import { OpenAgentHostStateFileAction } from '../../agentHost/browser/openAgentHostStateFileAction.js';
-import { authenticateProtectedResources, AgentHostAuthenticationRecovery, AgentHostAuthTokenCache, resolveAuthenticationInteractively } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostAuth.js';
+import { authenticateProtectedResources, AgentHostAuthenticationRecovery, AgentHostAuthTokenCache, forwardsWorkbenchCredentials, resolveAuthenticationInteractively } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostAuth.js';
 import { AgentHostLanguageModelProvider, agentHostProviderSupportsAutoModel } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostLanguageModelProvider.js';
+import { registerAgentHostModelSourcePresentations } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostModelSourcePresentations.js';
+import { agentHostModelProviderPresentationRegistry } from '../../../../../workbench/services/agentHost/browser/agentHostModelProviderPresentation.js';
+import { RemoteAgentSdkSetup } from './remoteAgentSdkSetup.js';
 import { AgentHostSessionHandler } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.js';
 import { IAgentHostActiveClientService } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostActiveClientService.js';
 import { ChatSessionsExtensions, IAsyncChatSessionActivationRegistry, IChatSessionsService } from '../../../../../workbench/contrib/chat/common/chatSessionsService.js';
@@ -297,6 +301,7 @@ export class RemoteAgentHostContribution extends Disposable implements IWorkbenc
 		@ICustomizationHarnessService private readonly _customizationHarnessService: ICustomizationHarnessService,
 		@IAgentHostTerminalService private readonly _agentHostTerminalService: IAgentHostTerminalService,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
+		@IProductService private readonly _productService: IProductService,
 		@IAgentHostActiveClientService private readonly _activeClientService: IAgentHostActiveClientService,
 		@IRemoteAgentHostConnectionCustomizationService private readonly _connectionCustomizations: IRemoteAgentHostConnectionCustomizationService,
 	) {
@@ -1025,10 +1030,20 @@ export class RemoteAgentHostContribution extends Disposable implements IWorkbenc
 		// Language model provider.
 		// Order matters: `updateModels` must be called after
 		// `registerLanguageModelProvider` so the initial `onDidChange` is observed.
-		const vendorDescriptor = { vendor, displayName, configuration: undefined, managementCommand: undefined, when: undefined };
+		// Hidden from Manage Models for the same reason as the local host's vendor:
+		// it routes a harness's models, it is not an entry the user manages.
+		const vendorDescriptor = { vendor, displayName, configuration: undefined, managementCommand: undefined, when: undefined, hiddenFromManagement: true };
 		this._languageModelsService.deltaLanguageModelChatProviderDescriptors([vendorDescriptor], []);
 		agentStore.add(toDisposable(() => this._languageModelsService.deltaLanguageModelChatProviderDescriptors([], [vendorDescriptor])));
-		const modelProvider = agentStore.add(new AgentHostLanguageModelProvider(sessionType, vendor));
+		// Same shape as the local host's registration: the agent's own catalog
+		// capability decides whether an empty list is worth reporting, and the
+		// presentation names the sign-in this host is missing.
+		agentStore.add(registerAgentHostModelSourcePresentations(agent.provider, vendor));
+		const remotePresentationFactory = agentHostModelProviderPresentationRegistry.getRemote(agent.provider);
+		const presentation = remotePresentationFactory
+			? remotePresentationFactory(agentStore.add(new RemoteAgentSdkSetup(connection)))
+			: undefined;
+		const modelProvider = agentStore.add(new AgentHostLanguageModelProvider(sessionType, vendor, agent.capabilities?.modelCatalog, presentation));
 		connState.modelProviders.set(agent.provider, modelProvider);
 		agentStore.add(toDisposable(() => connState.modelProviders.delete(agent.provider)));
 		agentStore.add(this._languageModelsService.registerLanguageModelProvider(vendor, modelProvider));
@@ -1056,6 +1071,18 @@ export class RemoteAgentHostContribution extends Disposable implements IWorkbenc
 	private async _authenticateWithConnection(address: string, connection: IAgentConnection, agents: readonly AgentInfo[]): Promise<void> {
 		const providerId = `agenthost-${agentHostAuthority(address)}`;
 		const provider = this._sessionsProvidersService.getProvider<RemoteAgentHostSessionsProvider>(providerId);
+		if (!forwardsWorkbenchCredentials(this._productService)) {
+			// Same decision the local host already makes in
+			// `AgentHostContribution._authenticateWithServer`, and it has to hold
+			// here too: the browser driving this machine has no authentication
+			// provider to resolve a token from, and the empty token a failed pass
+			// forwards would revoke the credential the host is already running on.
+			// Root state changes on every turn, so the pass also runs several times
+			// per session open. The provider still has to leave its initial pending
+			// state or its sessions stay loading forever.
+			provider?.setAuthenticationPending(false);
+			return;
+		}
 		const authTokenCache = this._connections.get(address)?.authTokenCache;
 		provider?.setAuthenticationPending(true);
 		try {
@@ -1183,6 +1210,7 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 					address: { type: 'string', description: nls.localize('chat.remoteAgentHosts.address', "The WebSocket address of the remote agent host (e.g. \"localhost:3000\").") },
 					name: { type: 'string', description: nls.localize('chat.remoteAgentHosts.name', "A display name for this remote agent host.") },
 					connectionToken: { type: 'string', description: nls.localize('chat.remoteAgentHosts.connectionToken', "An optional connection token for authenticating with the remote agent host.") },
+					clientId: { type: 'string', description: nls.localize('chat.remoteAgentHosts.clientId', "An optional stable client identifier to present to this host instead of a fresh one per connection, so the host can recognise this client across reloads. It identifies only — it grants no access; authentication is the connection token.") },
 				},
 				required: ['address', 'name'],
 			},

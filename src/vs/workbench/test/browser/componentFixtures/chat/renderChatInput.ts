@@ -9,6 +9,10 @@ import { URI } from '../../../../../base/common/uri.js';
 import { mock } from '../../../../../base/test/common/mock.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
+import { ContextView, ContextViewDOMPosition } from '../../../../../base/browser/ui/contextview/contextview.js';
+import { IActionWidgetService } from '../../../../../platform/actionWidget/browser/actionWidget.js';
+import { IContextViewService } from '../../../../../platform/contextview/browser/contextView.js';
+import { getSingletonServiceDescriptors } from '../../../../../platform/instantiation/common/extensions.js';
 import { IMenuService, MenuId } from '../../../../../platform/actions/common/actions.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { TestConfigurationService } from '../../../../../platform/configuration/test/common/testConfigurationService.js';
@@ -82,6 +86,8 @@ export interface ChatInputFixtureOptions {
 	readonly width?: number;
 	/** Supplies models so the picker renders provider icons. */
 	readonly models?: readonly ILanguageModelChatMetadataAndIdentifier[];
+	/** Exercises the host's presentation adapter with the real native model picker. */
+	readonly modelPickerDelegateAdapter?: IChatInputPartOptions['modelPickerDelegateAdapter'];
 	/** Renders a standalone dictation / Voice Mode control in the given state. */
 	readonly voiceControl?: VoiceControlState;
 	/**
@@ -102,6 +108,25 @@ export async function renderChatInput(context: ComponentFixtureContext, fixtureO
 		colorTheme: context.theme,
 		additionalServices: (reg) => {
 			registerChatFixtureServices(reg, { artifactGroups: artifactsObs, todos, notification });
+			if (fixtureOptions.modelPickerDelegateAdapter) {
+				// These fixtures exercise the dropdown rows, not only the selected
+				// model label. Use the registered action widget with a real popup.
+				const actionWidget = getSingletonServiceDescriptors().find(([id]) => id === IActionWidgetService)?.[1];
+				if (!actionWidget) {
+					throw new Error('Action widget service is not registered');
+				}
+				reg.define(IActionWidgetService, actionWidget.ctor);
+				const contextView = disposableStore.add(new ContextView(container, ContextViewDOMPosition.ABSOLUTE));
+				reg.definePartialInstance(IContextViewService, {
+					showContextView: delegate => {
+						contextView.show(delegate);
+						return { close: () => contextView.hide() };
+					},
+					hideContextView: () => contextView.hide(),
+					getContextViewElement: () => contextView.getViewElement(),
+					layout: () => contextView.layout(),
+				});
+			}
 			if (models.length > 0) {
 				const modelsById = new Map(models.map(model => [model.identifier, model]));
 				reg.defineInstance(ILanguageModelsService, new class extends mock<ILanguageModelsService>() {
@@ -153,17 +178,21 @@ export async function renderChatInput(context: ComponentFixtureContext, fixtureO
 	container.appendChild(session);
 
 	const menuService = instantiationService.get(IMenuService) as FixtureMenuService;
-	menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.attachContext', title: '+', icon: Codicon.addCompact }, group: 'navigation', order: -1 });
+	menuService.addItem(isSessionsWindow ? MenuId.ChatInputSecondary : MenuId.ChatInput, { command: { id: 'workbench.action.chat.attachContext', title: '+', icon: Codicon.addCompact }, group: 'navigation', order: -1 });
 	menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.openModePicker', title: 'Agent' }, group: 'navigation', order: 1 });
 	menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.openModelPicker', title: 'GPT-5.3-Codex' }, group: 'navigation', order: 3 });
-	menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.configureTools', title: '', icon: Codicon.settingsCompact }, group: 'navigation', order: 100 });
+	if (!isSessionsWindow) {
+		menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.configureTools', title: '', icon: Codicon.settingsCompact }, group: 'navigation', order: 100 });
+	}
 	if (voiceControl) {
 		// Order 2 puts the voice control between the pickers and Send, where the
 		// real dictation / Voice Mode actions are contributed.
 		menuService.addItem(MenuId.ChatExecute, { command: { id: 'fixture.voiceControl', title: 'Voice', icon: voiceControlRenderings[voiceControl].icon }, group: 'navigation', order: 2 });
 	}
 	menuService.addItem(MenuId.ChatExecute, { command: { id: 'workbench.action.chat.submit', title: 'Send', icon: Codicon.arrowUpCompact }, group: 'navigation', order: 4 });
-	menuService.addItem(MenuId.ChatInputSecondary, { command: { id: 'workbench.action.chat.openSessionTargetPicker', title: 'Local' }, group: 'navigation', order: 0 });
+	if (!isSessionsWindow) {
+		menuService.addItem(MenuId.ChatInputSecondary, { command: { id: 'workbench.action.chat.openSessionTargetPicker', title: 'Local' }, group: 'navigation', order: 0 });
+	}
 	menuService.addItem(MenuId.ChatInputSecondary, { command: { id: 'workbench.action.chat.openPermissionPicker', title: 'Default Permissions' }, group: 'navigation', order: 10 });
 
 	const options: IChatInputPartOptions = {
@@ -174,6 +203,7 @@ export async function renderChatInput(context: ComponentFixtureContext, fixtureO
 		widgetViewKindTag: 'view',
 		inputEditorMinLines: 2,
 		isSessionsWindow,
+		modelPickerDelegateAdapter: fixtureOptions.modelPickerDelegateAdapter,
 		// The sandbox toggle is specific to the local harness, so present the
 		// input as the local session type when exercising the sandboxed state.
 		sessionTypePickerDelegate: sandboxingEnabled ? { getActiveSessionProvider: () => SessionType.Local } : undefined,

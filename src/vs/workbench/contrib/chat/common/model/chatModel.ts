@@ -1748,6 +1748,8 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 			copilotCredits: this.usage?.copilotCredits,
 			modelTotals: this.usage?.modelTotals,
 			sessionCopilotCredits: this.usage?.sessionCopilotCredits,
+			modelContextWindow: this.usage?.modelContextWindow,
+			cachedPromptTokens: this.usage?.cachedPromptTokens,
 			elapsedMs: this.elapsedMs ?? (this.completedAt ? Math.max(0, this.completedAt - this.confirmationAdjustedTimestamp.get()) : undefined),
 		} satisfies WithDefinedProps<Omit<ISerializableChatResponseData, 'timestamp'>>;
 	}
@@ -1853,6 +1855,8 @@ interface ISerializableChatResponseData {
 	copilotCredits?: number;
 	modelTotals?: readonly IChatUsageModelTotal[];
 	sessionCopilotCredits?: number;
+	modelContextWindow?: IChatUsage['modelContextWindow'];
+	cachedPromptTokens?: number;
 	elapsedMs?: number;
 }
 
@@ -2971,6 +2975,8 @@ export class ChatModel extends Disposable implements IChatModel {
 					copilotCredits: raw.copilotCredits,
 					modelTotals: raw.modelTotals,
 					sessionCopilotCredits: raw.sessionCopilotCredits,
+					modelContextWindow: raw.modelContextWindow,
+					cachedPromptTokens: raw.cachedPromptTokens,
 				});
 			}
 			if (raw.usedContext) { // @ulugbekna: if this's a new vscode sessions, doc versions are incorrect anyway?

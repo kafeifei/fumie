@@ -16,6 +16,7 @@ import { URI } from '../../../base/common/uri.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { detectLibcSync, type LibcFamily } from '../../../base/node/libc.js';
 import { INativeEnvironmentService } from '../../environment/common/environment.js';
+import { AgentHostFumieHomeEnvVar } from '../common/agentHostProductEnv.js';
 import { FileOperationError, FileOperationResult, IFileService, toFileOperationResult } from '../../files/common/files.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
 import { ILogService } from '../../log/common/log.js';
@@ -413,7 +414,7 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 		// independent caches — one per resolved target — instead of
 		// thrashing a single shared one as launches alternate.
 		return path.join(
-			this._environmentService.userDataPath,
+			process.env[AgentHostFumieHomeEnvVar] ?? this._environmentService.userDataPath,
 			'agent-host',
 			'sdk-cache',
 			packageId,

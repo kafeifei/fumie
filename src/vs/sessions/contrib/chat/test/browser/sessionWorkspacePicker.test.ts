@@ -1464,13 +1464,53 @@ suite('AutomationsWorkspacePicker', () => {
 			isQuickChat: model.isQuickChat,
 			folderUri: model.folderUri?.toString(),
 			pickerFolderUri: picker.selectedFolderUri?.toString(),
+			pickerProvider: picker.selectedResolved?.providerId,
 			trustRequests,
 		}, {
 			isQuickChat: false,
 			folderUri: browsedFolder.toString(),
 			pickerFolderUri: browsedFolder.toString(),
+			pickerProvider: producingProvider.id,
 			trustRequests: [{ folderUri: browsedFolder.toString(), providerId: producingProvider.id }],
 		});
+	});
+
+	test('folder row keeps its provider when multiple providers resolve the same URI', async () => {
+		const providersService = disposables.add(new MockSessionsProvidersService());
+		const sharedFolder = URI.file('/shared/project');
+		const makeSharedProvider = (id: string): ISessionsProvider => ({
+			...createMockProvider(id),
+			resolveWorkspace: uri => uri.toString() === sharedFolder.toString()
+				? {
+					uri,
+					label: 'shared/project',
+					icon: Codicon.folder,
+					folders: [{
+						root: uri,
+						workingDirectory: uri,
+						name: 'project',
+						description: undefined,
+						gitRepository: { uri, workTreeUri: undefined, baseBranchName: undefined, gitHubInfo: constObservable(undefined) },
+					}],
+					requiresWorkspaceTrust: false,
+					isVirtualWorkspace: false,
+				}
+				: undefined,
+		});
+		const first = makeSharedProvider('first');
+		const selected = makeSharedProvider('selected');
+		providersService.setProviders([first, selected]);
+		const picker = createTestPicker(
+			disposables,
+			providersService,
+			undefined,
+			new TestNotificationService(),
+			DispatchingWorkspacePicker,
+		) as DispatchingWorkspacePicker;
+
+		await picker.dispatchFolder(sharedFolder, selected.id);
+
+		assert.strictEqual(picker.selectedResolved?.providerId, selected.id);
 	});
 
 	test('stays in No workspace mode when trust is declined for a browsed folder', async () => {

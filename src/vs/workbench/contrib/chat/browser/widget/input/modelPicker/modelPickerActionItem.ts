@@ -75,6 +75,9 @@ export interface IModelPickerDelegate {
 	readonly modelConfiguration?: IModelConfigurationAccess;
 }
 
+/** Allows a chat widget host to project model-picker presentation without taking over selection state. */
+export type IModelPickerDelegateAdapter = (delegate: IModelPickerDelegate) => IModelPickerDelegate;
+
 /**
  * Action view item for selecting a language model in the chat interface.
  *

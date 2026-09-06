@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { timeout } from '../../../../base/common/async.js';
+import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -458,6 +458,121 @@ suite('AgentHostFileSystemProvider - synthetic content schemes', () => {
 			resources: [inner.toString()],
 			encodings: [ContentEncoding.Base64],
 		});
+	});
+
+	test('coalesces and caches immutable git-blob reads', async () => {
+		const provider = disposables.add(new AgentHostFileSystemProvider());
+		const releaseRead = new DeferredPromise<void>();
+		const connection = new class extends StubConnection {
+			override async resourceRead(uri: URI, encoding?: ContentEncoding): Promise<ResourceReadResult> {
+				this.readCalls.push(uri);
+				this.readEncodings.push(encoding);
+				await releaseRead.p;
+				return this.readResult;
+			}
+		}();
+		disposables.add(provider.registerAuthority('local', connection));
+		const inner = URI.from({
+			scheme: 'git-blob',
+			path: '/repo/file.ts',
+			query: JSON.stringify({ sessionUri: 'test:/session', sha: '0123456789abcdef0123456789abcdef01234567', repoRelativePath: 'file.ts', immutable: true }),
+		});
+		const wrapped = toAgentHostUri(inner, 'local');
+
+		const firstRead = provider.readFile(wrapped);
+		const secondRead = provider.readFile(wrapped);
+		await timeout(0);
+		assert.strictEqual(connection.readCalls.length, 1, 'concurrent reads should share one remote request');
+
+		await releaseRead.complete();
+		const [first, second] = await Promise.all([firstRead, secondRead]);
+		first[0] = 0;
+		const third = await provider.readFile(wrapped);
+
+		assert.deepStrictEqual({
+			remoteReads: connection.readCalls.length,
+			second: VSBuffer.wrap(second).toString(),
+			third: VSBuffer.wrap(third).toString(),
+		}, {
+			remoteReads: 1,
+			second: 'stub-content',
+			third: 'stub-content',
+		});
+	});
+
+	test('does not reuse immutable reads across connection generations', async () => {
+		const provider = disposables.add(new AgentHostFileSystemProvider());
+		const first = new StubConnection();
+		first.readResult = { data: 'first-connection', encoding: ContentEncoding.Utf8, contentType: 'text/plain' };
+		disposables.add(provider.registerAuthority('local', first));
+		const inner = URI.from({
+			scheme: 'git-blob',
+			path: '/repo/file.ts',
+			query: JSON.stringify({ sessionUri: 'test:/session', sha: '0123456789abcdef0123456789abcdef01234567', repoRelativePath: 'file.ts', immutable: true }),
+		});
+		const wrapped = toAgentHostUri(inner, 'local');
+
+		assert.strictEqual(VSBuffer.wrap(await provider.readFile(wrapped)).toString(), 'first-connection');
+		assert.strictEqual(VSBuffer.wrap(await provider.readFile(wrapped)).toString(), 'first-connection');
+
+		const second = new StubConnection();
+		second.readResult = { data: 'second-connection', encoding: ContentEncoding.Utf8, contentType: 'text/plain' };
+		disposables.add(provider.registerAuthority('local', second));
+
+		assert.strictEqual(VSBuffer.wrap(await provider.readFile(wrapped)).toString(), 'second-connection');
+		assert.deepStrictEqual({ firstReads: first.readCalls.length, secondReads: second.readCalls.length }, { firstReads: 1, secondReads: 1 });
+	});
+
+	test('does not cache a git-blob URI backed by a mutable ref', async () => {
+		const { provider, connection } = setup();
+		const inner = URI.from({
+			scheme: 'git-blob',
+			path: '/repo/file.ts',
+			query: JSON.stringify({ sessionUri: 'test:/session', sha: 'HEAD', repoRelativePath: 'file.ts' }),
+		});
+		const wrapped = toAgentHostUri(inner, 'local');
+
+		await provider.readFile(wrapped);
+		await provider.readFile(wrapped);
+
+		assert.strictEqual(connection.readCalls.length, 2);
+	});
+
+	test('does not cache an unmarked hexadecimal git ref', async () => {
+		const { provider, connection } = setup();
+		const inner = URI.from({
+			scheme: 'git-blob',
+			path: '/repo/file.ts',
+			query: JSON.stringify({ sessionUri: 'test:/session', sha: '0123456789abcdef0123456789abcdef01234567', repoRelativePath: 'file.ts' }),
+		});
+		const wrapped = toAgentHostUri(inner, 'local');
+
+		await provider.readFile(wrapped);
+		await provider.readFile(wrapped);
+
+		assert.strictEqual(connection.readCalls.length, 2);
+	});
+
+	test('bounds the immutable git-blob cache by entry count', async () => {
+		const { provider, connection } = setup();
+		const first = URI.from({
+			scheme: 'git-blob',
+			path: '/repo/file-0.ts',
+			query: JSON.stringify({ sessionUri: 'test:/session', sha: '0000000000000000000000000000000000000000', repoRelativePath: 'file-0.ts', immutable: true }),
+		});
+
+		for (let index = 0; index < 2049; index++) {
+			const sha = index.toString(16).padStart(40, '0');
+			const inner = URI.from({
+				scheme: 'git-blob',
+				path: `/repo/file-${index}.ts`,
+				query: JSON.stringify({ sessionUri: 'test:/session', sha, repoRelativePath: `file-${index}.ts`, immutable: true }),
+			});
+			await provider.readFile(toAgentHostUri(inner, 'local'));
+		}
+
+		await provider.readFile(toAgentHostUri(first, 'local'));
+		assert.strictEqual(connection.readCalls.length, 2050, 'the oldest entry should be evicted once the cache exceeds its bound');
 	});
 
 	test('readFile decodes binary Base64 content', async () => {
@@ -972,5 +1087,106 @@ suite('AgentHostFileSystemProvider - resolve / mkdir / copy / watch', () => {
 		assert.strictEqual(connection.watchCalls.length, 1, 'watch attached after late registration');
 		assert.strictEqual(received.length, 1);
 		assert.strictEqual(received[0][0].resource.toString(), agentHostUri('never-registered', '/path/late.txt').toString());
+	});
+
+	/**
+	 * Stands in for a remote that only knows about the paths in
+	 * {@link existing}: everything else answers `NotFound`, exactly as
+	 * `node/agentService.ts` `createResourceWatch` does for a path that has
+	 * not been created yet. Mutating `existing` between calls is how a test
+	 * says "the user just created that file".
+	 */
+	function watchOnlyExisting(connection: FullConnection, existing: Set<string>) {
+		const emitters = new Map<string, Emitter<readonly IFileChange[]>>();
+		const disposedRoots: string[] = [];
+		connection.watchResource = async params => {
+			connection.watchCalls.push(params);
+			const uri = typeof params.uri === 'string' ? params.uri : URI.revive(params.uri).toString();
+			if (!existing.has(uri)) {
+				throw new ProtocolError(AhpErrorCodes.NotFound, `Resource not found: ${uri}`);
+			}
+			const emitter = new Emitter<readonly IFileChange[]>();
+			emitters.set(uri, emitter);
+			return {
+				onDidChange: emitter.event,
+				dispose: () => { emitter.dispose(); disposedRoots.push(uri); },
+			};
+		};
+		return { emitters, disposedRoots };
+	}
+
+	const watchedRoots = (connection: FullConnection) => connection.watchCalls.map(c => c.uri);
+
+	test('watching a path that does not exist yet falls back to its closest existing ancestor', async () => {
+		// Opening a session watches `<cwd>/.claude/settings.json`, which most
+		// repositories do not have — and neither is `.claude` itself there.
+		const { provider, connection } = setup();
+		watchOnlyExisting(connection, new Set(['file:///repo']));
+		const wrapped = agentHostUri('remote', '/repo/.claude/settings.json');
+
+		const errors: string[] = [];
+		disposables.add(provider.onDidWatchError(message => errors.push(message)));
+		const watchDisposable = provider.watch(wrapped, { recursive: false, excludes: [] });
+		await timeout(0);
+		await timeout(0);
+
+		assert.deepStrictEqual(watchedRoots(connection), [
+			'file:///repo/.claude/settings.json',
+			'file:///repo/.claude',
+			'file:///repo',
+		], 'walked up to the first ancestor that exists');
+		assert.strictEqual(connection.watchCalls[2].recursive, false, 'the stand-in watch must not pull the whole tree over the wire');
+		assert.deepStrictEqual(errors, [], 'a missing optional config file is an answer, not a watch failure');
+
+		watchDisposable.dispose();
+	});
+
+	test('creating the missing path resumes the watch and reports it as added', async () => {
+		const { provider, connection } = setup();
+		const existing = new Set(['file:///repo']);
+		const { emitters } = watchOnlyExisting(connection, existing);
+		const wrapped = agentHostUri('remote', '/repo/.claude/settings.json');
+
+		const received: IFileChange[][] = [];
+		disposables.add(provider.onDidChangeFile(c => received.push([...c])));
+		const watchDisposable = provider.watch(wrapped, { recursive: false, excludes: [] });
+		await timeout(0);
+		await timeout(0);
+		connection.watchCalls.length = 0;
+
+		// The user creates `.claude`, but not the file inside it yet. The
+		// stand-in has to move down with it, or the file's own creation
+		// happens where nothing is looking.
+		existing.add('file:///repo/.claude');
+		emitters.get('file:///repo')!.fire([{ resource: URI.file('/repo/.claude'), type: FileChangeType.ADDED }]);
+		await timeout(0);
+		await timeout(0);
+
+		assert.deepStrictEqual(watchedRoots(connection), [
+			'file:///repo/.claude/settings.json',
+			'file:///repo/.claude',
+		], 'retried the real path, then moved the stand-in down one level');
+		assert.strictEqual(received.length, 0, 'nothing to report until the watched path itself exists');
+		connection.watchCalls.length = 0;
+
+		// Now the file itself.
+		existing.add('file:///repo/.claude/settings.json');
+		emitters.get('file:///repo/.claude')!.fire([{ resource: URI.file('/repo/.claude/settings.json'), type: FileChangeType.ADDED }]);
+		await timeout(0);
+		await timeout(0);
+
+		assert.deepStrictEqual(watchedRoots(connection), ['file:///repo/.claude/settings.json']);
+		assert.deepStrictEqual(
+			received.map(batch => batch.map(c => [c.resource.toString(), c.type])),
+			[[[wrapped.toString(), FileChangeType.ADDED]]],
+			'resuming reports the path that was waited for, like the local watcher does',
+		);
+
+		// The real watch is live from here on.
+		emitters.get('file:///repo/.claude/settings.json')!.fire([{ resource: URI.file('/repo/.claude/settings.json'), type: FileChangeType.UPDATED }]);
+		assert.strictEqual(received.length, 2);
+		assert.strictEqual(received[1][0].type, FileChangeType.UPDATED);
+
+		watchDisposable.dispose();
 	});
 });

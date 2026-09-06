@@ -17,7 +17,7 @@ import { IFileService } from '../../files/common/files.js';
 import { ILogService } from '../../log/common/log.js';
 import { FileEditKind, type ISessionFileDiff, type ISessionGitState } from '../common/state/sessionState.js';
 import { buildGitBlobUri } from './gitDiffContent.js';
-import { EMPTY_TREE_OBJECT, IAddWorktreeOptions, IAgentHostGitService, IBranch, IBranchDiffSafetyInfo, IRefQuery, IComputeSessionFileDiffsOptions, IDefaultBranch, IPullOptions, IPushOptions, GitRefType, IRemoteBranch, GitRef, ITag, Branch, IWorktreeFileProgress } from '../common/agentHostGitService.js';
+import { EMPTY_TREE_OBJECT, IAddWorktreeOptions, IAgentHostGitService, IBranch, IBranchDiffSafetyInfo, IRefQuery, IComputeSessionFileDiffsOptions, IDefaultBranch, IPullOptions, IPushOptions, GitRefType, IRemoteBranch, GitRef, ITag, Branch, IWorktreeArchiveSnapshot, IWorktreeFileProgress } from '../common/agentHostGitService.js';
 import { LRUCache } from '../../../base/common/map.js';
 import { firstParallel, Limiter, SequencerByKey, timeout } from '../../../base/common/async.js';
 
@@ -212,9 +212,11 @@ export class AgentHostGitService implements IAgentHostGitService {
 				for (const error of failedOperations) {
 					this._logService.warn(`[AgentHostGitService][copyWorktreeIncludeFiles] ${error.reason}`);
 				}
+				throw new Error(`Failed to copy ${failedOperations.length} configured worktree file entr${failedOperations.length === 1 ? 'y' : 'ies'}.`);
 			}
 		} catch (error) {
 			this._logService.warn(`[AgentHostGitService][copyWorktreeIncludeFiles] Failed to copy folder(s)/file(s) to worktree ${worktree.fsPath}: ${error}`);
+			throw error;
 		}
 	}
 
@@ -296,6 +298,13 @@ export class AgentHostGitService implements IAgentHostGitService {
 		throw lastError;
 	}
 
+	async deleteBranch(repositoryRoot: URI, branchName: string, options?: { readonly force?: boolean }): Promise<void> {
+		if (!await this.branchExists(repositoryRoot, branchName)) {
+			return;
+		}
+		await this._runGit(repositoryRoot, ['branch', options?.force ? '-D' : '-d', '--', branchName], { timeout: 60_000, throwOnError: true });
+	}
+
 	private async _pathExists(fsPath: string): Promise<boolean> {
 		try {
 			await fsPromises.access(fsPath);
@@ -359,6 +368,98 @@ export class AgentHostGitService implements IAgentHostGitService {
 	async hasUncommittedChanges(workingDirectory: URI): Promise<boolean> {
 		const output = await this._runGitStatus(workingDirectory, ['--porcelain']);
 		return !!output && output.trim().length > 0;
+	}
+
+	async captureWorktreeArchiveSnapshot(workingDirectory: URI): Promise<IWorktreeArchiveSnapshot | undefined> {
+		const repositoryRoot = await this.getRepositoryRoot(workingDirectory);
+		if (!repositoryRoot) {
+			return undefined;
+		}
+		const baseCommit = (await this._runGit(repositoryRoot, ['rev-parse', '--verify', 'HEAD']))?.trim();
+		if (!baseCommit) {
+			return undefined;
+		}
+		const [statusOut, baseTreeOut, indexTreeOut, trackedWorktreePathsOut, untrackedPathsOut] = await Promise.all([
+			this._runGitStatus(repositoryRoot, ['--porcelain=v1', '-z', '--untracked-files=all']),
+			this._runGit(repositoryRoot, ['rev-parse', '--verify', `${baseCommit}^{tree}`]),
+			this._runGit(repositoryRoot, ['write-tree']),
+			this._runGit(repositoryRoot, ['diff-files', '--name-only', '-z', '--']),
+			this._runGit(repositoryRoot, ['ls-files', '--others', '--exclude-standard', '-z']),
+		]);
+		const baseTree = baseTreeOut?.trim();
+		const indexTree = indexTreeOut?.trim();
+		if (statusOut === undefined || !baseTree || !indexTree || trackedWorktreePathsOut === undefined || untrackedPathsOut === undefined) {
+			return undefined;
+		}
+
+		const tempDir = URI.joinPath(this._environmentService.tmpDir, `agent-host-archive-${generateUuid()}`);
+		await this._fileService.createFolder(tempDir);
+		const workingEnv: Record<string, string> = {
+			GIT_INDEX_FILE: URI.joinPath(tempDir, 'working.index').fsPath,
+			COMMAND_HOOK_LOCK: '1',
+		};
+		try {
+			await this._runGit(repositoryRoot, ['read-tree', indexTree], { env: workingEnv, throwOnError: true });
+			const trackedWorktreePaths = trackedWorktreePathsOut.split('\x00').filter(Boolean);
+			if (!(await this._stageChangedPaths(repositoryRoot, tempDir, trackedWorktreePaths, workingEnv, { force: true, pathspecName: 'working.pathspec' }))) {
+				return undefined;
+			}
+			const workingTree = (await this._runGit(repositoryRoot, ['write-tree'], { env: workingEnv, throwOnError: true }))?.trim();
+			if (!workingTree) {
+				return undefined;
+			}
+
+			let untrackedTree: string | undefined;
+			const untrackedPaths = untrackedPathsOut.split('\x00').filter(Boolean);
+			if (untrackedPaths.length > 0) {
+				const untrackedEnv: Record<string, string> = {
+					GIT_INDEX_FILE: URI.joinPath(tempDir, 'untracked.index').fsPath,
+					COMMAND_HOOK_LOCK: '1',
+				};
+				await this._runGit(repositoryRoot, ['read-tree', EMPTY_TREE_OBJECT], { env: untrackedEnv, throwOnError: true });
+				if (!(await this._stageChangedPaths(repositoryRoot, tempDir, untrackedPaths, untrackedEnv, { force: true, pathspecName: 'untracked.pathspec' }))) {
+					return undefined;
+				}
+				untrackedTree = (await this._runGit(repositoryRoot, ['write-tree'], { env: untrackedEnv, throwOnError: true }))?.trim();
+				if (!untrackedTree) {
+					return undefined;
+				}
+			}
+
+			const rawDiffs = await Promise.all([
+				this._runGit(repositoryRoot, ['diff', '--raw', '--no-renames', baseTree, indexTree, '--']),
+				this._runGit(repositoryRoot, ['diff', '--raw', '--no-renames', indexTree, workingTree, '--']),
+				untrackedTree ? this._runGit(repositoryRoot, ['diff', '--raw', '--no-renames', EMPTY_TREE_OBJECT, untrackedTree, '--']) : Promise.resolve(''),
+			]);
+			if (rawDiffs.some(rawDiff => rawDiff === undefined || this._rawDiffContainsGitlink(rawDiff))) {
+				// Gitlinks name only a nested repository commit; they cannot preserve
+				// uncommitted files inside that repository. Fail closed rather than
+				// flattening or silently dropping nested work.
+				return undefined;
+			}
+
+			const [endHead, endIndex] = await Promise.all([
+				this._runGit(repositoryRoot, ['rev-parse', '--verify', 'HEAD']),
+				this._runGit(repositoryRoot, ['write-tree']),
+			]);
+			if (endHead?.trim() !== baseCommit || endIndex?.trim() !== indexTree) {
+				return undefined;
+			}
+			if (statusOut.length > 0 && indexTree === baseTree && workingTree === baseTree && !untrackedTree) {
+				// A dirty submodule or another non-tree state cannot be represented by
+				// the stash object. Keep the checkout instead of declaring it clean.
+				return undefined;
+			}
+			return {
+				baseCommit,
+				baseTreeOid: baseTree,
+				indexTreeOid: indexTree,
+				workingTreeOid: workingTree,
+				...(untrackedTree ? { untrackedTreeOid: untrackedTree } : {}),
+			};
+		} finally {
+			try { await this._fileService.del(tempDir, { recursive: true, useTrash: false }); } catch { /* best-effort */ }
+		}
 	}
 
 	async commitAll(workingDirectory: URI, message: string): Promise<void> {
@@ -487,7 +588,7 @@ export class AgentHostGitService implements IAgentHostGitService {
 			return undefined;
 		}
 
-		return parseGitDiffRawNumstat(rawDiffOutput, repositoryRoot, options.sessionUri, mergeBaseCommit);
+		return parseGitDiffRawNumstat(rawDiffOutput, repositoryRoot, options.sessionUri, mergeBaseCommit, undefined, true);
 	}
 
 	async resolveBranchBaselineCommit(workingDirectory: URI, baseBranch?: string): Promise<string | undefined> {
@@ -553,11 +654,11 @@ export class AgentHostGitService implements IAgentHostGitService {
 		}
 	}
 
-	private async _stageChangedPaths(repositoryRoot: URI, tempDir: URI, changedPaths: readonly string[], env: Record<string, string>): Promise<boolean> {
+	private async _stageChangedPaths(repositoryRoot: URI, tempDir: URI, changedPaths: readonly string[], env: Record<string, string>, options?: { readonly force?: boolean; readonly pathspecName?: string }): Promise<boolean> {
 		if (changedPaths.length === 0) {
 			return true;
 		}
-		const pathspecFile = URI.joinPath(tempDir, 'pathspec');
+		const pathspecFile = URI.joinPath(tempDir, options?.pathspecName ?? 'pathspec');
 		// Stage only the paths `git status` reported as changed. The previous
 		// full-repo `git add -A -- :/` walked nested repos/worktrees and large
 		// checkouts, which made temp-index diffing slow and timeout-prone. A
@@ -565,9 +666,13 @@ export class AgentHostGitService implements IAgentHostGitService {
 		// and rename/copy sources in scope.
 		await this._fileService.writeFile(pathspecFile, VSBuffer.fromString(changedPaths.join('\x00') + '\x00'));
 		this._logService.debug(`[agentHostGitService] Staging ${changedPaths.length} changed path(s) into temp index`);
-		return await this._runGit(repositoryRoot, ['add', '-A', `--pathspec-from-file=${pathspecFile.fsPath}`, '--pathspec-file-nul'], {
+		return await this._runGit(repositoryRoot, ['add', ...(options?.force ? ['-f'] : []), '-A', `--pathspec-from-file=${pathspecFile.fsPath}`, '--pathspec-file-nul'], {
 			env: { ...env, GIT_LITERAL_PATHSPECS: '1' },
 		}) !== undefined;
+	}
+
+	private _rawDiffContainsGitlink(output: string): boolean {
+		return output.split(/\r?\n/g).some(line => /^:(?:160000 \d{6}|\d{6} 160000) /.test(line));
 	}
 
 	private async _resolveRemoteTrackingBranch(repositoryRoot: URI, branch: string, fetchIfMissing = false): Promise<string | undefined> {
@@ -626,15 +731,11 @@ export class AgentHostGitService implements IAgentHostGitService {
 			return [];
 		}
 
-		// Keep only the ignored files that match one of the configured
-		// `git.worktreeIncludeFiles` glob patterns (VS Code glob semantics),
-		// and — in the same pass — tally which wholly-ignored directories
-		// contain an ignored file that cannot be copied (and therefore cannot be
-		// collapsed). `git ls-files --directory` reports a wholly-ignored
-		// directory as a single `dir/` entry and never nests these entries
-		// (it stops descending once a directory is wholly ignored), so each
-		// file has at most one containing directory and no de-duplication of
-		// the directory set is required.
+		// `git ls-files --directory` reports a wholly-ignored directory (one
+		// containing no tracked files) as a single `dir/` entry and never nests
+		// these entries — it stops descending once a directory is wholly
+		// ignored — so each ignored file has at most one containing directory
+		// and no de-duplication of the directory set is required.
 		const matchers = globs.map(pattern => parse(pattern));
 		const wholeDirectories = new Set((directoryOutput ?? '')
 			.split('\x00').filter(entry => entry.endsWith('/')));
@@ -653,44 +754,21 @@ export class AgentHostGitService implements IAgentHostGitService {
 			}
 		}
 
-		const matchedFiles: string[] = [];
-		const nonCollapsibleDirectories = new Set<string>();
-		for (const file of ignoredFiles) {
-			if (
-				matchers.some(matcher => matcher(file)) &&
-				!hasWorktreePathCollision(file, worktreeFiles, worktreeDirectories)
-			) {
-				matchedFiles.push(file);
-			} else if (wholeDirectories.size > 0) {
-				const containingDirectory = findContainingDirectory(file, wholeDirectories);
-				if (containingDirectory !== undefined) {
-					nonCollapsibleDirectories.add(containingDirectory);
-				}
-			}
-		}
+		// Keep only the ignored files that match one of the configured
+		// `git.worktreeIncludeFiles` glob patterns (VS Code glob semantics) and
+		// whose destination in the worktree is free.
+		const matchedFiles = ignoredFiles.filter(file =>
+			matchers.some(matcher => matcher(file))
+			&& !hasWorktreePathCollision(file, worktreeFiles, worktreeDirectories));
 
 		if (matchedFiles.length === 0) {
 			return [];
 		}
 
-		// Collapse matched files into their containing directory when the whole
-		// directory can be copied as a single recursive unit — i.e. it is
-		// wholly ignored (so it has no tracked files a recursive copy would
-		// clobber) and every ignored file it contains matched a glob (so
-		// nothing unwanted is copied, tracked by `nonCollapsibleDirectories` above).
-		// This turns a large tree such as `node_modules/` into one copy instead
-		// of one per file, while a partially-matched or partially-tracked
-		// directory falls back to its individual matched files. `--directory`
-		// with `--no-empty-directory` never reports an empty directory, so every
-		// entry in `wholeDirectories` is known to contain at least one ignored file.
-		const collapsedDirectories = new Set<string>();
-		for (const dir of wholeDirectories) {
-			if (!nonCollapsibleDirectories.has(dir)) {
-				collapsedDirectories.add(dir);
-			}
-		}
-
-		return toWorktreeIncludeEntries(repositoryRoot, matchedFiles, collapsedDirectories);
+		// Copy whole directories as a single recursive unit wherever that is
+		// safe, so a large tree such as `node_modules/` costs one copy instead
+		// of one per file.
+		return toWorktreeIncludeEntries(repositoryRoot, collapseWorktreeIncludePaths(ignoredFiles, matchedFiles, wholeDirectories));
 	}
 
 	async showBlob(workingDirectory: URI, ref: string, repoRelativePath: string): Promise<VSBuffer | undefined> {
@@ -765,14 +843,32 @@ export class AgentHostGitService implements IAgentHostGitService {
 		}
 	}
 
-	async commitTree(repositoryRoot: URI, treeOid: string, parentOid: string | undefined, message: string): Promise<string | undefined> {
+	async commitTree(repositoryRoot: URI, treeOid: string, parentOid: string | undefined, message: string, options?: { readonly syntheticIdentity?: boolean }): Promise<string | undefined> {
+		return this._commitTree(repositoryRoot, treeOid, parentOid ? [parentOid] : [], message, options);
+	}
+
+	async commitTreeWithParents(repositoryRoot: URI, treeOid: string, parentOids: readonly string[], message: string, options?: { readonly syntheticIdentity?: boolean }): Promise<string | undefined> {
+		return this._commitTree(repositoryRoot, treeOid, parentOids, message, options);
+	}
+
+	private async _commitTree(repositoryRoot: URI, treeOid: string, parentOids: readonly string[], message: string, options?: { readonly syntheticIdentity?: boolean }): Promise<string | undefined> {
 		const args = ['commit-tree', treeOid];
-		if (parentOid) {
-			args.push('-p', parentOid);
+		for (const parent of parentOids) {
+			args.push('-p', parent);
 		}
 		args.push('-m', message);
-		const out = await this._runGit(repositoryRoot, args, { throwOnError: true });
+		const env = options?.syntheticIdentity ? {
+			GIT_AUTHOR_NAME: 'Fumie',
+			GIT_AUTHOR_EMAIL: 'fumie@localhost',
+			GIT_COMMITTER_NAME: 'Fumie',
+			GIT_COMMITTER_EMAIL: 'fumie@localhost',
+		} : undefined;
+		const out = await this._runGit(repositoryRoot, args, { env, throwOnError: true });
 		return out?.trim() || undefined;
+	}
+
+	async applyWorktreeArchiveStash(workingDirectory: URI, ref: string): Promise<void> {
+		await this._runGit(workingDirectory, ['stash', 'apply', '--index', ref], { timeout: 180_000, throwOnError: true });
 	}
 
 	async updateRef(repositoryRoot: URI, ref: string, newOid: string): Promise<void> {
@@ -787,13 +883,13 @@ export class AgentHostGitService implements IAgentHostGitService {
 		// invocation. Each command is `delete SP <ref> NUL [<expected_oid>] NUL`;
 		// we omit the expected oid so already-missing refs don't fail the batch.
 		const stdin = refs.map(ref => `delete ${ref}\x00\x00`).join('');
-		await new Promise<void>((resolve) => {
-			const proc = cp.execFile('git', ['update-ref', '--stdin', '-z'], { cwd: repositoryRoot.fsPath, timeout: 10_000 }, () => {
-				// Tolerate non-zero exits — missing refs are not fatal for cleanup.
-				resolve();
-			});
-			proc.stdin?.end(stdin);
-		});
+		await this._runGit(repositoryRoot, ['update-ref', '--stdin', '-z'], { stdin, timeout: 10_000, throwOnError: true });
+		const remaining = await this._runGit(repositoryRoot, ['for-each-ref', '--format=%(refname)', ...refs], { throwOnError: true });
+		const remainingRefs = new Set(remaining?.split(/\r?\n/g).map(ref => ref.trim()).filter(Boolean));
+		const undeleted = refs.filter(ref => remainingRefs.has(ref));
+		if (undeleted.length > 0) {
+			throw new Error(`Git reported successful ref deletion but these refs remain: ${undeleted.join(', ')}`);
+		}
 	}
 
 	async revParse(repositoryRoot: URI, expression: string): Promise<string | undefined> {
@@ -879,12 +975,22 @@ export class AgentHostGitService implements IAgentHostGitService {
 		}
 
 		try {
-			const raw = await this._runGit(repositoryRoot, ['diff', '--raw', '--numstat', '--diff-filter=ADMR', '-z', options.fromRef, options.toRef, '--']);
+			const [resolvedFromRef, resolvedToRef] = await Promise.all([
+				this._runGit(repositoryRoot, ['rev-parse', '--verify', `${options.fromRef}^{tree}`]),
+				this._runGit(repositoryRoot, ['rev-parse', '--verify', `${options.toRef}^{tree}`]),
+			]);
+			const fromOid = resolvedFromRef?.trim();
+			const toOid = resolvedToRef?.trim();
+			if (!fromOid || !toOid) {
+				return undefined;
+			}
+
+			const raw = await this._runGit(repositoryRoot, ['diff', '--raw', '--numstat', '--diff-filter=ADMR', '-z', fromOid, toOid, '--']);
 			if (raw === undefined) {
 				return undefined;
 			}
 
-			return parseGitDiffRawNumstat(raw, repositoryRoot, options.sessionUri, options.fromRef, options.toRef);
+			return parseGitDiffRawNumstat(raw, repositoryRoot, options.sessionUri, fromOid, toOid, true);
 		} catch (err) {
 			this._logService.warn(`[AgentHostGitService][computeFileDiffsBetweenRefs] Failed to compute file diffs ${repositoryRoot.toString()}, ${options.fromRef}, ${options.toRef}: ${err}`);
 			return undefined;
@@ -1046,7 +1152,7 @@ export class AgentHostGitService implements IAgentHostGitService {
 		return this._runGit(workingDirectory, ['status', ...args], { env: { GIT_OPTIONAL_LOCKS: '0' } });
 	}
 
-	private _runGit(workingDirectory: URI, args: readonly string[], options?: { readonly timeout?: number; readonly throwOnError?: boolean; readonly env?: Record<string, string>; readonly maxBuffer?: number; readonly onStderr?: (chunk: string) => void }): Promise<string | undefined> {
+	private _runGit(workingDirectory: URI, args: readonly string[], options?: { readonly timeout?: number; readonly throwOnError?: boolean; readonly env?: Record<string, string>; readonly maxBuffer?: number; readonly onStderr?: (chunk: string) => void; readonly stdin?: string }): Promise<string | undefined> {
 		this._logService.trace(`[agentHostGitService] > git ${args.join(' ')}`);
 
 		return new Promise((resolve, reject) => {
@@ -1092,6 +1198,9 @@ export class AgentHostGitService implements IAgentHostGitService {
 			const onStderr = options?.onStderr;
 			if (onStderr) {
 				child.stderr?.on('data', (chunk: Buffer | string) => onStderr(chunk.toString()));
+			}
+			if (options?.stdin !== undefined) {
+				child.stdin?.end(options.stdin);
 			}
 			const timer = setTimeout(() => {
 				didTimeOut = true;
@@ -1175,38 +1284,127 @@ interface IWorktreeIncludeEntry {
 }
 
 /**
+ * The result of {@link collapseWorktreeIncludePaths}: the directories that can
+ * be copied as one recursive unit, and the matched files left to copy on their
+ * own.
+ */
+export interface IWorktreeIncludeCollapse {
+	/**
+	 * Directories to copy recursively, each with a trailing `/`, mapped to how
+	 * many matched files they stand in for.
+	 */
+	readonly collapsedDirectories: ReadonlyMap<string, number>;
+	/** The matched files that no collapsed directory covers. */
+	readonly standaloneFiles: readonly string[];
+}
+
+/**
+ * How many ignored files a directory holds, and how many of those matched a glob.
+ */
+interface IWorktreeDirectoryTally {
+	ignored: number;
+	matched: number;
+}
+
+/**
+ * Collapses the matched files into the fewest directories that can be copied as
+ * a single recursive unit, given the git-reported wholly-ignored directories.
+ *
+ * A directory may be copied wholesale when it is inside (or is) a wholly-ignored
+ * directory — so it holds no tracked file a recursive copy could clobber — and
+ * every ignored file beneath it matched a glob, so nothing unwanted is copied.
+ * `git ls-files --directory` only reports the *topmost* wholly-ignored
+ * directories, and a common layout defeats them: a wholly-ignored `.build/`
+ * mixes a huge matched subtree (the `node_modules` of the built-in extensions)
+ * with unrelated build output, which demoted every one of those files to its
+ * own copy. Because everything below a wholly-ignored directory is itself ignored,
+ * the tallies below are complete for that subtree, so the walk can descend into
+ * such a directory and collapse at the highest fully-matched directories under it.
+ *
+ * Costs one pass over `ignoredFiles` and one over `matchedFiles` — each O(path
+ * depth) per file — plus a sort of the directories found inside wholly-ignored
+ * ones, and holds one tally per such directory.
+ */
+export function collapseWorktreeIncludePaths(ignoredFiles: readonly string[], matchedFiles: readonly string[], wholeDirectories: ReadonlySet<string>): IWorktreeIncludeCollapse {
+	if (wholeDirectories.size === 0) {
+		return { collapsedDirectories: new Map(), standaloneFiles: matchedFiles };
+	}
+
+	const tallies = new Map<string, IWorktreeDirectoryTally>();
+	const tally = (files: readonly string[], matched: boolean): void => {
+		for (const file of files) {
+			const wholeDirectory = findContainingDirectory(file, wholeDirectories);
+			if (wholeDirectory === undefined) {
+				continue;
+			}
+			// Walk the `/` boundaries from the wholly-ignored directory itself
+			// down to the directory holding the file, tallying every one of them.
+			let index = wholeDirectory.length - 1;
+			while (index !== -1) {
+				const directory = file.slice(0, index + 1);
+				let entry = tallies.get(directory);
+				if (!entry) {
+					entry = { ignored: 0, matched: 0 };
+					tallies.set(directory, entry);
+				}
+				if (matched) {
+					entry.matched++;
+				} else {
+					entry.ignored++;
+				}
+				index = file.indexOf('/', index + 1);
+			}
+		}
+	};
+	tally(ignoredFiles, false);
+	tally(matchedFiles, true);
+
+	const collapsed = new Set<string>();
+	// `--no-empty-directory` means a reported directory always holds an ignored
+	// file, so a missing tally should not happen; still copy such a directory as
+	// one unit rather than dropping it.
+	for (const directory of wholeDirectories) {
+		if (!tallies.has(directory)) {
+			collapsed.add(directory);
+		}
+	}
+	// Shortest first: a directory is a strict prefix of everything nested inside
+	// it, and therefore strictly shorter, so ancestors are decided first and the
+	// highest fully-matched directory of a subtree wins.
+	for (const directory of [...tallies.keys()].sort((a, b) => a.length - b.length)) {
+		const entry = tallies.get(directory)!;
+		// Dropping the trailing `/` makes the lookup probe the ancestors of
+		// `directory` without matching `directory` itself.
+		if (entry.matched > 0 && entry.matched === entry.ignored && findContainingDirectory(directory.slice(0, -1), collapsed) === undefined) {
+			collapsed.add(directory);
+		}
+	}
+
+	const collapsedDirectories = new Map<string, number>();
+	for (const directory of collapsed) {
+		collapsedDirectories.set(directory, tallies.get(directory)?.matched ?? 0);
+	}
+
+	return {
+		collapsedDirectories,
+		standaloneFiles: matchedFiles.filter(file => findContainingDirectory(file, collapsed) === undefined),
+	};
+}
+
+/**
  * Builds the entries to copy: one per collapsed directory, standing in for all
  * the matched files beneath it, plus one per matched file no collapsed
  * directory covers.
  */
-function toWorktreeIncludeEntries(repositoryRoot: URI, matchedFiles: readonly string[], collapsedDirectories: ReadonlySet<string>): IWorktreeIncludeEntry[] {
+function toWorktreeIncludeEntries(repositoryRoot: URI, collapse: IWorktreeIncludeCollapse): IWorktreeIncludeEntry[] {
 	const toEntry = (relativePath: string, fileCount: number): IWorktreeIncludeEntry => ({
 		sourcePath: path.join(repositoryRoot.fsPath, relativePath),
 		fileCount,
 	});
 
-	// Seeded with every collapsed directory so one is still emitted even if the
-	// tally below never reaches it.
-	const directoryFileCounts = new Map<string, number>();
-	for (const dir of collapsedDirectories) {
-		directoryFileCounts.set(dir, 0);
-	}
-
-	const fileEntries: IWorktreeIncludeEntry[] = [];
-	for (const file of matchedFiles) {
-		const containingDirectory = collapsedDirectories.size > 0
-			? findContainingDirectory(file, collapsedDirectories)
-			: undefined;
-		if (containingDirectory === undefined) {
-			fileEntries.push(toEntry(file, 1));
-		} else {
-			directoryFileCounts.set(containingDirectory, directoryFileCounts.get(containingDirectory)! + 1);
-		}
-	}
-
 	return [
-		...[...directoryFileCounts].map(([dir, fileCount]) => toEntry(dir, fileCount)),
-		...fileEntries,
+		...[...collapse.collapsedDirectories].map(([directory, fileCount]) => toEntry(directory, fileCount)),
+		...collapse.standaloneFiles.map(file => toEntry(file, 1)),
 	];
 }
 
@@ -1432,7 +1630,7 @@ export function parseSingleLsTreeEntry(output: string | undefined): { mode: stri
  *
  * Exported for tests.
  */
-export function parseGitDiffRawNumstat(output: string, repositoryRoot: URI, sessionUri: string, beforeRef: string, afterRef?: string): ISessionFileDiff[] {
+export function parseGitDiffRawNumstat(output: string, repositoryRoot: URI, sessionUri: string, beforeRef: string, afterRef?: string, refsAreImmutable = false): ISessionFileDiff[] {
 	const segments = output.split('\x00');
 	const changes: { kind: FileEditKind; oldPath?: string; newPath?: string }[] = [];
 	const numStats = new Map<string, { added: number; removed: number }>();
@@ -1498,7 +1696,7 @@ export function parseGitDiffRawNumstat(output: string, repositoryRoot: URI, sess
 		const before = change.kind !== FileEditKind.Create && change.oldPath && beforeFileUri
 			? {
 				uri: beforeFileUri.toString(),
-				content: { uri: buildGitBlobUri(sessionUri, beforeRef, change.oldPath, beforeFileUri.path) },
+				content: { uri: buildGitBlobUri(sessionUri, beforeRef, change.oldPath, beforeFileUri.path, refsAreImmutable) },
 			}
 			: undefined;
 
@@ -1506,7 +1704,7 @@ export function parseGitDiffRawNumstat(output: string, repositoryRoot: URI, sess
 			? {
 				uri: afterFileUri.toString(),
 				content: afterRef !== undefined
-					? { uri: buildGitBlobUri(sessionUri, afterRef, change.newPath, afterFileUri.path) }
+					? { uri: buildGitBlobUri(sessionUri, afterRef, change.newPath, afterFileUri.path, refsAreImmutable) }
 					: { uri: afterFileUri.toString() }
 			}
 			: undefined;

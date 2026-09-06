@@ -159,6 +159,66 @@ suite('ChatListRenderer', () => {
 				});
 			});
 
+			test('keeps a still-running subagent outside the completed response disclosure', async () => {
+				const tool: IChatToolInvocationSerialized = {
+					kind: 'toolInvocationSerialized',
+					toolCallId: 'search',
+					toolId: 'search',
+					invocationMessage: 'Searching...',
+					originMessage: undefined,
+					pastTenseMessage: 'Searched',
+					isComplete: true,
+					isConfirmed: { type: ToolConfirmKind.ConfirmationNotNeeded },
+					presentation: undefined,
+					source: ToolDataSource.Internal,
+				};
+				// A background subagent keeps streaming after its turn ends.
+				const backgroundSubagent = new ChatToolInvocation({
+					invocationMessage: 'Running subagent',
+					toolSpecificData: { kind: 'subagent', description: 'Investigate' },
+				}, {
+					id: 'task',
+					displayName: 'Task',
+					modelDescription: 'Runs a subagent',
+					source: ToolDataSource.Internal,
+				}, 'subagent-1', undefined, {}, {}, 'request-1');
+				const finishedSubagent: IChatToolInvocationSerialized = {
+					...tool,
+					toolCallId: 'subagent-2',
+					toolId: 'task',
+					toolSpecificData: { kind: 'subagent', description: 'Investigate' },
+				};
+				// A tool run *by* a subagent is not itself an anchor for one.
+				const subagentChildTool: IChatToolInvocationSerialized = {
+					...finishedSubagent,
+					toolCallId: 'child-1',
+					subAgentInvocationId: 'subagent-2',
+					toolSpecificData: { kind: 'subagent', description: 'Investigate', isActive: true },
+				};
+				const finalResponse = { kind: 'markdownContent', content: new MarkdownString('Final response') } as const;
+
+				const whileRunning = {
+					collapses: shouldCollapseCompletedResponsePart(backgroundSubagent),
+					collapseEnd: getCompletedResponseCollapseEndIndex([tool, backgroundSubagent, tool, finalResponse], 3),
+				};
+				await backgroundSubagent.didExecuteTool(undefined);
+
+				assert.deepStrictEqual({
+					whileRunning,
+					afterFinishing: {
+						collapses: shouldCollapseCompletedResponsePart(backgroundSubagent),
+						collapseEnd: getCompletedResponseCollapseEndIndex([tool, backgroundSubagent, tool, finalResponse], 3),
+					},
+					finishedSubagentCollapses: shouldCollapseCompletedResponsePart(finishedSubagent),
+					subagentChildToolCollapses: shouldCollapseCompletedResponsePart(subagentChildTool),
+				}, {
+					whileRunning: { collapses: false, collapseEnd: 1 },
+					afterFinishing: { collapses: true, collapseEnd: 3 },
+					finishedSubagentCollapses: true,
+					subagentChildToolCollapses: true,
+				});
+			});
+
 			test('moves durable tool outcomes after the final response and before trailing adjuncts', () => {
 				const tool: IChatToolInvocationSerialized = {
 					kind: 'toolInvocationSerialized',
@@ -1462,6 +1522,119 @@ suite('ChatListRenderer', () => {
 			hasDisclosure: true,
 			summaryLabel: 'Completed 2 steps',
 			announcedToggles: 1,
+		});
+
+		disposables.dispose();
+	});
+
+	test('a background subagent survives its turn and winds down when it stops', async () => {
+		const disposables = store.add(new DisposableStore());
+		const instantiationService = workbenchInstantiationService(undefined, disposables);
+		const configurationService = new TestConfigurationService();
+		configurationService.setUserConfiguration(ChatConfiguration.IncrementalRendering, false);
+		configurationService.setUserConfiguration(ChatConfiguration.CollapseCompletedResponses, true);
+		configurationService.setUserConfiguration('chat.checkpoints.enabled', false);
+		configurationService.setUserConfiguration('chat.checkpoints.showFileChanges', false);
+		configurationService.setUserConfiguration(ChatConfiguration.TurnStatusPills, false);
+		configurationService.setUserConfiguration(ChatConfiguration.Verbose, false);
+		instantiationService.stub(IConfigurationService, configurationService);
+		instantiationService.stub(IChatService, new MockChatService());
+		instantiationService.stub(IChatModelFeedbackSurveyService, new MockChatModelFeedbackSurveyService());
+		instantiationService.stub(IChatAgentService, disposables.add(instantiationService.createInstance(ChatAgentService)));
+
+		const model = disposables.add(instantiationService.createInstance(ChatModel, undefined, { initialLocation: ChatAgentLocation.Chat, canUseTools: true }));
+		const viewModel = disposables.add(instantiationService.createInstance(ChatViewModel, model, undefined));
+		const text = 'test';
+		const request = model.addRequest({
+			text,
+			parts: [new ChatRequestTextPart(new OffsetRange(0, text.length), new Range(1, 1, 1, text.length + 1), text)]
+		}, { variables: [] }, 0);
+		const response = viewModel.getItems().find(isResponseVM);
+		assert.ok(response);
+
+		const container = mainWindow.document.createElement('div');
+		mainWindow.document.body.appendChild(container);
+		disposables.add(toDisposable(() => container.remove()));
+		const renderer = disposables.add(instantiationService.createInstance(
+			ChatListItemRenderer,
+			{} as ChatEditorOptions,
+			{},
+			{
+				getListLength: () => 1,
+				onDidScroll: () => toDisposable(() => { }),
+				container,
+				currentChatMode: () => ChatModeKind.Agent,
+				isStickyScrollEnabled: () => false,
+				refreshStickyScroll: () => { },
+				stickyScrollTopPadding: 0,
+			},
+			undefined,
+			viewModel,
+		));
+		const template = renderer.renderTemplate(container);
+		disposables.add(toDisposable(() => renderer.disposeTemplate(template)));
+		const node = { element: response, children: [], depth: 0, visibleChildrenCount: 0, visibleChildIndex: 0, collapsible: false, collapsed: false, visible: true, filterData: undefined };
+
+		for (const callId of ['call-1', 'call-2']) {
+			const toolInvocation = new ChatToolInvocation({
+				invocationMessage: 'Running tool...',
+				pastTenseMessage: 'Tool completed',
+			}, {
+				id: 'my-tool',
+				displayName: 'My Tool',
+				modelDescription: 'Test tool',
+				source: ToolDataSource.Internal,
+			}, callId, undefined, {}, {}, request.id);
+			model.acceptResponseProgress(request, toolInvocation);
+			await toolInvocation.didExecuteTool(undefined);
+		}
+		const backgroundSubagent = new ChatToolInvocation({
+			invocationMessage: 'Running subagent',
+			toolSpecificData: { kind: 'subagent', description: 'Investigate' },
+		}, {
+			id: 'task',
+			displayName: 'Task',
+			modelDescription: 'Runs a subagent',
+			source: ToolDataSource.Internal,
+		}, 'subagent-1', undefined, {}, {}, request.id);
+		model.acceptResponseProgress(request, backgroundSubagent);
+		model.acceptResponseProgress(request, { kind: 'markdownContent', content: new MarkdownString('Final response') });
+
+		// The turn ends while the subagent keeps working in the background.
+		request.response?.complete();
+		renderer.renderElement(node, 0, template);
+
+		const subagentPart = container.querySelector<HTMLElement>('.chat-subagent-part');
+		const whileRunning = {
+			hasSubagent: !!subagentPart,
+			isActive: !!subagentPart?.classList.contains('chat-thinking-active'),
+			insideDisclosure: !!container.querySelector('.completed-response-disclosure')?.contains(subagentPart!),
+			summaryLabel: container.querySelector('.completed-response-summary')?.textContent,
+		};
+
+		// The subagent stops. No re-render happens: the pill has to wind down on its own.
+		await backgroundSubagent.didExecuteTool(undefined);
+		await timeout(0);
+
+		assert.deepStrictEqual({
+			whileRunning,
+			afterStopping: {
+				isActive: !!subagentPart?.classList.contains('chat-thinking-active'),
+				insideDisclosure: !!container.querySelector('.completed-response-disclosure')?.contains(subagentPart!),
+				summaryLabel: container.querySelector('.completed-response-summary')?.textContent,
+			},
+		}, {
+			whileRunning: {
+				hasSubagent: true,
+				isActive: true,
+				insideDisclosure: false,
+				summaryLabel: 'Completed 2 steps',
+			},
+			afterStopping: {
+				isActive: false,
+				insideDisclosure: true,
+				summaryLabel: 'Completed 3 steps',
+			},
 		});
 
 		disposables.dispose();

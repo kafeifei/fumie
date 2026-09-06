@@ -381,6 +381,21 @@ export default defineConfig(
 			'local/code-no-untyped-meta-access': 'warn',
 		}
 	},
+	// The Agents window has one entry point per platform, so a registration made from an
+	// Electron-only file reaches the desktop entry and nothing else. Keep those doors for
+	// code that actually needs Electron.
+	{
+		files: [
+			'src/vs/sessions/**/{electron-browser,electron-main,electron-utility,node}/**/*.ts',
+			'.eslint-plugin-local/tests/code-no-electron-only-registration-test.ts',
+		],
+		plugins: {
+			'local': pluginLocal,
+		},
+		rules: {
+			'local/code-no-electron-only-registration': ['warn', { neutralRoot: 'src/vs/sessions/' }],
+		}
+	},
 	// Strict no explicit `any`
 	{
 		files: [
@@ -1684,6 +1699,7 @@ export default defineConfig(
 						'@vscode/copilot-api', // used by agentHost for Copilot API requests
 						'@anthropic-ai/sdk', // used by agentHost for Anthropic API requests
 						'@anthropic-ai/claude-agent-sdk', // used by agentHost for Claude Agent SDK session enumeration / queries
+						'@agentclientprotocol/sdk', // used by agentHost for the Agent Client Protocol (ACP) provider
 						'@modelcontextprotocol/sdk/**/*', // used by agentHost for Claude client-tool MCP result types (Phase 10)
 						'@github/copilot-sdk',
 						'zod', // used by agentHost for Claude client-tool MCP input schemas
@@ -2164,6 +2180,26 @@ export default defineConfig(
 						'vs/sessions/contrib/providers/*/~',
 						'vs/workbench/~',
 						'vs/workbench/browser/**',
+						'vs/workbench/services/*/~',
+						'vs/workbench/contrib/*/~',
+						'vs/sessions/sessions.web.main.js'
+					]
+				},
+				{
+					// Web-entry smoke test: imports the web entry itself to read the
+					// registrations the web bundle ships.
+					'target': 'src/vs/sessions/test/browser/webEntry.smoke.ts',
+					'layer': 'browser',
+					'test': true,
+					'restrictions': [
+						'vs/base/~',
+						'vs/base/parts/*/~',
+						'vs/platform/*/~',
+						'vs/sessions/~',
+						'vs/sessions/services/*/~',
+						'vs/sessions/contrib/*/~',
+						'vs/sessions/contrib/providers/*/~',
+						'vs/workbench/~',
 						'vs/workbench/services/*/~',
 						'vs/workbench/contrib/*/~',
 						'vs/sessions/sessions.web.main.js'

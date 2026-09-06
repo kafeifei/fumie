@@ -6,7 +6,7 @@
 import electron from 'electron';
 import { Disposable } from '../../../base/common/lifecycle.js';
 import { isMacintosh } from '../../../base/common/platform.js';
-import { extUriBiasedIgnorePathCase } from '../../../base/common/resources.js';
+import { basename, dirname, extUriBiasedIgnorePathCase, isEqual } from '../../../base/common/resources.js';
 import { URI } from '../../../base/common/uri.js';
 import { IConfigurationService } from '../../configuration/common/configuration.js';
 import { ILifecycleMainService } from '../../lifecycle/electron-main/lifecycleMainService.js';
@@ -58,6 +58,11 @@ export class WindowsStateHandler extends Disposable {
 	private readonly _state: IWindowsState;
 
 	private lastClosedState: IWindowState | undefined = undefined;
+
+	/** Last closed window (macOS last-window-close) or the persisted last active window. */
+	getLastClosedOrActiveWindow(): IWindowState | undefined {
+		return this.lastClosedState ?? this._state.lastActiveWindow;
+	}
 
 	private shuttingDown = false;
 
@@ -426,6 +431,23 @@ export class WindowsStateHandler extends Disposable {
 
 		return state;
 	}
+}
+
+/**
+ * True when `windowState` is the dedicated Agents workspace, including recents
+ * from another profile's user-data directory (same `agent-sessions.code-workspace`
+ * basename fallback used for Agents recents).
+ */
+export function isAgentSessionsWindowState(windowState: IWindowState | undefined, agentSessionsWorkspace: URI | undefined): boolean {
+	const configPath = windowState?.workspace?.configPath;
+	if (!configPath || !agentSessionsWorkspace) {
+		return false;
+	}
+	if (isEqual(configPath, agentSessionsWorkspace)) {
+		return true;
+	}
+	return basename(configPath) === basename(agentSessionsWorkspace)
+		&& basename(dirname(configPath)) === basename(dirname(agentSessionsWorkspace));
 }
 
 export function restoreWindowsState(data: ISerializedWindowsState | undefined): IWindowsState {

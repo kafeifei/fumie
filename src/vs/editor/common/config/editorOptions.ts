@@ -1467,7 +1467,14 @@ class EditorAccessibilitySupport extends BaseEditorOption<EditorOption.accessibi
 				],
 				default: 'auto',
 				tags: ['accessibility'],
-				description: nls.localize('accessibilitySupport', "Controls if the UI should run in a mode where it is optimized for screen readers.")
+				description: nls.localize('accessibilitySupport', "Controls if the UI should run in a mode where it is optimized for screen readers."),
+				// `auto` asks the platform whether a screen reader is attached. On macOS that flag is
+				// shared with every client of the Accessibility API, so UI automation tools set it
+				// the same way assistive software does and it cannot tell the two apart. A false
+				// positive unmutes every `sound: 'auto'` accessibility signal at once, which in the
+				// Agents window means each request, reply and error plays audio. Pin the value so
+				// this window's behavior does not depend on that detection.
+				agentsWindow: { default: 'off', readOnly: true }
 			}
 		);
 	}

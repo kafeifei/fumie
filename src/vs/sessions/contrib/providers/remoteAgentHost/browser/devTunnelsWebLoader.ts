@@ -6,6 +6,7 @@
 import type { TunnelRelayTunnelClient } from '@microsoft/dev-tunnels-connections';
 import type { TunnelManagementHttpClient } from '@microsoft/dev-tunnels-management';
 import { AppResourcePath, FileAccess } from '../../../../../base/common/network.js';
+import type { ITunnelUserLimit } from '../../../../../platform/agentHost/common/tunnelAgentHost.js';
 import type { ITunnelDescriptor } from '../../../../../platform/agentHost/common/tunnelAgentHostConnector.js';
 import type { ITunnelDuplexStream } from '../../../../../platform/agentHost/common/tunnelMessageSocket.js';
 
@@ -37,6 +38,7 @@ export interface IDevTunnelsWebManagementClient {
 		options: IDevTunnelsWebRequestOptions,
 	): Promise<IDevTunnelsWebTunnel | null>;
 	deleteTunnel(tunnel: Pick<IDevTunnelsWebTunnel, 'tunnelId' | 'clusterId'>): Promise<boolean>;
+	listUserLimits(): Promise<readonly ITunnelUserLimit[]>;
 }
 
 /** Browser-compatible subset of the Dev Tunnels relay client. */

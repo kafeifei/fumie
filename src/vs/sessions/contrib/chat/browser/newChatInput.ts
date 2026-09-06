@@ -6,32 +6,20 @@
 import './media/chatInput.css';
 import './media/chatInputMobile.css';
 import * as dom from '../../../../base/browser/dom.js';
-import { StandardKeyboardEvent } from '../../../../base/browser/keyboardEvent.js';
-import { Gesture, EventType as TouchEventType } from '../../../../base/browser/touch.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
-import { Disposable, DisposableStore, MutableDisposable, thenRegisterOrDispose, toDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, IDisposable, MutableDisposable, thenRegisterOrDispose, toDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { Schemas } from '../../../../base/common/network.js';
-import { Button } from '../../../../base/browser/ui/button/button.js';
-import type { IManagedHoverContent } from '../../../../base/browser/ui/hover/hover.js';
-import { IMenuEntryActionViewItemOptions, MenuEntryActionViewItem } from '../../../../platform/actions/browser/menuEntryActionViewItem.js';
-import { CodeEditorWidget, ICodeEditorWidgetOptions } from '../../../../editor/browser/widget/codeEditor/codeEditorWidget.js';
-import { EditorExtensionsRegistry } from '../../../../editor/browser/editorExtensions.js';
-import { IEditorConstructionOptions } from '../../../../editor/browser/config/editorConfiguration.js';
+import { CodeEditorWidget } from '../../../../editor/browser/widget/codeEditor/codeEditorWidget.js';
 import { ITextModel } from '../../../../editor/common/model.js';
 import { IModelService } from '../../../../editor/common/services/model.js';
 import { ITextModelService } from '../../../../editor/common/services/resolverService.js';
 import { EDITOR_FONT_DEFAULTS } from '../../../../editor/common/config/fontInfo.js';
-import { EditorOptions } from '../../../../editor/common/config/editorOptions.js';
-import { SuggestController } from '../../../../editor/contrib/suggest/browser/suggestController.js';
-import { SnippetController2 } from '../../../../editor/contrib/snippet/browser/snippetController2.js';
-import { CopyPasteController } from '../../../../editor/contrib/dropOrPasteInto/browser/copyPasteController.js';
-import { PlaceholderTextContribution } from '../../../../editor/contrib/placeholderText/browser/placeholderTextContribution.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
-import { ContextKeyExpr, IContextKeyService, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
+import { ContextKeyExpr, IContextKey, IContextKeyService, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { ServiceCollection } from '../../../../platform/instantiation/common/serviceCollection.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
@@ -48,43 +36,37 @@ import { renderIcon } from '../../../../base/browser/ui/iconLabel/iconLabels.js'
 import { ThemeIcon } from '../../../../base/common/themables.js';
 import { localize } from '../../../../nls.js';
 import * as aria from '../../../../base/browser/ui/aria/aria.js';
-import { ContextMenuController } from '../../../../editor/contrib/contextmenu/browser/contextmenu.js';
-import { getSimpleEditorOptions } from '../../../../workbench/contrib/codeEditor/browser/simpleEditorOptions.js';
 import { NewChatContextAttachments } from './newChatContextAttachments.js';
+import { collectComposerClipboardAttachments } from './composerAttach.js';
 import { ChatDragAndDrop } from '../../../../workbench/contrib/chat/browser/widget/chatDragAndDrop.js';
 import { EDITOR_DRAG_AND_DROP_BACKGROUND } from '../../../../workbench/common/theme.js';
 import { inactiveSessionViewBackground, inactiveSessionViewForeground } from '../../../common/theme.js';
 
 import { INewChatVoiceTargetService, isNewChatVoiceSessionActive, NEW_CHAT_VOICE_SENTINEL, NewChatVoiceController } from './newChatVoice.js';
+import { AgentSdkPrepBar } from './agentSdkPrepBar.js';
 import { ISessionTypePickerOptions, SessionTypePicker } from './sessionTypePicker.js';
 import { IActiveSession } from '../../../services/sessions/common/sessionsManagement.js';
 import { MobileSessionTypePicker } from './mobile/mobileSessionTypePicker.js';
-import { installMobileChipLaneScroll } from '../../../browser/parts/mobile/mobileChipLaneScroll.js';
 import { IWorkbenchLayoutService } from '../../../../workbench/services/layout/browser/layoutService.js';
 import { Menus } from '../../../browser/menus.js';
 import { HiddenItemStrategy, MenuWorkbenchToolBar } from '../../../../platform/actions/browser/toolbar.js';
-import { MenuId, MenuItemAction } from '../../../../platform/actions/common/actions.js';
-import { IContextMenuService } from '../../../../platform/contextview/browser/contextView.js';
+import { installMobileChipLaneScroll } from '../../../browser/parts/mobile/mobileChipLaneScroll.js';
 import { IAccessibilityService } from '../../../../platform/accessibility/common/accessibility.js';
-import { INotificationService } from '../../../../platform/notification/common/notification.js';
-import { IThemeService } from '../../../../platform/theme/common/themeService.js';
-import { defaultButtonStyles } from '../../../../platform/theme/browser/defaultStyles.js';
-import { ICommandService } from '../../../../platform/commands/common/commands.js';
-import { getDictationHoverMarkdown } from '../../../../workbench/contrib/chat/browser/speechToText/micButtonHovers.js';
-import { addMicButtonContextMenuListener, getDictationContextMenuActions } from '../../../../workbench/contrib/chat/browser/speechToText/micButtonMenuActions.js';
 import { SlashCommandHandler } from './slashCommands.js';
 import { VariableCompletionHandler } from './variableCompletions.js';
 import { SessionReferenceCompletionHandler } from './sessionReferenceCompletions.js';
 import { AgentHostInputCompletionHandler } from './agentHostInputCompletions.js';
 import { IChatModelInputState } from '../../../../workbench/contrib/chat/common/model/chatModel.js';
-import { IChatRequestVariableEntry, isExplicitFileOrImageVariableEntry, toFileVariableEntry } from '../../../../workbench/contrib/chat/common/attachments/chatVariableEntries.js';
+import { IChatRequestVariableEntry, toFileVariableEntry } from '../../../../workbench/contrib/chat/common/attachments/chatVariableEntries.js';
 import { IChatSessionsService } from '../../../../workbench/contrib/chat/common/chatSessionsService.js';
 import { ChatAgentLocation, ChatModeKind } from '../../../../workbench/contrib/chat/common/constants.js';
 import { ChatHistoryNavigator } from '../../../../workbench/contrib/chat/common/widget/chatWidgetHistoryService.js';
 import { IHistoryNavigationWidget } from '../../../../base/browser/history.js';
-import { registerAndCreateHistoryNavigationContext, IHistoryNavigationContext } from '../../../../platform/history/browser/contextScopedHistoryWidget.js';
+import { IHistoryNavigationContext } from '../../../../platform/history/browser/contextScopedHistoryWidget.js';
 import { autorun, constObservable, derived, IObservable, observableFromEvent, observableValue } from '../../../../base/common/observable.js';
 import { isEqual } from '../../../../base/common/resources.js';
+import { ChatInputCanSubmit, ChatInputDictationContext, ChatInputSubmitMenu, ChatInputSupportsBackground, createChatInputExecuteToolbar, hasChatInputSendableContent, IChatInputSubmitContext } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputExecuteToolbar.js';
+import { ChatInputEditor } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputEditor.js';
 import { ChatInputNotificationWidget } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputNotificationWidget.js';
 import { ChatInputNoticeHost, ChatInputNoticeLane } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputNoticeHost.js';
 import { registerChatInputOnboardingHosts } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputOnboardingHosts.js';
@@ -96,36 +78,31 @@ import { ModelPicker, ModelPickerActionViewItem } from './modelPicker.js';
 import { ISessionModelSelection, SessionModelSelection } from './sessionModelSelection.js';
 import { ISessionContext, SessionContext } from '../../../services/sessions/browser/sessionContext.js';
 import { AGENT_SESSIONS_SCOPED_INPUT_HISTORY_SETTING } from './sessionsChatHistory.js';
-import { IChatStatusItemService } from '../../../../workbench/contrib/chat/browser/chatStatus/chatStatusItemService.js';
 import { handleTerminalCommandPaste, isTerminalCommandInput } from '../../../../workbench/contrib/chat/browser/chatTerminalCommandPaste.js';
 import { IChatPasteTargetService } from '../../../../workbench/contrib/chat/browser/chat.js';
 import { NewChatInputPasteTarget } from './newChatInputPasteTarget.js';
 import { getChatSessionType } from '../../../../workbench/contrib/chat/common/model/chatUri.js';
-import { ChatSpeechToTextState, DictationSettingId, IChatSpeechToTextService } from '../../../../workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.js';
-import { setupDictationMicGlow } from '../../../../workbench/contrib/chat/browser/speechToText/dictationMicGlow.js';
+import { IChatSpeechToTextService } from '../../../../workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.js';
 import { IDictationOnboardingService } from '../../../../workbench/contrib/chat/browser/speechToText/dictationOnboarding.js';
 import { ChatVoiceInputModeAction, VoiceInputModeActionViewItem } from '../../../../workbench/contrib/chat/browser/voiceInputMode/voiceInputModeActionViewItem.js';
 import { IVoiceInputModeService } from '../../../../workbench/contrib/chat/browser/voiceInputMode/voiceInputMode.js';
 import { toAction } from '../../../../base/common/actions.js';
-import { runDictationShortcut } from '../../../../workbench/contrib/chat/browser/actions/chatSpeechToTextActions.js';
+import { ChatDictationMenu, runDictationShortcut } from '../../../../workbench/contrib/chat/browser/actions/chatSpeechToTextActions.js';
 import { isDictationActiveForEditor, notifyDictationSubmitted, onDidChangeDictationEditor } from '../../../../workbench/contrib/chat/browser/speechToText/dictationSession.js';
 import { combineVoiceInput } from '../../../../workbench/contrib/chat/browser/voiceClient/voiceInputUtils.js';
 import { ChatContextKeys } from '../../../../workbench/contrib/chat/common/actions/chatContextKeys.js';
-import { DictationDownloadRing, getDictationDownloadHoverMarkdown, getDictationPreparingLabel } from '../../../../workbench/contrib/chat/browser/speechToText/dictationDownloadRing.js';
 import { IVoiceSessionController } from '../../../../workbench/contrib/chat/browser/voiceClient/voiceSessionController.js';
 import { IChatPetWidgetService } from '../../../../workbench/contrib/chat/browser/widget/chatPetWidgetService.js';
 import { IVoiceModeOnboardingService } from '../../../../workbench/contrib/agentsVoice/browser/voiceModeOnboarding.js';
-import { AGENTS_VOICE_ENABLED } from '../../../../workbench/contrib/agentsVoice/common/agentsVoice.js';
+import { AGENTS_VOICE_CONNECTED, AGENTS_VOICE_ENABLED } from '../../../../workbench/contrib/agentsVoice/common/agentsVoice.js';
 import { animatePromptTyping, IPromptTypingAnimation } from './promptTypingAnimation.js';
 import { PromptTemplatePlaceholderController } from './promptTemplatePlaceholder.js';
 import { INewSessionComposer, INewSessionPromptOptionsController, NEW_SESSION_PROMPT_TYPING_DURATION_MS, NewSessionPromptOptionsState, NewSessionWorkspacePreselectionSource } from './newSessionComposerService.js';
 import { NewSessionPromptOptionsWidget } from './newSessionPromptOptions.js';
+import { blurActiveElementWithin } from './mobile/mobileChatKeyboard.js';
+import { isPhoneLayout } from '../../../browser/parts/mobile/mobileLayout.js';
 
 
-const OPEN_OTEL_SETTINGS_COMMAND = 'github.copilot.chat.otel.openSettings';
-const OTEL_STATUS_COMMAND = 'github.copilot.chat.otel.statusActive';
-const OTEL_STATUS_ENTRY_ID = 'copilot.otelStatus';
-const OTEL_DOCS_URL = 'https://code.visualstudio.com/docs/agents/guides/monitoring-agents';
 const STORAGE_KEY_DRAFT_STATE = 'sessions.draftState';
 const MIN_EDITOR_HEIGHT = 50;
 const MAX_EDITOR_HEIGHT = 200;
@@ -164,106 +141,6 @@ KeybindingsRegistry.registerKeybindingRule({
 interface IDraftState {
 	inputText: string;
 	attachments: readonly IChatRequestVariableEntry[];
-}
-
-class NewChatInputStatusActionViewItem extends MenuEntryActionViewItem {
-	private readonly hoverContentDisposables = this._register(new MutableDisposable<DisposableStore>());
-
-	constructor(
-		action: MenuItemAction,
-		options: IMenuEntryActionViewItemOptions | undefined,
-		@IKeybindingService keybindingService: IKeybindingService,
-		@INotificationService notificationService: INotificationService,
-		@IContextKeyService contextKeyService: IContextKeyService,
-		@IThemeService themeService: IThemeService,
-		@IContextMenuService contextMenuService: IContextMenuService,
-		@IAccessibilityService accessibilityService: IAccessibilityService,
-		@IChatStatusItemService private readonly chatStatusItemService: IChatStatusItemService,
-		@IHoverService private readonly hoverService: IHoverService,
-		@ICommandService private readonly commandService: ICommandService,
-	) {
-		super(action, options, keybindingService, notificationService, contextKeyService, themeService, contextMenuService, accessibilityService);
-	}
-
-	override render(container: HTMLElement): void {
-		super.render(container);
-
-		if (this._commandAction.id !== OTEL_STATUS_COMMAND) {
-			return;
-		}
-
-		this._register(this.chatStatusItemService.onDidChange(e => {
-			if (e.entry.id === OTEL_STATUS_ENTRY_ID) {
-				this.updateTooltip();
-			}
-		}));
-	}
-
-	override async onClick(event: MouseEvent): Promise<void> {
-		if (this._commandAction.id === OTEL_STATUS_COMMAND && this.element) {
-			event.preventDefault();
-			event.stopPropagation();
-			this.hoverService.showManagedHover(this.element);
-			return;
-		}
-
-		await super.onClick(event);
-	}
-
-	protected override getHoverContents(): IManagedHoverContent | undefined {
-		if (this._commandAction.id === OTEL_STATUS_COMMAND) {
-			return { element: () => this._renderStatusHover() };
-		}
-
-		return super.getHoverContents();
-	}
-
-	protected override getTooltip(): string {
-		if (this._commandAction.id === OTEL_STATUS_COMMAND) {
-			const tooltip = this._getStatusEntryTooltip();
-			if (tooltip) {
-				return tooltip;
-			}
-		}
-
-		return super.getTooltip();
-	}
-
-	private _getStatusEntryTooltip(): string | undefined {
-		for (const entry of this.chatStatusItemService.getEntries()) {
-			if (entry.id === OTEL_STATUS_ENTRY_ID) {
-				return entry.tooltip;
-			}
-		}
-
-		return undefined;
-	}
-
-	private _renderStatusHover(): HTMLElement {
-		const store = new DisposableStore();
-		this.hoverContentDisposables.value = store;
-
-		const root = dom.$('.new-chat-input-status-hover');
-		root.appendChild(dom.$('.new-chat-input-status-hover-title', undefined, localize('newChatInput.status.otel.title', "Monitoring with OpenTelemetry enabled")));
-		root.appendChild(dom.$('.new-chat-input-status-hover-detail', undefined, this._getStatusEntryTooltip() ?? super.getTooltip()));
-
-		const actions = root.appendChild(dom.$('.new-chat-input-status-hover-actions'));
-		const learnMoreButton = store.add(new Button(actions, { ...defaultButtonStyles, secondary: true }));
-		learnMoreButton.label = localize('newChatInput.status.otel.learnMore', "Learn More");
-		store.add(learnMoreButton.onDidClick(() => {
-			void this.commandService.executeCommand('vscode.open', URI.parse(OTEL_DOCS_URL));
-			this.hoverService.hideHover(true);
-		}));
-
-		const manageButton = store.add(new Button(actions, { ...defaultButtonStyles, secondary: true }));
-		manageButton.label = localize('newChatInput.status.otel.manage', "Manage");
-		store.add(manageButton.onDidClick(() => {
-			void this.commandService.executeCommand(OPEN_OTEL_SETTINGS_COMMAND);
-			this.hoverService.hideHover(true);
-		}));
-
-		return root;
-	}
 }
 
 /**
@@ -312,7 +189,7 @@ function getRandomChatInputPlaceholder(): string {
 // #region --- New Chat Widget ---
 
 export class NewChatInputWidget extends Disposable implements IHistoryNavigationWidget, INewSessionComposer {
-	private static readonly compactModelPickerWidth = 280;
+	private static readonly compactModelPickerWidth = 500;
 
 	readonly sessionTypePicker: SessionTypePicker;
 
@@ -358,6 +235,7 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 	private _editor!: CodeEditorWidget;
 	private _editorContainer!: HTMLElement;
 	private _sessionControlsContainer: HTMLElement | undefined;
+	private _attachButton: HTMLElement | undefined;
 	private readonly _promptTemplatePlaceholder = this._register(new MutableDisposable<PromptTemplatePlaceholderController>());
 	private readonly _promptOptionsWidget = this._register(new MutableDisposable<NewSessionPromptOptionsWidget>());
 	private readonly _promptOptionsRefresh = this._register(new MutableDisposable<CancellationTokenSource>());
@@ -366,7 +244,8 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 	private _promptOptionsDismissed = false;
 
 	// Send button
-	private _sendButton: Button | undefined;
+	private _sendButton: MenuWorkbenchToolBar | undefined;
+	private _sendEnabled: IContextKey<boolean> | undefined;
 	private _sending = false;
 
 	// Loading state
@@ -409,6 +288,12 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 			historyKey?: IObservable<string | undefined>;
 			minEditorHeight?: number;
 			placeholder?: string;
+			/**
+			 * Render the session-type (harness) picker in the composer
+			 * controls, independent of the model picker. Defaults to `true`.
+			 * Pass `false` for the in-session follow-up composer, which is
+			 * already bound to a harness.
+			 */
 			renderSessionTypePickerInControls?: boolean;
 			renderSendButton?: boolean;
 			sessionTypePickerOptions?: ISessionTypePickerOptions;
@@ -440,18 +325,18 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		@IDictationOnboardingService private readonly dictationOnboardingService: IDictationOnboardingService,
 		@IChatInputNoticeHubService private readonly chatInputNoticeHubService: IChatInputNoticeHubService,
 		@IChatSubmitRequestHandlerService private readonly chatSubmitRequestHandlerService: IChatSubmitRequestHandlerService,
-		@IContextMenuService private readonly contextMenuService: IContextMenuService,
-		@ICommandService private readonly commandService: ICommandService,
 		@IVoiceSessionController private readonly voiceSessionController: IVoiceSessionController,
 		@IVoiceInputModeService private readonly voiceInputModeService: IVoiceInputModeService,
 		@IAccessibilityService private readonly accessibilityService: IAccessibilityService,
 		@IVoiceModeOnboardingService private readonly voiceModeOnboardingService: IVoiceModeOnboardingService,
 		@INewChatVoiceTargetService private readonly newChatVoiceTargetService: INewChatVoiceTargetService,
-		@IThemeService private readonly themeService: IThemeService,
 		@IChatPetWidgetService private readonly chatPetWidgetService: IChatPetWidgetService,
 	) {
 		super();
-		this._modelSelection = this._register(this.instantiationService.createInstance(SessionModelSelection, this.options.session));
+		this._modelSelection = this._register(this.instantiationService.createInstance(
+			SessionModelSelection as unknown as new (session: IObservable<IActiveSession | undefined>) => SessionModelSelection,
+			this.options.session,
+		));
 		this._canSendRequest = derived(this, reader => {
 			if (this.options.canSubmitWithoutSession?.read(reader)) {
 				return true;
@@ -480,6 +365,7 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		// avoids a class-mismatch when the user resizes across the
 		// phone breakpoint after the chat input mounted.
 		this.sessionTypePicker = this._register(this.instantiationService.createInstance(MobileSessionTypePicker, this.options.session, this.options.sessionTypePickerOptions));
+		this._register(this._modelSelection.onDidRequestSessionType(pick => this.sessionTypePicker.selectSessionType(pick)));
 		this._register(this._contextAttachments.onDidChangeContext(() => {
 			this._updateDraftState();
 			this._updateSendButtonState();
@@ -527,6 +413,10 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		const composerFocusTracker = this._register(dom.trackFocus(chatInputContainer));
 		this._register(composerFocusTracker.onDidFocus(() => composerFocusKey.set(true)));
 		this._register(composerFocusTracker.onDidBlur(() => composerFocusKey.set(false)));
+
+		// Agent SDK preparation status (installing/failed agents), above the
+		// notification stack so it reads as host state rather than a chat notice.
+		this._register(this.instantiationService.createInstance(AgentSdkPrepBar, chatInputContainer));
 
 		// Notification widget above the input area
 		const notificationContainer = dom.append(chatInputContainer, dom.$(`.chat-input-notification-container.${chatInputStackSlotClass}`));
@@ -609,63 +499,37 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 			getPlatformTop: () => undefined,
 			onDidChangePlatform: Event.None,
 		}, this.options.petHostPreferred, this.onDidFocus));
-		this._createInputToolbar(inputArea);
+		const composerControls = dom.append(inputAreaWrapper, dom.$('.sessions-chat-composer-controls'));
+		this._createInputToolbar(inputArea, composerControls);
 
-		const newChatBottomContainer = dom.append(parent, dom.$('.new-chat-bottom-container'));
-		const newChatControlsContainer = dom.append(newChatBottomContainer, dom.$('.new-chat-controls-container'));
-		if (this.options.renderSessionTypePickerInControls !== false) {
-			const sessionTypePickerHost = dom.append(newChatControlsContainer, dom.$('.new-chat-session-type-picker-host'));
-			this.sessionTypePicker.render(sessionTypePickerHost);
+		// In-session follow-up has no workspace picker; keep the original
+		// branch / worktree chips on the composer secondary toolbar.
+		if (this.options.renderSessionTypePickerInControls === false) {
+			const repoConfigLane = dom.append(parent, dom.$('.new-chat-bottom-container'));
+			this._register(this.renderRepositoryConfig(repoConfigLane));
+			this._register(installMobileChipLaneScroll(repoConfigLane, this.layoutService));
 		}
-		const sessionControlsContainer = this._sessionControlsContainer = dom.append(newChatControlsContainer, dom.$('.new-chat-session-controls'));
-		this._register(this._scopedInstantiationService.createInstance(MenuWorkbenchToolBar, sessionControlsContainer, Menus.NewSessionControl, {
-			hiddenItemStrategy: HiddenItemStrategy.NoHide,
-		}));
-		this._register({ dispose: () => sessionControlsContainer.remove() });
-
-		const repoConfigContainer = dom.append(newChatBottomContainer, dom.$('.new-chat-repo-config-container'));
-		this._register(this._scopedInstantiationService.createInstance(MenuWorkbenchToolBar, repoConfigContainer, Menus.NewSessionRepositoryConfig, {
-			hiddenItemStrategy: HiddenItemStrategy.NoHide,
-		}));
-
-		// On phone, the chip lane is horizontally scrollable when its
-		// content overflows the viewport. Native touch scroll is blocked
-		// because each chip registers a `Gesture.addTarget` handler in
-		// `renderPickerTrigger` that calls `preventDefault` on
-		// `touchmove`, swallowing the pan. The helper below installs a
-		// pointer-event-based scroll handler that no-ops on desktop and
-		// kicks in once a drag crosses a small threshold on phone.
-		this._register(installMobileChipLaneScroll(newChatBottomContainer, this.layoutService));
-
-		// Generic extension point for status indicators in the new-session view.
-		const statusContainer = dom.append(repoConfigContainer, dom.$('.new-chat-status-toolbar'));
-		this._register(this.instantiationService.createInstance(MenuWorkbenchToolBar, statusContainer, MenuId.ChatInputStatus, {
-			hiddenItemStrategy: HiddenItemStrategy.NoHide,
-			toolbarOptions: { primaryGroup: () => true },
-			actionViewItemProvider: (action, options) => {
-				if (action.id === OTEL_STATUS_COMMAND && action instanceof MenuItemAction) {
-					return this.instantiationService.createInstance(NewChatInputStatusActionViewItem, action, options);
-				}
-				return undefined;
-			},
-		}));
 
 		// Restore draft input state from storage
 		this._restoreState();
 
-		// The composer is a stack, and was just added to its host's stack. Hosts
-		// often dock a notice - the sub-session tip, a feedback banner - before
-		// this point, and nothing reports for a child being added.
-		//
-		// Standalone, not docked: the composer draws its own frame, so a notice
-		// above it joins it but the run stops before the controls row below.
+		// The composer is a standalone stack slot; notices dock above it.
 		setChatInputStackSlot(chatInputContainer, ChatInputStackSlot.Standalone);
 		refreshChatInputStack(parent);
 
-		// Layout editor after the input slot fade-in animation completes
-		this._register(dom.addDisposableListener(chatInputContainer, 'animationend', () => {
-			this._editor?.layout();
-		}, { once: true }));
+		// Layout editor after the input slot fade-in animation completes. The
+		// container starts `display: none` (revealed + animated via CSS), so a
+		// layout pass that ran before the reveal measured a 0-size editor — a
+		// 0-size editor swallows every click until someone lays it out again.
+		// `animationend` bubbles and descendants animate too, so filter on the
+		// container's own animation instead of `{ once: true }` (a child's
+		// earlier animation would consume the listener and the fade-in's own
+		// end would never trigger the backfill).
+		this._register(dom.addDisposableListener(chatInputContainer, 'animationend', (e: AnimationEvent) => {
+			if (e.target === chatInputContainer) {
+				this._editor?.layout();
+			}
+		}));
 	}
 
 	private _updateInputLoadingState(): void {
@@ -708,6 +572,24 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		handleTerminalCommandPaste(e, this._editor, this._getTerminalCommandPrefix(), this.dialogService, this.storageService);
 	}
 
+	// Must stay synchronous: the capture-phase veto (preventDefault/stopPropagation)
+	// only works while the event is still dispatching. An await before the veto
+	// would let the paste fall through to the editor's paste pipeline, which
+	// attaches its own copy of the same content.
+	private _handleComposerPaste(e: ClipboardEvent): void {
+		this._handleTerminalCommandPaste(e);
+		if (e.defaultPrevented) {
+			return;
+		}
+		const attachments = collectComposerClipboardAttachments(e);
+		if (!attachments) {
+			return;
+		}
+		e.preventDefault();
+		e.stopPropagation();
+		this._contextAttachments.addAttachments(...attachments);
+	}
+
 	/**
 	 * Paste edits are applied through the bulk edit service, which resolves the
 	 * input model and force-destroys it when the last reference is released.
@@ -728,65 +610,20 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		const minHeight = this.options.minEditorHeight ?? MIN_EDITOR_HEIGHT;
 		editorContainer.style.height = `${minHeight}px`;
 
-		// Create scoped context key service and register history navigation
-		// BEFORE creating the editor, so the editor's context key scope is a child
-		const inputScopedContextKeyService = this._register(this.contextKeyService.createScoped(container));
-		const { historyNavigationBackwardsEnablement, historyNavigationForwardsEnablement } = this._register(registerAndCreateHistoryNavigationContext(inputScopedContextKeyService, this));
-		this._historyNavigationBackwardsEnablement = historyNavigationBackwardsEnablement;
-		this._historyNavigationForwardsEnablement = historyNavigationForwardsEnablement;
-
-		const scopedInstantiationService = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, inputScopedContextKeyService])));
-
-		const uri = URI.from({ scheme: Schemas.sessionsChatInput, path: `input-${Date.now()}` });
-		const textModel = this.modelService.createModel('', null, uri, true);
-		this._holdInputModelReference(uri, textModel);
-
-		const editorOptions: IEditorConstructionOptions = {
-			...getSimpleEditorOptions(this.configurationService),
-			readOnly: false,
-			// Match the workbench chat input so the post-paste selector is offered.
-			pasteAs: EditorOptions.pasteAs.defaultValue,
+		const input = this._register(this.instantiationService.createInstance(ChatInputEditor, container, editorContainer, this, {
 			ariaLabel: this._getAriaLabel(),
 			placeholder: this.options.placeholder ?? getRandomChatInputPlaceholder(),
 			fontFamily: NEW_CHAT_INPUT_FONT_FAMILY,
-			fontSize: 13,
-			lineHeight: 20,
-			cursorWidth: 1,
 			padding: { top: 8, bottom: 2 },
-			wrappingStrategy: 'advanced',
-			stickyScroll: { enabled: false },
-			renderWhitespace: 'none',
-			scrollbar: {
-				horizontal: 'hidden',
-				alwaysConsumeMouseWheel: false,
-				vertical: 'auto',
-				verticalScrollbarSize: 7,
-			},
 			overflowWidgetsDomNode,
-			suggest: {
-				showIcons: true,
-				showSnippets: false,
-				showWords: true,
-				showStatusBar: false,
-				insertMode: 'insert',
-				fitWidthToDetails: true,
-			},
-		};
-
-		const widgetOptions: ICodeEditorWidgetOptions = {
-			isSimpleWidget: true,
-			contributions: EditorExtensionsRegistry.getSomeEditorContributions([
-				ContextMenuController.ID,
-				SuggestController.ID,
-				SnippetController2.ID,
-				PlaceholderTextContribution.ID,
-				CopyPasteController.ID,
-			]),
-		};
-
-		this._editor = this._register(scopedInstantiationService.createInstance(
-			CodeEditorWidget, editorContainer, editorOptions, widgetOptions,
-		));
+		}));
+		const inputScopedContextKeyService = input.contextKeyService;
+		this._historyNavigationBackwardsEnablement = input.historyNavigation.historyNavigationBackwardsEnablement;
+		this._historyNavigationForwardsEnablement = input.historyNavigation.historyNavigationForwardsEnablement;
+		this._editor = input.editor;
+		const uri = URI.from({ scheme: Schemas.sessionsChatInput, path: `input-${Date.now()}` });
+		const textModel = this.modelService.createModel('', null, uri, true);
+		this._holdInputModelReference(uri, textModel);
 		this._editor.setModel(textModel);
 		this._promptTemplatePlaceholder.value = new PromptTemplatePlaceholderController(this._editor, () => this._promptTypingAnimation.value?.complete());
 		this._register(autorun(reader => {
@@ -797,10 +634,7 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		}));
 		// Attach to the container (not `getDomNode()`, which is null until the
 		// editor has a model) so the capture-phase paste veto is always wired up.
-		this._register(dom.addDisposableListener(this._editorContainer, dom.EventType.PASTE, e => this._handleTerminalCommandPaste(e), true));
-
-		// Ensure suggest widget renders above the input (not clipped by container)
-		SuggestController.get(this._editor)?.forceRenderingAbove();
+		this._register(dom.addDisposableListener(this._editorContainer, dom.EventType.PASTE, e => this._handleComposerPaste(e), true));
 
 		// Update aria label when accessibility verbosity setting changes
 		this._register(this.configurationService.onDidChangeConfiguration(e => {
@@ -861,7 +695,7 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 			if (e.equals(KeyMod.CtrlCmd | KeyCode.Slash)) {
 				e.preventDefault();
 				e.stopPropagation();
-				this._contextAttachments.showPicker(this.options.getContextFolderUri());
+				this._openAttachMenu();
 			}
 		}));
 
@@ -937,8 +771,29 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		this._editor.updateOptions({ fontFamily: isCommand ? EDITOR_FONT_DEFAULTS.fontFamily : NEW_CHAT_INPUT_FONT_FAMILY });
 	}
 
+	private _openAttachMenu(): void {
+		if (this._attachButton) {
+			this._contextAttachments.showPicker(this._attachButton);
+		}
+	}
+
+	/**
+	 * Mounts the original new-session repository chips (New Worktree + branch)
+	 * into `container`. The welcome composer places this next to the folder
+	 * picker; the in-session composer uses the secondary toolbar lane.
+	 */
+	renderRepositoryConfig(container: HTMLElement): IDisposable {
+		const store = new DisposableStore();
+		const repoConfigContainer = dom.append(container, dom.$('.new-chat-repo-config-container'));
+		store.add(this._scopedInstantiationService.createInstance(MenuWorkbenchToolBar, repoConfigContainer, Menus.NewSessionRepositoryConfig, {
+			hiddenItemStrategy: HiddenItemStrategy.NoHide,
+		}));
+		store.add(toDisposable(() => repoConfigContainer.remove()));
+		return store;
+	}
+
 	private _createAttachButton(container: HTMLElement): void {
-		const attachButton = dom.append(container, dom.$('.sessions-chat-attach-button'));
+		const attachButton = this._attachButton = dom.append(container, dom.$('.sessions-chat-attach-button'));
 		const attachButtonLabel = localize('addContext', "Add Context...");
 		attachButton.tabIndex = 0;
 		attachButton.role = 'button';
@@ -949,12 +804,10 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 			appearance: { showPointer: true }
 		}));
 		dom.append(attachButton, renderIcon(Codicon.addCompact));
-		this._register(dom.addDisposableListener(attachButton, dom.EventType.CLICK, () => {
-			this._contextAttachments.showPicker(this.options.getContextFolderUri());
-		}));
+		this._register(dom.addDisposableListener(attachButton, dom.EventType.CLICK, () => this._openAttachMenu()));
 	}
 
-	private _createInputToolbar(container: HTMLElement): void {
+	private _createInputToolbar(container: HTMLElement, controls: HTMLElement): void {
 		const toolbar = dom.append(container, dom.$('.sessions-chat-toolbar'));
 		let dictationActionVisible = false;
 		let voiceActionCount = 0;
@@ -962,10 +815,19 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 			toolbar.classList.toggle('sessions-chat-voice-input-actions-multiple', Number(dictationActionVisible) + voiceActionCount > 1);
 		};
 
-		this._createAttachButton(toolbar);
+		this._createAttachButton(controls);
 
-		// Session config pickers (such as model) — rendered via MenuWorkbenchToolBar
-		// Visibility controlled by context keys (isActiveSessionBackgroundProvider, isNewChatSession)
+		const sessionControlsContainer = this._sessionControlsContainer = dom.append(controls, dom.$('.new-chat-session-controls'));
+		this._register(this._scopedInstantiationService.createInstance(MenuWorkbenchToolBar, sessionControlsContainer, Menus.NewSessionControl, {
+			hiddenItemStrategy: HiddenItemStrategy.NoHide,
+		}));
+
+		dom.append(toolbar, dom.$('.sessions-chat-toolbar-spacer'));
+		if (this.options.renderSessionTypePickerInControls !== false) {
+			const sessionTypePickerHost = dom.append(toolbar, dom.$('.new-chat-session-type-picker-host'));
+			this.sessionTypePicker.render(sessionTypePickerHost, { className: 'sessions-chat-session-type-picker' });
+		}
+
 		const configContainer = dom.append(toolbar, dom.$('.sessions-chat-config-toolbar'));
 		this._register(this._scopedInstantiationService.createInstance(MenuWorkbenchToolBar, configContainer, Menus.NewSessionConfig, {
 			hiddenItemStrategy: HiddenItemStrategy.NoHide,
@@ -977,8 +839,6 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 				return undefined;
 			},
 		}));
-
-		dom.append(toolbar, dom.$('.sessions-chat-toolbar-spacer'));
 
 		// Dictation mic button. Shares the STT service, mic
 		// device, and gating (backend support + `dictation.enabled`)
@@ -1031,16 +891,14 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 
 		if (this.options.renderSendButton !== false) {
 			const sendButtonContainer = dom.append(toolbar, dom.$('.sessions-chat-send-button'));
-			const sendButton = this._sendButton = this._register(new Button(sendButtonContainer, {
-				secondary: true,
-				title: this.options.supportsBackground
-					? localize('sendWithBackgroundHint', "Send (Alt-click to start in the background)")
-					: localize('send', "Send"),
-				ariaLabel: localize('send', "Send"),
+			const context = this._register(this.contextKeyService.createScoped(sendButtonContainer));
+			this._sendEnabled = ChatInputCanSubmit.bindTo(context);
+			ChatInputSupportsBackground.bindTo(context).set(!!this.options.supportsBackground);
+			const services = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, context])));
+			this._sendButton = this._register(createChatInputExecuteToolbar(services, sendButtonContainer, ChatInputSubmitMenu, {
+				isActive: constObservable(false), isDictationActive: constObservable(false), isVoiceActive: constObservable(false),
 			}));
-			sendButton.icon = Codicon.arrowUpCompact;
-			// Hold Alt while clicking Send to start the session in the background.
-			this._register(sendButton.onDidClick(e => this._send(!!this.options.supportsBackground && !!(e as MouseEvent | KeyboardEvent | undefined)?.altKey)));
+			this._sendButton.context = { submitInput: background => this._send(background) } satisfies IChatInputSubmitContext;
 		}
 		updateVoiceInputActionBorder();
 	}
@@ -1098,149 +956,36 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 	}
 
 	private _createSpeechToTextButton(container: HTMLElement, onDidChangeVisibility: (visible: boolean) => void): void {
-		const sttService = this.chatSpeechToTextService;
-		const isDictationInputActive = observableFromEvent(
-			this,
-			Event.any(sttService.onDidChangeState, sttService.onDidChangePreparingModel, onDidChangeDictationEditor),
-			() => isDictationActiveForEditor(this._editor),
-		);
-
-		const button = dom.append(container, dom.$('.sessions-chat-stt-button'));
-		button.tabIndex = 0;
-		button.role = 'button';
-		const micLabel = localize('sessionsStt.dictate', "Dictate (Speech to Text)");
-		const stopLabel = localize('sessionsStt.stop', "Stop Dictation");
-		this._register(this.hoverService.setupDelayedHover(button, () => ({
-			// While the model prepares, surface the download/connecting hover
-			// (which invites the user to click to cancel) so this composer matches
-			// the main chat toolbar affordance. Idle gets the richer description
-			// naming the configured dictation model.
-			content: isDictationInputActive.get() && sttService.isPreparingModel
-				? getDictationDownloadHoverMarkdown(sttService)
-				: (isDictationInputActive.get() ? stopLabel : getDictationHoverMarkdown(micLabel, this.configurationService)),
-			position: { hoverPosition: HoverPosition.BELOW },
-			appearance: { showPointer: true }
-		})));
-
-		const downloadRing = this._register(new MutableDisposable<DictationDownloadRing>());
-		const renderState = () => {
-			const active = isDictationActiveForEditor(this._editor);
-			const preparing = active && sttService.isPreparingModel;
-			// Only the active Recording state should read as "recording" (filled
-			// mic). Once the user stops, the service enters Transcribing while it
-			// waits for the final transcript (up to a few seconds on the cloud
-			// backend); during that the mic must already read as idle, matching
-			// the chat toolbar which flips as soon as recording stops.
-			const recording = active && sttService.state === ChatSpeechToTextState.Recording;
-			dom.clearNode(button);
-			downloadRing.clear();
-			if (preparing) {
-				// First-use only. Show a download icon wrapped by a progress
-				// ring only during an actual model download (a confirmed cache
-				// miss); otherwise (loading an already-cached model, or the cloud
-				// backend connecting) render a plain spinner instead.
-				// Glyphs render at the compact 12px size, so use the `*Compact`
-				// variants where one exists.
-				if (sttService.isDownloadingModel) {
-					dom.append(button, renderIcon(Codicon.micDownloadCompact));
-					downloadRing.value = new DictationDownloadRing(button, sttService);
-				} else {
-					dom.append(button, renderIcon(ThemeIcon.modify(Codicon.loadingCompact, 'spin')));
-				}
-			} else {
-				// `mic` / `micFilled` have no compact variant, so they stay as-is.
-				dom.append(button, renderIcon(recording ? Codicon.micFilled : Codicon.mic));
-			}
-			button.classList.toggle('recording', recording && !preparing);
-			button.classList.toggle('preparing', preparing);
-			button.ariaLabel = preparing
-				? localize('sessionsStt.cancelPreparing', "Cancel Dictation. {0}", getDictationPreparingLabel(sttService))
-				: (active ? stopLabel : micLabel);
-		};
-		renderState();
-		this._register(sttService.onDidChangeState(renderState));
-		this._register(sttService.onDidChangePreparingModel(renderState));
-		this._register(sttService.onDidChangeDownloadingModel(renderState));
-		this._register(setupDictationMicGlow(button, sttService, this.accessibilityService, isDictationInputActive, this.themeService));
-
+		const host = dom.append(container, dom.$('.sessions-chat-dictation-toolbar'));
+		const context = this._register(this.contextKeyService.createScoped(host));
+		const services = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, context])));
+		const dictation = this._register(services.createInstance(ChatInputDictationContext, this._editor));
+		const voiceConnected = AGENTS_VOICE_CONNECTED.bindTo(context);
+		this._register(autorun(reader => {
+			voiceConnected.set(isNewChatVoiceSessionActive(
+				this.voiceSessionController.isConnected.read(reader),
+				this.voiceSessionController.isConnecting.read(reader),
+				this.voiceSessionController.targetSession.read(reader),
+				this.voiceSessionController.hasDraftTarget.read(reader),
+			));
+		}));
+		const toolbar = this._register(createChatInputExecuteToolbar(services, host, ChatDictationMenu, {
+			isActive: dictation.isActive, isDictationActive: dictation.isActive, isVoiceActive: constObservable(false),
+		}));
+		toolbar.context = { inputEditor: this._editor };
 		const updateVisibility = () => {
-			// Mirror the `MenuId.ChatExecute` dictation gate: hide while
-			// unconfigured, and while Voice Mode is connected so the dictation and
-			// voice mic affordances never compete on this composer. Also hide when
-			// the segmented voice/dictation pill applies (both modes available, so
-			// the pill hosts its own dictation cell), which supersedes this button.
-			const voiceActive = isNewChatVoiceSessionActive(
-				this.voiceSessionController.isConnected.get(),
-				this.voiceSessionController.isConnecting.get(),
-				this.voiceSessionController.targetSession.get(),
-				this.voiceSessionController.hasDraftTarget.get(),
-			);
-			const dict = this.voiceInputModeService.dictationAvailable.get();
-			const voice = this.voiceInputModeService.voiceAvailable.get();
-			const handsFree = this.voiceInputModeService.handsFree.get();
-			// Match the pill autorun / `AGENTS_VOICE_CONNECTED`: the voice-only branch
-			// keys off `isConnected` only, not the connecting phase.
-			const sessionActive = this.voiceSessionController.isConnected.get();
-			const pillActive = (dict && voice) || (voice && !dict && !handsFree && sessionActive);
-			// Honor the shared `dictation.showButton` visibility toggle: hiding the
-			// button still leaves Cmd/Ctrl+I working (its keybinding is independent).
-			const buttonShown = this.configurationService.getValue<boolean>(DictationSettingId.ShowButton) !== false;
-			const visible = sttService.isConfigured && !voiceActive && !pillActive && buttonShown;
-			button.classList.toggle('hidden', !visible);
+			const visible = !!toolbar.getItemAction(0);
+			host.classList.toggle('hidden', !visible);
 			onDidChangeVisibility(visible);
 		};
+		this._register(toolbar.onDidChangeMenuItems(updateVisibility));
 		updateVisibility();
-		this._register(autorun(reader => {
-			this.voiceSessionController.isConnected.read(reader);
-			this.voiceSessionController.isConnecting.read(reader);
-			this.voiceSessionController.targetSession.read(reader);
-			this.voiceSessionController.hasDraftTarget.read(reader);
-			this.voiceInputModeService.dictationAvailable.read(reader);
-			this.voiceInputModeService.voiceAvailable.read(reader);
-			this.voiceInputModeService.handsFree.read(reader);
-			updateVisibility();
-		}));
-		this._register(this.configurationService.onDidChangeConfiguration(e => {
-			// Both the enable kill-switch and the model selection can change
-			// availability (e.g. an unsupported on-device platform becomes
-			// configured when switching to the cloud backend).
-			if (e.affectsConfiguration('dictation.enabled') || e.affectsConfiguration('dictation.model') || e.affectsConfiguration(DictationSettingId.ShowButton)) {
-				updateVisibility();
-			}
-		}));
-
-		const toggle = () => this.toggleDictation();
-		// A styled div doesn't get Enter/Space activation or touch tap for free;
-		// wire them explicitly so the button is keyboard- and touch-accessible.
-		this._register(Gesture.addTarget(button));
-		[dom.EventType.CLICK, TouchEventType.Tap].forEach(eventType => {
-			this._register(dom.addDisposableListener(button, eventType, e => {
-				dom.EventHelper.stop(e);
-				void toggle();
-			}));
-		});
-		this._register(dom.addDisposableListener(button, dom.EventType.KEY_DOWN, e => {
-			const event = new StandardKeyboardEvent(e);
-			if (event.equals(KeyCode.Enter) || event.equals(KeyCode.Space)) {
-				dom.EventHelper.stop(event, true);
-				void toggle();
-			}
-		}));
-
-		// Right-click shows dictation-specific entries ("Configure Keybinding",
-		// "Select Microphone", "Disable Dictation") mirroring the chat-input mic
-		// button, since this custom button isn't a `MenuEntryActionViewItem`.
-		this._register(addMicButtonContextMenuListener(
-			button,
-			() => getDictationContextMenuActions(this.commandService, this.configurationService, this.keybindingService, TOGGLE_DICTATION_COMMAND_ID),
-			this.contextMenuService,
-		));
 	}
 
 	/**
 	 * Toggle dictation into this composer's editor. Shared by the mic button and
-	 * the Cmd/Ctrl+I chord ({@link TOGGLE_DICTATION_COMMAND_ID}); the shared
-	 * Dictate action can't target this composer since it isn't an `IChatWidget`.
+	 * the Cmd/Ctrl+I chord ({@link TOGGLE_DICTATION_COMMAND_ID}); the same
+	 * dictation command also accepts this composer's editor directly.
 	 */
 	async toggleDictation(): Promise<void> {
 		if (!this._editor) {
@@ -1323,9 +1068,8 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		const rawQuery = this._editor.getModel()?.getValue() ?? '';
 		const query = rawQuery.trim();
 		const queryOffset = rawQuery.length - rawQuery.trimStart().length;
-		const hasSendableAttachment = this._contextAttachments.attachments.some(isExplicitFileOrImageVariableEntry);
 		const hasAdditionalSendContent = this.options.hasAdditionalSendContent?.get() ?? false;
-		if ((!query && !hasSendableAttachment && !hasAdditionalSendContent) || this._sending) {
+		if (!hasChatInputSendableContent(query, this._contextAttachments.attachments, hasAdditionalSendContent) || this._sending) {
 			return false;
 		}
 
@@ -1348,6 +1092,9 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 			input: query,
 		})) {
 			this._editor.getModel()?.setValue('');
+			if (isPhoneLayout(this.layoutService)) {
+				blurActiveElementWithin(this._editorContainer);
+			}
 			return true;
 		}
 
@@ -1385,6 +1132,9 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 			this._updateSendButtonState();
 			this._updateInputLoadingState();
 		}
+		if (isPhoneLayout(this.layoutService)) {
+			blurActiveElementWithin(this._editorContainer);
+		}
 		return sent;
 	}
 
@@ -1392,10 +1142,13 @@ export class NewChatInputWidget extends Disposable implements IHistoryNavigation
 		if (!this._sendButton) {
 			return;
 		}
-		const hasText = !!this._editor?.getModel()?.getValue().trim();
-		const hasSendableAttachment = this._contextAttachments.attachments.some(isExplicitFileOrImageVariableEntry);
-		const hasAdditionalSendContent = this.options.hasAdditionalSendContent?.get() ?? false;
-		this._sendButton.enabled = !this._sending && (hasText || hasSendableAttachment || hasAdditionalSendContent) && this._canSendRequest.get();
+		const canSend = !this._sending && this._canSendRequest.get() && hasChatInputSendableContent(
+			this._editor?.getModel()?.getValue() ?? '', this._contextAttachments.attachments, this.options.hasAdditionalSendContent?.get(),
+		);
+		if (this._sendEnabled?.get() !== canSend) {
+			this._sendEnabled?.set(canSend);
+			this._sendButton.refresh();
+		}
 	}
 
 	private _restoreState(): void {

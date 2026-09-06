@@ -46,6 +46,12 @@ export interface ISessionsProviderCreateSessionOptions {
 	readonly metadata?: Record<string, unknown>;
 }
 
+/** Provider options applied when archiving a session. */
+export interface ISessionsProviderArchiveSessionOptions {
+	/** One-shot user receipt allowing the Host to preserve Git-visible changes. */
+	readonly preserveChanges?: boolean;
+}
+
 /** Programmatic worktree settings applied together before a new session starts. */
 export interface ISessionWorktreeConfiguration {
 	readonly isolationMode?: string;
@@ -159,6 +165,12 @@ export interface ISessionsProvider {
 	 * Session types supported by this provider. The provider is expected to update this list and fire `onDidChangeSessionTypes`
 	 */
 	readonly sessionTypes: readonly ISessionType[];
+	/**
+	 * Re-runs a failed agent SDK install for one of this provider's session
+	 * types (see {@link ISessionType.sdkReadiness}). Only implemented by
+	 * providers whose backend manages SDK installs.
+	 */
+	retryAgentSdkInstall?(sessionTypeId: string): Promise<void>;
 	/**
 	 * Event that fires when the list of session types changes. Consumers should refresh any session type pickers when this occurs.
 	 */
@@ -380,8 +392,9 @@ export interface ISessionsProvider {
 	/**
 	 * Archive a session.
 	 * @param sessionId The ID of the session to archive.
+	 * @param options Optional archive receipt forwarded to the owning backend.
 	 */
-	archiveSession(sessionId: string): Promise<void>;
+	archiveSession(sessionId: string, options?: ISessionsProviderArchiveSessionOptions): Promise<void>;
 
 	/**
 	 * Unarchive a session.

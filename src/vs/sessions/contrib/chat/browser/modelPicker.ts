@@ -5,7 +5,7 @@
 
 import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { autorun, derived, IObservable } from '../../../../base/common/observable.js';
-import { localize2 } from '../../../../nls.js';
+import { localize, localize2 } from '../../../../nls.js';
 import { BaseActionViewItem } from '../../../../base/browser/ui/actionbar/actionViewItems.js';
 import { Action2, registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
@@ -14,6 +14,7 @@ import { ITelemetryService } from '../../../../platform/telemetry/common/telemet
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
 import { IChatInputPickerOptions } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputPickerActionItem.js';
 import { IModelPickerDelegate, ModelPickerActionItem } from '../../../../workbench/contrib/chat/browser/widget/input/modelPicker/modelPickerActionItem.js';
+import { ILanguageModelChatMetadataAndIdentifier } from '../../../../workbench/contrib/chat/common/languageModels.js';
 import { ChatPetAchievementIds, didExplicitlySwitchChatPetModel } from '../../../../workbench/contrib/chat/browser/chatPetAchievements.js';
 import { IChatPetService } from '../../../../workbench/contrib/chat/browser/chatPetService.js';
 import { IChatEntitlementService } from '../../../../workbench/services/chat/common/chatEntitlementService.js';
@@ -25,6 +26,71 @@ import { ISessionModelSelection } from './sessionModelSelection.js';
 import { INewChatModelPickerService } from './newChatModelPicker.js';
 import { reportNewChatPickerClosed } from './newChatPickerTelemetry.js';
 import { markOnboardingTarget } from '../../../../workbench/contrib/onboarding/browser/spotlight/onboardingTarget.js';
+import { adaptSessionModelPickerDelegate } from './sessionModelPickerPresentation.js';
+
+export function needsExplicitModelPlaceholder(
+	currentModel: ILanguageModelChatMetadataAndIdentifier | undefined,
+	models: readonly ILanguageModelChatMetadataAndIdentifier[],
+	showAutoModel: boolean,
+): boolean {
+	return !currentModel && models.length > 0 && !showAutoModel;
+}
+
+export function updateExplicitModelPlaceholder(
+	split: HTMLElement,
+	currentModel: ILanguageModelChatMetadataAndIdentifier | undefined,
+	models: readonly ILanguageModelChatMetadataAndIdentifier[],
+	showAutoModel: boolean,
+): boolean {
+	if (!needsExplicitModelPlaceholder(currentModel, models, showAutoModel)) {
+		return false;
+	}
+	const nameButton = split.firstElementChild as HTMLElement | undefined;
+	const label = nameButton
+		? Array.from(nameButton.children).find(child => child.classList.contains('chat-input-picker-label')) as HTMLElement | undefined
+		: undefined;
+	const autoLabel = localize('sessions.modelPicker.autoLabel', "Auto");
+	if (!nameButton || !label || label.textContent !== autoLabel) {
+		return false;
+	}
+	label.textContent = localize('sessions.modelPicker.modelsLabel', "Models");
+	const ariaLabel = localize('sessions.modelPicker.explicitSelectionAriaLabel', "Models, select a model");
+	nameButton.setAttribute('aria-label', ariaLabel);
+	split.setAttribute('aria-label', ariaLabel);
+	return true;
+}
+
+/**
+ * Whether the model picker should be shown. Visible when the session has models,
+ * when its Auto model is unavailable (so the widget can render the "No models
+ * available" empty state), or when the workspace is untrusted / Chat still needs
+ * sign-in (so the widget can render its Restricted Mode or Sign In state).
+ * Otherwise hidden, matching the historical behavior for providers that offer no
+ * models.
+ *
+ * The sign-in state is gated on a resolved pool. Before the composer has a
+ * session there is no agent to scope models by, so the empty list carries no
+ * verdict on entitlement, and the shared widget would read it as Copilot needing
+ * setup and advertise a Copilot sign-in the Agents window never asked for.
+ */
+export function shouldShowSessionModelPicker(context: {
+	readonly poolResolved: boolean;
+	readonly modelCount: number;
+	readonly restrictedMode: boolean;
+	readonly setupRequired: boolean;
+	readonly showAutoModel: boolean;
+}): boolean {
+	if (context.modelCount > 0) {
+		return true;
+	}
+	if (context.restrictedMode) {
+		return true;
+	}
+	if (context.setupRequired && context.poolResolved) {
+		return true;
+	}
+	return !context.showAutoModel;
+}
 
 /**
  * The sessions-core model picker. Unlike the previous per-provider pickers,
@@ -56,7 +122,7 @@ export class ModelPicker extends Disposable {
 		super();
 		const currentModel = derived(this, reader => this._selectionModel.state.read(reader).currentModel);
 
-		this._delegate = {
+		this._delegate = adaptSessionModelPickerDelegate({
 			currentModel,
 			setModel: model => {
 				const previousModel = this._selectionModel.state.get().currentModel;
@@ -77,7 +143,7 @@ export class ModelPicker extends Disposable {
 			getModels: () => [...this._selectionModel.state.get().models],
 			getPresentationOptions: () => ({
 				...this._selectionModel.state.get().options,
-				showModelIcon: true,
+				showModelIcon: false,
 			}),
 			isCacheWarm: () => {
 				const session = this._sessionContext.session.get();
@@ -86,7 +152,7 @@ export class ModelPicker extends Disposable {
 				// picker which warms as soon as the first request is added.
 				return session ? session.status.get() !== SessionStatus.Untitled : false;
 			},
-		};
+		});
 
 		const pickerOptions: IChatInputPickerOptions = {
 			compact,
@@ -127,6 +193,12 @@ export class ModelPicker extends Disposable {
 		this._renderDisposables.clear();
 		this._container = container;
 		this._modelPicker.render(container);
+		const split = this._modelPicker.element;
+		if (split) {
+			const observer = new container.ownerDocument.defaultView!.MutationObserver(() => this._updateExplicitModelPlaceholder());
+			observer.observe(split, { childList: true, subtree: true });
+			this._renderDisposables.add({ dispose: () => observer.disconnect() });
+		}
 		this._renderDisposables.add(markOnboardingTarget(container, 'sessions.newSession.modelPicker', {
 			open: () => this._modelPicker.openModelPicker(),
 		}));
@@ -137,29 +209,39 @@ export class ModelPicker extends Disposable {
 		return this._selectionModel.selectModel(modelIdentifier);
 	}
 
-	/**
-	 * Whether the model picker should be shown for the given session. Visible
-	 * when the session has models, when its Auto model is unavailable (so the
-	 * widget can render the "No models available" empty state), or when the
-	 * workspace is untrusted / Chat still needs sign-in (so the widget can render
-	 * its Restricted Mode or Sign In state). Otherwise hidden, matching the
-	 * historical behavior for providers that offer no models.
-	 */
+	/** Thin wrapper over {@link shouldShowSessionModelPicker} that supplies this picker's live state. */
 	private _shouldShowPicker(): boolean {
 		const state = this._selectionModel.state.get();
-		if (state.models.length > 0) {
-			return true;
-		}
-		if (this._modelPicker.isRestrictedMode() || this._modelPicker.isSetupRequired()) {
-			return true;
-		}
-		return !state.options.showAutoModel;
+		return shouldShowSessionModelPicker({
+			poolResolved: state.poolResolved,
+			modelCount: state.models.length,
+			restrictedMode: this._modelPicker.isRestrictedMode(),
+			setupRequired: this._modelPicker.isSetupRequired(),
+			showAutoModel: state.options.showAutoModel,
+		});
 	}
 
 	private _updatePickerState(): void {
 		const visible = this._shouldShowPicker();
 		this._modelPicker.setEnabled(visible);
 		this._updateVisibility(visible);
+		this._updateExplicitModelPlaceholder();
+	}
+
+	/**
+	 * The shared picker uses `Auto` as its generic empty-selection label. Agent
+	 * sessions that require an explicit model must not advertise that fallback
+	 * while a remembered or default model is still resolving. Keep this Fumie
+	 * chrome correction local to the Agents window rather than changing the
+	 * workbench-wide picker.
+	 */
+	private _updateExplicitModelPlaceholder(): void {
+		const split = this._modelPicker.element;
+		if (!split) {
+			return;
+		}
+		const state = this._selectionModel.state.get();
+		updateExplicitModelPlaceholder(split, state.currentModel, state.models, state.options.showAutoModel);
 	}
 
 	private _updateVisibility(visible: boolean): void {

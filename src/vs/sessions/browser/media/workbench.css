@@ -15,6 +15,32 @@
 	--modern-ui-notifications-block-start-inset: var(--vscode-spacing-size400);
 }
 
+/* Agent-brand marks that are not part of the Codicon font (currentColor masks). */
+.codicon.codicon-sessions-agent-deepseek,
+.codicon.codicon-sessions-agent-pi {
+	width: 1em;
+	height: 1em;
+	background-color: currentColor;
+}
+
+.codicon.codicon-sessions-agent-deepseek {
+	-webkit-mask: url('./sessions-agent-deepseek.svg') center / contain no-repeat;
+	mask: url('./sessions-agent-deepseek.svg') center / contain no-repeat;
+}
+
+.codicon.codicon-sessions-agent-pi {
+	-webkit-mask: url('./sessions-agent-pi.svg') center / contain no-repeat;
+	mask: url('./sessions-agent-pi.svg') center / contain no-repeat;
+}
+
+.codicon.codicon-sessions-agent-deepseek::before,
+.codicon.codicon-sessions-agent-pi::before {
+	content: '' !important;
+	display: inline-block;
+	width: 1em;
+	visibility: hidden;
+}
+
 /* ---- Workbench Shell ---- */
 
 .monaco-workbench.agent-sessions-workbench .part.sidebar {
@@ -371,4 +397,30 @@
 	.agent-sessions-workbench .part.sidebar > .content {
 		transition: none;
 	}
+}
+
+/* Agent SDK preparation bar above the landing composer. */
+.sessions-agent-sdk-prep-bar {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 4px 8px;
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.sessions-agent-sdk-prep-bar.hidden {
+	display: none;
+}
+
+.sessions-agent-sdk-prep-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 18px;
+}
+
+.sessions-agent-sdk-prep-row .sessions-agent-sdk-prep-retry {
+	cursor: pointer;
+	color: var(--vscode-textLink-foreground);
 }

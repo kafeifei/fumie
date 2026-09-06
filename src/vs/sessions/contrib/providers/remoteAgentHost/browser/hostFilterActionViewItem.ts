@@ -20,7 +20,46 @@ import { localize } from '../../../../../nls.js';
 import { IContextMenuService } from '../../../../../platform/contextview/browser/contextView.js';
 import { IHoverService } from '../../../../../platform/hover/browser/hover.js';
 import { defaultButtonStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
-import { AgentHostFilterConnectionStatus, IAgentHostFilterEntry, IAgentHostFilterService } from '../../../../services/agentHostFilter/common/agentHostFilter.js';
+import { AgentHostFilterConnectionStatus, AgentHostFilterScope, IAgentHostFilterEntry, IAgentHostFilterService } from '../../../../services/agentHostFilter/common/agentHostFilter.js';
+
+/**
+ * One radio entry of the host-filter menu.
+ */
+export interface IHostFilterMenuEntry {
+	readonly id: string;
+	readonly label: string;
+	readonly checked: boolean;
+	/** The scope applied when the entry is picked. */
+	readonly scope: AgentHostFilterScope;
+}
+
+/**
+ * Builds the host-filter menu: "All Machines" — the union of every host — on
+ * top, then one entry per known host, offline ones included (picking one is
+ * how the user gets back to it). Web has no local agent host, so there is no
+ * "This Machine" entry.
+ */
+export function buildHostFilterMenuEntries(scope: AgentHostFilterScope, hosts: readonly IAgentHostFilterEntry[]): IHostFilterMenuEntry[] {
+	const entries: IHostFilterMenuEntry[] = [{
+		id: 'agentHostFilter.scope.all',
+		label: localize('agentHostFilter.menu.allMachines', "All Machines"),
+		checked: scope.kind === 'all',
+		scope: { kind: 'all' },
+	}];
+	for (const host of hosts) {
+		entries.push({
+			id: `agentHostFilter.host.${host.providerId}`,
+			label: host.status === AgentHostFilterConnectionStatus.Connected
+				? host.label
+				: host.status === AgentHostFilterConnectionStatus.Connecting
+					? localize('agentHostFilter.hostConnecting', "{0} (connecting…)", host.label)
+					: localize('agentHostFilter.hostDisconnected', "{0} (disconnected)", host.label),
+			checked: scope.kind === 'host' && scope.providerId === host.providerId,
+			scope: { kind: 'host', providerId: host.providerId },
+		});
+	}
+	return entries;
+}
 
 /**
  * Visual appearance of {@link HostFilterActionViewItem}.
@@ -106,17 +145,11 @@ export class HostFilterActionViewItem extends BaseActionViewItem {
 		this._register(Gesture.addTarget(this._dropdownElement));
 		for (const eventType of [dom.EventType.CLICK, TouchEventType.Tap]) {
 			this._register(dom.addDisposableListener(this._dropdownElement, eventType, e => {
-				if (!this._isInteractive()) {
-					return;
-				}
 				dom.EventHelper.stop(e, true);
 				this._showMenu(e);
 			}));
 		}
 		this._register(dom.addDisposableListener(this._dropdownElement, dom.EventType.KEY_DOWN, e => {
-			if (!this._isInteractive()) {
-				return;
-			}
 			const event = new StandardKeyboardEvent(e);
 			if (event.equals(KeyCode.Enter) || event.equals(KeyCode.Space)) {
 				dom.EventHelper.stop(e, true);
@@ -171,15 +204,12 @@ export class HostFilterActionViewItem extends BaseActionViewItem {
 		this._sidebarLeadingIcon.classList.add('codicon', `codicon-${Codicon.remote.id}`);
 		this._labelElement = dom.append(this._sidebarButton.element, dom.$('span.agent-host-filter-label'));
 		// Trailing chevron is created up-front but only attached to the
-		// button when this is a real picker (2+ hosts). See
+		// button when it opens the host menu (i.e. any host is known). See
 		// `_renderSidebarButtonAffordances`.
 		this._sidebarTrailingIcon = dom.$('span.agent-host-filter-trailing-icon.codicon');
 		this._sidebarTrailingIcon.classList.add(`codicon-${Codicon.chevronDown.id}`);
 
 		this._register(this._sidebarButton.onDidClick(e => {
-			if (!this._isInteractive()) {
-				return;
-			}
 			// Pass the original event through to `_showMenu`. It will
 			// anchor on the mouse position when `e` is a real
 			// `MouseEvent` and otherwise fall back to anchoring on the
@@ -215,32 +245,22 @@ export class HostFilterActionViewItem extends BaseActionViewItem {
 		}));
 	}
 
-	private _renderSidebarButtonAffordances(interactive: boolean, canRetry: boolean): void {
+	private _renderSidebarButtonAffordances(canRetry: boolean): void {
 		if (!this._sidebarButton || !this._sidebarTrailingIcon) {
 			return;
 		}
 
-		// Trailing chevron — only attached when this is a real picker
-		// (i.e. there are 2+ hosts to choose from). For canRetry /
-		// single-host the button is *not* a dropdown — in canRetry the
-		// refresh action lives in the trailing connect slot instead,
-		// mirroring the disconnect button shape.
-		const showChevron = interactive && !canRetry;
-		if (showChevron) {
+		// Trailing chevron — attached whenever the button opens the host
+		// menu. With no hosts the button is *not* a dropdown: the refresh
+		// action lives in the trailing connect slot instead, mirroring the
+		// disconnect button shape.
+		if (!canRetry) {
 			if (!this._sidebarTrailingIcon.isConnected) {
 				this._sidebarButton.element.appendChild(this._sidebarTrailingIcon);
 			}
 		} else {
 			this._sidebarTrailingIcon.remove();
 		}
-	}
-
-	protected _isInteractive(): boolean {
-		const hosts = this._filterService.hosts;
-		// Interactive when there is something to do: pick from a menu (>1
-		// hosts) or trigger re-discovery (0 hosts). With exactly 1 host the
-		// pill is a static label.
-		return hosts.length === 0 || hosts.length > 1;
 	}
 
 	private _update(): void {
@@ -255,37 +275,34 @@ export class HostFilterActionViewItem extends BaseActionViewItem {
 		}
 
 		const hosts = this._filterService.hosts;
-		const selectedId = this._filterService.selectedProviderId;
-		const selected = selectedId === undefined
-			? undefined
-			: hosts.find(h => h.providerId === selectedId);
+		const scope = this._filterService.scope;
+		// Web has no local agent host, so every non-`host` scope reads as the
+		// union of the known hosts.
+		const selected = scope.kind === 'host'
+			? hosts.find(h => h.providerId === scope.providerId)
+			: undefined;
 
-		const hasMenu = hosts.length > 1;
 		const canRetry = hosts.length === 0;
-		const interactive = hasMenu || canRetry;
 		const discovering = this._filterService.isDiscovering;
 
 		// Dropdown label + aria
 		const text = selected
 			? selected.label
-			: discovering
-				? localize('agentHostFilter.searching', "Searching…")
-				: localize('agentHostFilter.none', "No Host");
+			: canRetry
+				? (discovering
+					? localize('agentHostFilter.searching', "Searching…")
+					: localize('agentHostFilter.none', "No Host"))
+				: localize('agentHostFilter.allMachines', "All Machines");
 
+		this._labelElement.textContent = text;
 		if (this._sidebarButton) {
-			// Sidebar appearance: write the host name into our own label
-			// span (which is `flex: 1` so it consumes remaining space) and
-			// (re)position the leading host icon + trailing chevron
-			// around it. The chevron uses `$(refresh)` when there are no
-			// hosts (clicking re-runs discovery) and is omitted entirely
-			// for the non-interactive single-host case.
-			this._labelElement.textContent = text;
-			this._renderSidebarButtonAffordances(interactive, canRetry);
-		} else {
-			this._labelElement.textContent = text;
+			// Sidebar appearance: the label span is `flex: 1` so it consumes
+			// the remaining space; (re)position the trailing chevron around
+			// it. With no hosts the trailing slot becomes a `$(refresh)`
+			// button instead (clicking re-runs discovery).
+			this._renderSidebarButtonAffordances(canRetry);
 		}
 
-		this.element.classList.toggle('single-host', !interactive);
 		// While discovery is running, suppress the label so the pill collapses
 		// to a small pulsing icon (a la "checking…"). Once discovery finishes,
 		// the label re-appears.
@@ -303,50 +320,37 @@ export class HostFilterActionViewItem extends BaseActionViewItem {
 			this._chevronElement.append(...renderLabelWithIcons(`$(${chevronIconId})`));
 		}
 
-		if (interactive) {
-			if (!this._sidebarButton) {
-				// Titlebar: drive tabIndex / role on the dropdown DIV manually.
-				// The Button used in the sidebar appearance already provides
-				// its own focusability, role, and keyboard activation.
-				this._dropdownElement.tabIndex = 0;
-				this._dropdownElement.role = 'button';
-				if (hasMenu) {
-					this._dropdownElement.setAttribute('aria-haspopup', 'menu');
-				} else {
-					this._dropdownElement.removeAttribute('aria-haspopup');
-				}
-			} else if (hasMenu) {
-				this._dropdownElement.setAttribute('aria-haspopup', 'menu');
-			} else {
-				this._dropdownElement.removeAttribute('aria-haspopup');
-			}
-			const ariaLabel = selected
-				? localize('agentHostFilter.aria.selected', "Sessions scoped to host {0}. Click to change host.", selected.label)
-				: canRetry
-					? localize('agentHostFilter.aria.retry', "No hosts found. Click to re-discover hosts.")
-					: localize('agentHostFilter.aria.none', "No agent host selected.");
-			this._dropdownElement.setAttribute('aria-label', ariaLabel);
-			const hoverText = canRetry
-				? (discovering
-					? localize('agentHostFilter.hover.searching', "Searching for hosts…")
-					: localize('agentHostFilter.hover.retry', "Re-discover hosts"))
-				: localize('agentHostFilter.hover', "Change the host the sessions list is scoped to");
-			this._dropdownHover.value = this._hoverService.setupManagedHover(
-				getDefaultHoverDelegate('element'),
-				this._dropdownElement,
-				() => hoverText,
-			);
-		} else {
-			if (!this._sidebarButton) {
-				this._dropdownElement.removeAttribute('tabindex');
-				this._dropdownElement.removeAttribute('role');
-			}
-			this._dropdownElement.removeAttribute('aria-haspopup');
-			this._dropdownElement.setAttribute('aria-label', selected
-				? localize('agentHostFilter.aria.singleSelected', "Sessions scoped to host {0}", selected.label)
-				: localize('agentHostFilter.aria.none', "No agent host selected."));
-			this._dropdownHover.clear();
+		// The pill always does something on click: it opens the host menu
+		// ("All Machines" plus every known host), or — with nothing
+		// discovered yet — re-runs discovery.
+		if (!this._sidebarButton) {
+			// Titlebar: drive tabIndex / role on the dropdown DIV manually.
+			// The Button used in the sidebar appearance already provides
+			// its own focusability, role, and keyboard activation.
+			this._dropdownElement.tabIndex = 0;
+			this._dropdownElement.role = 'button';
 		}
+		if (canRetry) {
+			this._dropdownElement.removeAttribute('aria-haspopup');
+		} else {
+			this._dropdownElement.setAttribute('aria-haspopup', 'menu');
+		}
+		const ariaLabel = selected
+			? localize('agentHostFilter.aria.selected', "Sessions scoped to host {0}. Click to change host.", selected.label)
+			: canRetry
+				? localize('agentHostFilter.aria.retry', "No hosts found. Click to re-discover hosts.")
+				: localize('agentHostFilter.aria.all', "Sessions from all machines. Click to change host.");
+		this._dropdownElement.setAttribute('aria-label', ariaLabel);
+		const hoverText = canRetry
+			? (discovering
+				? localize('agentHostFilter.hover.searching', "Searching for hosts…")
+				: localize('agentHostFilter.hover.retry', "Re-discover hosts"))
+			: localize('agentHostFilter.hover', "Change the host the sessions list is scoped to");
+		this._dropdownHover.value = this._hoverService.setupManagedHover(
+			getDefaultHoverDelegate('element'),
+			this._dropdownElement,
+			() => hoverText,
+		);
 
 		this._updateConnectButton(selected, canRetry, discovering);
 	}
@@ -436,6 +440,8 @@ export class HostFilterActionViewItem extends BaseActionViewItem {
 			return;
 		}
 
+		// No connect toggle outside a single-host scope: in the "All Machines"
+		// state there is no one host the button would act on.
 		const selectedId = this._filterService.selectedProviderId;
 		if (selectedId === undefined) {
 			return;
@@ -467,27 +473,13 @@ export class HostFilterActionViewItem extends BaseActionViewItem {
 			}
 			return;
 		}
-		if (hosts.length === 1) {
-			return;
-		}
-
-		const selectedId = this._filterService.selectedProviderId;
-
-		const actions: IAction[] = [];
-		for (const host of hosts) {
-			const label = host.status === AgentHostFilterConnectionStatus.Connected
-				? host.label
-				: host.status === AgentHostFilterConnectionStatus.Connecting
-					? localize('agentHostFilter.hostConnecting', "{0} (connecting…)", host.label)
-					: localize('agentHostFilter.hostDisconnected', "{0} (disconnected)", host.label);
-			actions.push(new Action(
-				`agentHostFilter.host.${host.providerId}`,
-				label,
-				selectedId === host.providerId ? 'codicon codicon-check' : undefined,
-				true,
-				async () => this._filterService.setSelectedProviderId(host.providerId),
-			));
-		}
+		const actions: IAction[] = buildHostFilterMenuEntries(this._filterService.scope, hosts).map(entry => new Action(
+			entry.id,
+			entry.label,
+			entry.checked ? 'codicon codicon-check' : undefined,
+			true,
+			async () => this._filterService.setScope(entry.scope),
+		));
 
 		const anchor = dom.isMouseEvent(e)
 			? new StandardMouseEvent(dom.getWindow(this._dropdownElement), e)

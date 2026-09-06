@@ -7,7 +7,7 @@
 	display: flex;
 	flex-direction: column;
 	height: 100%;
-	padding: 4px 8px;
+	padding: 2px 6px 8px;
 	box-sizing: border-box;
 }
 
@@ -31,21 +31,45 @@
 	position: relative;
 }
 
-/* Welcome/Empty state */
+/* Welcome/Empty state — quiet inspector, not an editor Welcome. */
 .changes-view-body .changes-welcome {
 	display: flex;
 	flex-direction: column;
 	align-items: center;
 	justify-content: center;
 	flex: 1;
-	padding: 32px;
+	padding: 32px 16px;
 	text-align: center;
-	gap: 8px;
+	gap: 4px;
+}
+
+.changes-view-body .changes-welcome-icon {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	margin-bottom: 6px;
+	color: var(--vscode-descriptionForeground);
+	opacity: 0.55;
+}
+
+.changes-view-body .changes-welcome-icon .codicon {
+	font-size: 18px;
+}
+
+.changes-view-body .changes-welcome-title {
+	color: var(--vscode-descriptionForeground);
+	font-size: var(--vscode-agents-fontSize-label1, 12px);
+	font-weight: var(--vscode-agents-fontWeight-medium, 500);
 }
 
 .changes-view-body .changes-welcome-message {
 	color: var(--vscode-descriptionForeground);
-	font-size: var(--vscode-agents-fontSize-label1);
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	max-width: 220px;
+	line-height: 1.45;
+	opacity: 0.85;
 }
 
 /* Main container */
@@ -57,15 +81,16 @@
 	overflow: hidden;
 }
 
-/* Files header */
+/* Files header — compact review chrome, not an SCM viewlet title. */
 .changes-view-body .changes-files-header {
 	display: flex;
 	align-items: center;
 	gap: 6px;
-	padding: 2px 0;
-	min-height: 22px;
-	font-weight: var(--vscode-agents-fontWeight-semiBold);
-	font-size: var(--vscode-agents-fontSize-label1);
+	padding: 4px 2px 2px;
+	min-height: 20px;
+	font-weight: var(--vscode-agents-fontWeight-medium, 500);
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	color: var(--vscode-descriptionForeground);
 }
 
 .changes-view-body .changes-files-header-toolbar {
@@ -123,7 +148,7 @@
 
 /* Actions container outside the card - new layout experiment */
 .changes-view-body .chat-editing-session-actions.outside-card {
-	margin-bottom: 8px;
+	margin-bottom: 4px;
 	justify-content: flex-end;
 }
 
@@ -244,7 +269,12 @@
 
 /* List rows */
 .changes-view-body .chat-editing-session-container:not(.has-file-icons) .monaco-list-row .monaco-icon-label {
-	margin-left: 6px;
+	margin-left: 4px;
+}
+
+.changes-view-body .chat-editing-session-container .monaco-list-row .monaco-icon-label-container .monaco-icon-description-container {
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	opacity: 0.7;
 }
 
 .changes-view-body .chat-editing-session-container.show-file-icons .monaco-scrollable-element .monaco-list-rows .monaco-list-row {

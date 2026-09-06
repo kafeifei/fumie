@@ -7,38 +7,27 @@ import * as dom from '../../../../base/browser/dom.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
-import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { renderIcon } from '../../../../base/browser/ui/iconLabel/iconLabels.js';
 import { localize } from '../../../../nls.js';
-import { ThemeIcon } from '../../../../base/common/themables.js';
 import { registerOpenEditorListeners } from '../../../../platform/editor/browser/editor.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { ChatConfiguration } from '../../../../workbench/contrib/chat/common/constants.js';
 import { IChatImageCarouselService } from '../../../../workbench/contrib/chat/browser/chatImageCarouselService.js';
 import { coerceImageBuffer } from '../../../../workbench/contrib/chat/common/chatImageExtraction.js';
 
-import { IQuickInputService, IQuickPickItem, IQuickPickSeparator } from '../../../../platform/quickinput/common/quickInput.js';
-import { ITextModelService } from '../../../../editor/common/services/resolverService.js';
+import { IContextMenuService } from '../../../../platform/contextview/browser/contextView.js';
 import { FileKind, IFileService } from '../../../../platform/files/common/files.js';
-import { IClipboardService } from '../../../../platform/clipboard/common/clipboardService.js';
-import { IFileDialogService } from '../../../../platform/dialogs/common/dialogs.js';
-import { ILabelService } from '../../../../platform/label/common/label.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
-import { IModelService } from '../../../../editor/common/services/model.js';
-import { ILanguageService } from '../../../../editor/common/languages/language.js';
-import { getIconClasses } from '../../../../editor/common/services/getIconClasses.js';
-import { basename } from '../../../../base/common/resources.js';
-import { Schemas } from '../../../../base/common/network.js';
 import { DEFAULT_LABELS_CONTAINER, ResourceLabels } from '../../../../workbench/browser/labels.js';
 
-import { IChatRequestVariableEntry, isAgentHostCompletionVariableEntry, isPastedTextArtifact, OmittedState } from '../../../../workbench/contrib/chat/common/attachments/chatVariableEntries.js';
+import { IChatRequestVariableEntry, isAgentHostCompletionVariableEntry, isPastedTextArtifact } from '../../../../workbench/contrib/chat/common/attachments/chatVariableEntries.js';
 import { isLocation } from '../../../../editor/common/languages.js';
-import { resizeImage } from '../../../../workbench/contrib/chat/browser/chatImageUtils.js';
 import { createImageHoverContent, openPastedTextArtifact } from '../../../../workbench/contrib/chat/browser/attachments/chatAttachmentWidgets.js';
-import { imageToHash, isImage } from '../../../../workbench/contrib/chat/browser/widget/input/editor/chatPasteProviders.js';
-import { getExcludes, ISearchConfiguration, ISearchService, QueryType } from '../../../../workbench/services/search/common/search.js';
+import { ChatAttachmentModel } from '../../../../workbench/contrib/chat/browser/attachments/chatAttachmentModel.js';
+import { showComposerAttachMenu } from './composerAttach.js';
+import { IComposerFilePickerService } from './composerFilePicker.js';
 
 /**
  * The attachment surface of the composer, as seen by its input plumbing
@@ -56,15 +45,11 @@ export interface INewChatAttachments {
 /**
  * Manages context attachments for the sessions new-chat widget.
  *
- * Supports:
- * - File picker via quick access ("Files and Open Folders...")
- * - Image from Clipboard
- * - Drag and drop files
- * - Paste images from clipboard (Ctrl/Cmd+V)
+ * Supports native Image/File attach, drag-and-drop, and clipboard paste.
  */
 export class NewChatContextAttachments extends Disposable implements INewChatAttachments {
 
-	private readonly _attachedContext: IChatRequestVariableEntry[] = [];
+	private readonly _attachmentModel: ChatAttachmentModel;
 	private _container: HTMLElement | undefined;
 	private readonly _renderDisposables = this._register(new DisposableStore());
 
@@ -72,35 +57,30 @@ export class NewChatContextAttachments extends Disposable implements INewChatAtt
 	readonly onDidChangeContext = this._onDidChangeContext.event;
 
 	get attachments(): readonly IChatRequestVariableEntry[] {
-		return this._attachedContext;
+		return this._attachmentModel.attachments;
 	}
 
 	setAttachments(entries: readonly IChatRequestVariableEntry[]): void {
-		this._attachedContext.length = 0;
-		this._attachedContext.push(...entries);
-		this._updateRendering();
-		this._onDidChangeContext.fire();
+		this._attachmentModel.clearAndSetContext(...entries);
 	}
 
 	private readonly _resourceLabels: ResourceLabels;
 
 	constructor(
-		@IQuickInputService private readonly quickInputService: IQuickInputService,
-		@ITextModelService private readonly textModelService: ITextModelService,
 		@IFileService private readonly fileService: IFileService,
-		@IClipboardService private readonly clipboardService: IClipboardService,
-		@IFileDialogService private readonly fileDialogService: IFileDialogService,
-		@ILabelService private readonly labelService: ILabelService,
-		@ISearchService private readonly searchService: ISearchService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@IOpenerService private readonly openerService: IOpenerService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
-		@IModelService private readonly modelService: IModelService,
-		@ILanguageService private readonly languageService: ILanguageService,
+		@IContextMenuService private readonly contextMenuService: IContextMenuService,
 		@IChatImageCarouselService private readonly chatImageCarouselService: IChatImageCarouselService,
 	) {
 		super();
+		this._attachmentModel = this._register(this.instantiationService.createInstance(ChatAttachmentModel));
 		this._resourceLabels = this._register(this.instantiationService.createInstance(ResourceLabels, DEFAULT_LABELS_CONTAINER));
+		this._register(this._attachmentModel.onDidChange(() => {
+			this._updateRendering();
+			this._onDidChangeContext.fire();
+		}));
 	}
 
 	// --- Rendering ---
@@ -119,7 +99,7 @@ export class NewChatContextAttachments extends Disposable implements INewChatAtt
 		this._resourceLabels.clear();
 		dom.clearNode(this._container);
 
-		const visibleAttachments = this._attachedContext.filter(entry => !isAgentHostCompletionVariableEntry(entry));
+		const visibleAttachments = this._attachmentModel.attachments.filter(entry => !isAgentHostCompletionVariableEntry(entry));
 		if (visibleAttachments.length === 0) {
 			this._container.style.display = 'none';
 			return;
@@ -208,200 +188,22 @@ export class NewChatContextAttachments extends Disposable implements INewChatAtt
 
 	// --- Picker ---
 
-	showPicker(folderUri?: URI): void {
-		const picker = this.quickInputService.createQuickPick<IQuickPickItem>({ useSeparators: true });
-		const disposables = new DisposableStore();
-		picker.placeholder = localize('chatContext.attach.placeholder', "Attach as context...");
-		picker.matchOnDescription = true;
-		picker.sortByLabel = false;
-
-		const staticPicks: (IQuickPickItem | IQuickPickSeparator)[] = [
-			{
-				label: localize('files', "Files..."),
-				iconClass: ThemeIcon.asClassName(Codicon.file),
-				id: 'sessions.filesAndFolders',
-			},
-			{
-				label: localize('imageFromClipboard', "Image from Clipboard"),
-				iconClass: ThemeIcon.asClassName(Codicon.fileMedia),
-				id: 'sessions.imageFromClipboard',
-			},
-		];
-
-		picker.items = staticPicks;
-		picker.show();
-
-		if (folderUri) {
-			let searchCts: CancellationTokenSource | undefined;
-			let debounceTimer: ReturnType<typeof setTimeout> | undefined;
-
-			const runSearch = (filePattern?: string) => {
-				searchCts?.dispose(true);
-				searchCts = new CancellationTokenSource();
-				const token = searchCts.token;
-
-				picker.busy = true;
-				this._collectFilePicks(folderUri, filePattern, token).then(filePicks => {
-					if (token.isCancellationRequested) {
-						return;
-					}
-					picker.busy = false;
-					if (filePicks.length > 0) {
-						picker.items = [
-							...staticPicks,
-							{ type: 'separator', label: basename(folderUri) },
-							...filePicks,
-						];
-					} else {
-						picker.items = staticPicks;
-					}
-				});
-			};
-
-			// Initial search (no filter)
-			runSearch();
-
-			// Re-search on user input with debounce
-			disposables.add(picker.onDidChangeValue(value => {
-				if (debounceTimer) {
-					clearTimeout(debounceTimer);
-				}
-				debounceTimer = setTimeout(() => runSearch(value || undefined), 200);
-			}));
-
-			disposables.add({ dispose: () => { searchCts?.dispose(true); if (debounceTimer) { clearTimeout(debounceTimer); } } });
-		}
-
-		disposables.add(picker.onDidAccept(async () => {
-			const [selected] = picker.selectedItems;
-			if (!selected) {
-				picker.hide();
+	showPicker(anchor: HTMLElement): void {
+		showComposerAttachMenu(this.contextMenuService, anchor, async kind => {
+			// Resolved on demand rather than in the constructor: the picker is
+			// only reachable from this click, and the composer widget is also
+			// built in component fixtures that have no desktop services.
+			const uris = await this.instantiationService.invokeFunction(accessor => accessor.get(IComposerFilePickerService).pickFiles(kind));
+			if (!uris) {
 				return;
 			}
-
-			picker.hide();
-
-			if (selected.id === 'sessions.filesAndFolders') {
-				await this._handleFileDialog();
-			} else if (selected.id === 'sessions.imageFromClipboard') {
-				await this._handleClipboardImage();
-			} else if (selected.id) {
-				await this._attachFileUri(URI.parse(selected.id), selected.label);
+			for (const uri of uris) {
+				await this._attachFileUri(uri);
 			}
-		}));
-
-		disposables.add(picker.onDidHide(() => {
-			picker.dispose();
-			disposables.dispose();
-		}));
-	}
-
-	private async _collectFilePicks(rootUri: URI, filePattern?: string, token?: CancellationToken): Promise<IQuickPickItem[]> {
-		const maxFiles = 200;
-
-		// For local file:// URIs, use the search service which respects .gitignore and excludes
-		if (rootUri.scheme === Schemas.file || rootUri.scheme === Schemas.vscodeRemote) {
-			return this._collectFilePicksViaSearch(rootUri, maxFiles, filePattern, token);
-		}
-
-		// For virtual filesystems (e.g. github-remote-file://), walk the tree via IFileService
-		return this._collectFilePicksViaFileService(rootUri, maxFiles, filePattern);
-	}
-
-	private async _collectFilePicksViaSearch(rootUri: URI, maxFiles: number, filePattern?: string, token?: CancellationToken): Promise<IQuickPickItem[]> {
-		const excludePattern = getExcludes(this.configurationService.getValue<ISearchConfiguration>({ resource: rootUri }));
-
-		try {
-			const searchResult = await this.searchService.fileSearch({
-				folderQueries: [{
-					folder: rootUri,
-					disregardIgnoreFiles: false,
-				}],
-				type: QueryType.File,
-				filePattern: filePattern || '',
-				excludePattern,
-				sortByScore: true,
-				maxResults: maxFiles,
-			}, token);
-
-			return searchResult.results.map(result => ({
-				label: basename(result.resource),
-				description: this.labelService.getUriLabel(result.resource, { relative: true }),
-				iconClasses: getIconClasses(this.modelService, this.languageService, result.resource, FileKind.FILE),
-				id: result.resource.toString(),
-			} satisfies IQuickPickItem));
-		} catch {
-			return [];
-		}
-	}
-
-	private async _collectFilePicksViaFileService(rootUri: URI, maxFiles: number, filePattern?: string): Promise<IQuickPickItem[]> {
-		const picks: IQuickPickItem[] = [];
-		const patternLower = filePattern?.toLowerCase();
-		const maxDepth = 10;
-
-		const collect = async (uri: URI, depth: number): Promise<void> => {
-			if (picks.length >= maxFiles || depth > maxDepth) {
-				return;
-			}
-
-			try {
-				const stat = await this.fileService.resolve(uri);
-				if (!stat.children) {
-					return;
-				}
-
-				const children = stat.children.slice().sort((a, b) => {
-					if (a.isDirectory !== b.isDirectory) {
-						return a.isDirectory ? -1 : 1;
-					}
-					return a.name.localeCompare(b.name);
-				});
-
-				for (const child of children) {
-					if (picks.length >= maxFiles) {
-						break;
-					}
-					if (child.isDirectory) {
-						await collect(child.resource, depth + 1);
-					} else {
-						if (patternLower && !child.name.toLowerCase().includes(patternLower)) {
-							continue;
-						}
-						picks.push({
-							label: child.name,
-							description: this.labelService.getUriLabel(child.resource, { relative: true }),
-							iconClasses: getIconClasses(this.modelService, this.languageService, child.resource, FileKind.FILE),
-							id: child.resource.toString(),
-						});
-					}
-				}
-			} catch {
-				// ignore errors for individual directories
-			}
-		};
-
-		await collect(rootUri, 0);
-		return picks;
-	}
-
-	private async _handleFileDialog(): Promise<void> {
-		const selected = await this.fileDialogService.showOpenDialog({
-			canSelectFiles: true,
-			canSelectFolders: true,
-			canSelectMany: true,
-			title: localize('selectFilesOrFolders', "Select Files or Folders"),
 		});
-		if (!selected) {
-			return;
-		}
-
-		for (const uri of selected) {
-			await this._attachFileUri(uri, basename(uri));
-		}
 	}
 
-	private async _attachFileUri(uri: URI, name: string): Promise<void> {
+	private async _attachFileUri(uri: URI): Promise<void> {
 		let stat;
 		try {
 			stat = await this.fileService.stat(uri);
@@ -410,100 +212,23 @@ export class NewChatContextAttachments extends Disposable implements INewChatAtt
 		}
 
 		if (stat.isDirectory) {
-			this._addAttachments({
-				kind: 'directory',
-				id: uri.toString(),
-				value: uri,
-				name,
-			});
+			this._attachmentModel.addFolder(uri);
 			return;
 		}
 
-		if (/\.(png|jpg|jpeg|bmp|gif|tiff)$/i.test(uri.path)) {
-			const readFile = await this.fileService.readFile(uri);
-			const resizedImage = await resizeImage(readFile.value.buffer);
-			this._addAttachments({
-				id: uri.toString(),
-				name,
-				fullName: name,
-				value: resizedImage,
-				kind: 'image',
-				references: [{ reference: uri, kind: 'reference' }]
-			});
-		} else {
-			let omittedState = OmittedState.NotOmitted;
-			try {
-				const ref = await this.textModelService.createModelReference(uri);
-				ref.dispose();
-			} catch {
-				omittedState = OmittedState.Full;
-			}
-
-			this._addAttachments({
-				kind: 'file',
-				id: uri.toString(),
-				value: uri,
-				name,
-				omittedState,
-			});
-		}
-	}
-
-	private async _handleClipboardImage(): Promise<void> {
-		const imageData = await this.clipboardService.readImage();
-		if (!isImage(imageData)) {
-			return;
-		}
-
-		const displayName = this._getUniqueImageName();
-
-		this._addAttachments({
-			id: await imageToHash(imageData),
-			name: displayName,
-			fullName: displayName,
-			value: imageData,
-			kind: 'image',
-		});
-	}
-
-	// --- State management ---
-
-	private _getUniqueImageName(): string {
-		const baseName = localize('pastedImage', "Pasted Image");
-		let name = baseName;
-		for (let i = 2; this._attachedContext.some(a => a.name === name); i++) {
-			name = `${baseName} ${i}`;
-		}
-		return name;
+		await this._attachmentModel.addFile(uri);
 	}
 
 	addAttachments(...entries: IChatRequestVariableEntry[]): void {
-		this._addAttachments(...entries);
-	}
-
-	private _addAttachments(...entries: IChatRequestVariableEntry[]): void {
-		for (const entry of entries) {
-			if (!this._attachedContext.some(e => e.id === entry.id)) {
-				this._attachedContext.push(entry);
-			}
-		}
-		this._updateRendering();
-		this._onDidChangeContext.fire();
+		this._attachmentModel.addContext(...entries);
 	}
 
 
 	removeAttachment(id: string): void {
-		const index = this._attachedContext.findIndex(e => e.id === id);
-		if (index >= 0) {
-			this._attachedContext.splice(index, 1);
-			this._updateRendering();
-			this._onDidChangeContext.fire();
-		}
+		this._attachmentModel.delete(id);
 	}
 
 	clear(): void {
-		this._attachedContext.length = 0;
-		this._updateRendering();
-		this._onDidChangeContext.fire();
+		this._attachmentModel.clear(true);
 	}
 }

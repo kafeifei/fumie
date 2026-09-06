@@ -9,12 +9,10 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { isClaudeAccountSetUp, resolveClaudeTransportMode } from '../../node/claude/claudeTransportMode.js';
 
 suite('claudeTransportMode', () => {
-
 	ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('resolveClaudeTransportMode precedence over the full input matrix', () => {
+	test('uses native only for a live first-party login without a GitHub token', () => {
 		const bools: readonly boolean[] = [false, true];
-
 		const actual: Record<string, string> = {};
 		for (const allowSignedOutWhenUsable of bools) {
 			for (const hasGitHubToken of bools) {
@@ -24,10 +22,9 @@ suite('claudeTransportMode', () => {
 				}
 			}
 		}
-
 		assert.deepStrictEqual(actual, {
-			'flag=false,token=false,setup=false': 'proxy', // flag off ⇒ today's default
-			'flag=false,token=false,setup=true': 'proxy',  // flag off ignores setup
+			'flag=false,token=false,setup=false': 'proxy',
+			'flag=false,token=false,setup=true': 'proxy',
 			'flag=false,token=true,setup=false': 'proxy',
 			'flag=false,token=true,setup=true': 'proxy',
 			'flag=true,token=false,setup=false': 'proxy',  // nothing usable ⇒ safe end (fails at use, not here)
@@ -52,18 +49,18 @@ suite('claudeTransportMode', () => {
 			// third-party.
 			['nothing configured, no provider field', { tokenSource: 'none' }, false],
 			['empty report', {}, false],
-			// `claude login` / `CLAUDE_CODE_OAUTH_TOKEN` — the keychain case no
-			// filesystem check could ever see.
+			// Legacy token-backed OAuth report.
 			['oauth token', { tokenSource: 'ANTHROPIC_AUTH_TOKEN', apiProvider: 'firstParty' }, true],
-			// An API key reports through `apiKeySource` and leaves `tokenSource`
-			// at its `'none'` sentinel, so testing `tokenSource` alone misses it.
-			['api key', { tokenSource: 'none', apiKeySource: 'ANTHROPIC_API_KEY', apiProvider: 'firstParty' }, true],
-			// The rows a later "simplification" silently breaks: for third-party
-			// backends the SDK documents the credential fields as absent, because
-			// auth is external (AWS creds, gcloud ADC).
-			['third-party backend (bedrock)', { apiProvider: 'bedrock' }, true],
-			['third-party backend (vertex)', { apiProvider: 'vertex' }, true],
-			['enterprise gateway', { apiProvider: 'gateway' }, true],
+			// Current Claude Code (2.1.220) Keychain login report. A normal
+			// claude.ai subscription deliberately omits tokenSource.
+			['claude.ai subscription', { email: 'user@example.com', organization: 'Example', subscriptionType: 'Claude Max', apiProvider: 'firstParty' }, true],
+			['empty subscription identity', { subscriptionType: '', apiProvider: 'firstParty' }, false],
+			// Provider credentials belong to Fumie's renderer-owned catalog, not
+			// the official native subscription row.
+			['api key', { tokenSource: 'none', apiKeySource: 'ANTHROPIC_API_KEY', apiProvider: 'firstParty' }, false],
+			['third-party backend (bedrock)', { apiProvider: 'bedrock' }, false],
+			['third-party backend (vertex)', { apiProvider: 'vertex' }, false],
+			['enterprise gateway', { apiProvider: 'gateway' }, false],
 		];
 
 		test('maps observed SDK account reports onto one set-up answer', () => {

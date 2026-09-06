@@ -59,6 +59,8 @@ export interface ListSessionsParams extends BaseParams, PaginatedParams {
 
 /** Result of the `listSessions` command. */
 export interface ListSessionsResult extends PaginatedResult {
+	/** Providers whose contribution is authoritative, including an empty contribution. */
+	providers?: string[];
 	/**
 	 * The list of session summaries. The server SHOULD order them
 	 * most-recently-modified first.

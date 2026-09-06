@@ -26,6 +26,7 @@ import { KNOWN_AUTO_APPROVE_VALUES, SessionConfigKey } from '../../../../../../p
 import { ClaudeSessionConfigKey } from '../../../../../../platform/agentHost/common/claudeSessionConfigKeys.js';
 import { CodexSessionConfigKey } from '../../../../../../platform/agentHost/common/codexSessionConfigKeys.js';
 import { ActionType } from '../../../../../../platform/agentHost/common/state/protocol/actions.js';
+import { NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
 import type { ResolveSessionConfigResult, SessionConfigPropertySchema, SessionConfigValueItem } from '../../../../../../platform/agentHost/common/state/protocol/commands.js';
 import type { SessionState } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { StateComponents } from '../../../../../../platform/agentHost/common/state/sessionState.js';
@@ -286,8 +287,8 @@ export function isWellKnownAutoApproveSchema(schema: SessionConfigPropertySchema
  * `Permissions` has no chip — it is surfaced through other UI — but is
  * included so the generic lane does not invent a chip for it.
  *
- * Host-owned worktree configuration also has no chip. Including those properties
- * here keeps the generic lane from surfacing them in the chat input.
+ * Host-owned worktree configuration and merge state also have no chip. Including
+ * those properties here keeps the generic lane from surfacing them in the input.
  */
 export const WELL_KNOWN_PICKER_PROPERTIES: ReadonlySet<string> = new Set<string>([
 	SessionConfigKey.Mode,
@@ -295,6 +296,8 @@ export const WELL_KNOWN_PICKER_PROPERTIES: ReadonlySet<string> = new Set<string>
 	SessionConfigKey.Isolation,
 	SessionConfigKey.Branch,
 	SessionConfigKey.Permissions,
+	SessionConfigKey.AgentMerge,
+	SessionConfigKey.AgentMergeController,
 	SessionConfigKey.WorktreeBranchPrefix,
 	SessionConfigKey.WorktreeBranchTrack,
 	SessionConfigKey.WorktreeCreateNewBranch,
@@ -355,6 +358,12 @@ export class AgentHostChatInputPicker extends Disposable {
 	private readonly _renderDisposables = this._register(new DisposableStore());
 	private readonly _filterDelayer = this._register(new Delayer<readonly IActionListItem<IConfigPickerItem>[]>(200));
 	private readonly _subRef = this._register(new MutableDisposable<IDisposable & { readonly sub: IAgentSubscription<SessionState>; readonly backendSession: URI }>());
+	/**
+	 * While the active resource is a client-local draft, listens for the host
+	 * announcing its session so the picker can subscribe the moment it exists.
+	 * Replaced on every {@link _reattach} and dropped once attached.
+	 */
+	private readonly _pendingSessionAdded = this._register(new MutableDisposable<IDisposable>());
 
 	constructor(
 		private readonly _widget: IChatWidget,
@@ -416,6 +425,7 @@ export class AgentHostChatInputPicker extends Disposable {
 	}
 
 	private _reattach(): void {
+		this._pendingSessionAdded.clear();
 		const sessionResource = this._widget.viewModel?.sessionResource;
 		const provisionalBackend = sessionResource ? this._provisional.get(sessionResource) : undefined;
 		const backendSession = provisionalBackend
@@ -425,6 +435,31 @@ export class AgentHostChatInputPicker extends Disposable {
 			this._subRef.clear();
 			this._initialResolved = undefined;
 			this._cancelInitialResolve();
+			this._renderChip();
+			return;
+		}
+
+		// A composer draft in the Agents window is client-local until its first
+		// message is sent, so there is no backend session to subscribe to and
+		// no provisional to create — the sessions provider owns that draft's
+		// config and hands it to the agent on send. Resolve the schema from
+		// the provider defaults and subscribe once the host announces the
+		// session the send created.
+		if (!provisionalBackend && !isUntitledChatSession(sessionResource) && this._workingDirectoryResolver.isNewSession(sessionResource)) {
+			this._subRef.clear();
+			if (!this._initialResolved || this._initialResolved.sessionResource.toString() !== sessionResource.toString()) {
+				this._initialResolved = undefined;
+				void this._refreshInitialResolved(sessionResource, backendSession);
+			}
+			// The composer keeps the same resource across the send that commits
+			// the draft, so nothing re-runs `_reattach` on its own. Attach
+			// directly from the announcement rather than re-testing the
+			// pre-session predicate — listener ordering is not guaranteed.
+			this._pendingSessionAdded.value = this._agentHostService.onDidNotification(n => {
+				if (n.type === NotificationType.SessionAdded && String(n.summary.resource) === backendSession.toString()) {
+					this._attachSubscription(backendSession);
+				}
+			});
 			this._renderChip();
 			return;
 		}
@@ -455,6 +490,12 @@ export class AgentHostChatInputPicker extends Disposable {
 			return;
 		}
 
+		this._attachSubscription(backendSession);
+	}
+
+	/** Subscribe to `backendSession`'s state and render the chip from it. */
+	private _attachSubscription(backendSession: URI): void {
+		this._pendingSessionAdded.clear();
 		this._initialResolved = undefined;
 		this._cancelInitialResolve();
 		const ref = this._agentHostService.getSubscription(StateComponents.Session, backendSession, 'AgentHostChatInputPicker');

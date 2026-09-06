@@ -41,7 +41,8 @@ const commandCenterContextKeys = new Set([IsNewChatSessionContext.key]);
  * Three sections driven entirely by menus:
  * - **Left**: `Menus.TitleBarLeft` toolbar
  * - **Center**: `Menus.CommandCenter` toolbar (renders session picker via IActionViewItemService)
- * - **Right**: `Menus.TitleBarRight` toolbar (includes account submenu)
+ * - **Right**: `Menus.TitleBarWorkspace` (folder / git / worktree), `Menus.TitleBarSessionMenu`,
+ *   `Menus.TitleBarRight` (includes account submenu)
  *
  * No menubar, no editor actions, no layout controls, no WindowTitle dependency.
  */
@@ -216,7 +217,7 @@ export class TitlebarPart extends Part implements ITitlebarPart {
 			toolbarOptions: { primaryGroup: () => true },
 		}));
 
-		// Center toolbar - command center (renders session picker via IActionViewItemService)
+		// Center toolbar - command center (renders session title via IActionViewItemService)
 		// Uses .window-title > .command-center nesting to match default workbench CSS selectors
 		const windowTitle = append(this.centerContent, $('div.window-title'));
 		const centerToolbarContainer = append(windowTitle, $('div.command-center'));
@@ -250,7 +251,7 @@ export class TitlebarPart extends Part implements ITitlebarPart {
 			toolbarOptions: { primaryGroup: () => true },
 		}));
 
-		// Session title actions toolbar (before right toolbar)
+		// Session title actions toolbar (panel / side pane, before right toolbar)
 		const sessionActionsContainer = prepend(this.rightContent, $('div.titlebar-actions-container.titlebar-session-actions-container'));
 		const sessionActionsToolBar = this._register(this.instantiationService.createInstance(MenuWorkbenchToolBar, sessionActionsContainer, Menus.TitleBarSessionMenu, {
 			contextMenu: Menus.TitleBarContext,
@@ -259,8 +260,25 @@ export class TitlebarPart extends Part implements ITitlebarPart {
 			toolbarOptions: { primaryGroup: () => true },
 		}));
 
-		// Update toolbar (leftmost in the right-side controls)
-		const updateToolBarElement = prepend(this.rightContent, $('div.titlebar-actions-container.titlebar-update-container'));
+		// Folder / git / worktree chips. Own toolbar so overflow hiding never
+		// drops the project chrome; packed to the right with the other right-side items.
+		const workspaceContainer = prepend(this.rightContent, $('div.titlebar-actions-container.titlebar-workspace-container'));
+		this._register(this.instantiationService.createInstance(MenuWorkbenchToolBar, workspaceContainer, Menus.TitleBarWorkspace, {
+			contextMenu: Menus.TitleBarContext,
+			hiddenItemStrategy: HiddenItemStrategy.NoHide,
+			telemetrySource: 'titlePart.workspace',
+			toolbarOptions: { primaryGroup: () => true },
+		}));
+
+		// Update toolbar (rightmost, immediately before native window controls).
+		// The window controls container lives in `leftContent` when the
+		// platform puts primary window controls on the left (macOS-style UAs,
+		// including iPad Safari); it is only a valid `insertBefore` reference
+		// when it was actually appended to `rightContent`.
+		const updateToolBarElement = $('div.titlebar-actions-container.titlebar-update-container');
+		const windowControls = this.rightWindowControlsContainer;
+		const updateAnchor = windowControls && windowControls.parentNode === this.rightContent ? windowControls : null;
+		this.rightContent.insertBefore(updateToolBarElement, updateAnchor);
 		const updateToolBar = this._register(this.instantiationService.createInstance(MenuWorkbenchToolBar, updateToolBarElement, Menus.TitleBarUpdate, {
 			contextMenu: Menus.TitleBarContext,
 			hiddenItemStrategy: HiddenItemStrategy.NoHide,

@@ -72,6 +72,7 @@ function isRawRemoteAgentHostEntry(value: unknown): value is IRawRemoteAgentHost
 	return typeof candidate.address === 'string'
 		&& typeof candidate.name === 'string'
 		&& (candidate.connectionToken === undefined || typeof candidate.connectionToken === 'string')
+		&& (candidate.clientId === undefined || typeof candidate.clientId === 'string')
 		&& (candidate.sshConfigHost === undefined || typeof candidate.sshConfigHost === 'string')
 		&& (candidate.sshHostName === undefined || typeof candidate.sshHostName === 'string')
 		&& (candidate.sshUser === undefined || typeof candidate.sshUser === 'string')
@@ -490,7 +491,7 @@ export class RemoteAgentHostService extends Disposable implements IRemoteAgentHo
 		// Add entries that this service owns.
 		for (const { entry, address } of entriesWithAddress) {
 			if (!this._entries.has(address) && getEntryTypeConfig(entry.connection.type).selfConnecting) {
-				this._connectTo(address, entry.connectionToken);
+				this._connectTo(address, entry.connectionToken, entry.clientId);
 			}
 		}
 
@@ -500,7 +501,22 @@ export class RemoteAgentHostService extends Disposable implements IRemoteAgentHo
 		}
 	}
 
-	private _connectTo(address: string, connectionToken?: string): void {
+	/**
+	 * `clientId`, when the entry carries one, is the identity this window
+	 * presents to the host for the life of the connection instead of a fresh
+	 * uuid per connect. Only the mobile web page supplies it, and it supplies it
+	 * from the browser's own storage so a reload resumes rather than arriving as
+	 * a stranger. Every other entry passes `undefined` and keeps the
+	 * per-connection uuid — deliberately, because this service is registered in
+	 * every Agents window on the desktop and one shared id would make two
+	 * windows a single client with two transports on the host.
+	 *
+	 * It identifies and does not authorize. Anyone who can load the page can put
+	 * any string here, so nothing downstream may grant access, trust or session
+	 * visibility on the strength of it; the connection token and, for the phone,
+	 * the capability path and session cookie are what authenticate.
+	 */
+	private _connectTo(address: string, connectionToken?: string, clientId?: string): void {
 		if (!this._configurationService.getValue<boolean>(RemoteAgentHostsEnabledSettingId)) {
 			return;
 		}
@@ -527,7 +543,7 @@ export class RemoteAgentHostService extends Disposable implements IRemoteAgentHo
 				? { logsHome: this._environmentService.logsHome, connectionId: address, transport: 'websocket' }
 				: undefined,
 		);
-		const client = store.add(this._instantiationService.createInstance(AgentHostProtocolClient, address, transportFactory, undefined, undefined, this.clientInfo));
+		const client = store.add(this._instantiationService.createInstance(AgentHostProtocolClient, address, transportFactory, undefined, clientId, this.clientInfo));
 		const entry: IConnectionEntry = { store, client, connected: false, status: RemoteAgentHostConnectionStatus.connecting };
 		this._entries.set(address, entry);
 
@@ -547,7 +563,7 @@ export class RemoteAgentHostService extends Disposable implements IRemoteAgentHo
 			// the "fatal" path — the protocol client already gave up its own
 			// soft-reconnect attempts (or it was never enabled), so we rebuild
 			// from scratch.
-			this._scheduleReconnect(address, connectionToken);
+			this._scheduleReconnect(address, connectionToken, clientId);
 		}));
 
 		// Reflect transient transport drops as `connecting` status (rather
@@ -617,7 +633,7 @@ export class RemoteAgentHostService extends Disposable implements IRemoteAgentHo
 			this._rejectPendingConnectionWait(address, err);
 			this._onDidChangeConnections.fire();
 			// Schedule reconnect if the address is still configured
-			this._scheduleReconnect(address, connectionToken);
+			this._scheduleReconnect(address, connectionToken, clientId);
 		});
 	}
 
@@ -625,7 +641,7 @@ export class RemoteAgentHostService extends Disposable implements IRemoteAgentHo
 	 * Schedule a reconnect attempt with exponential backoff.
 	 * Only reconnects if the address is still in the configured entries.
 	 */
-	private _scheduleReconnect(address: string, connectionToken?: string): void {
+	private _scheduleReconnect(address: string, connectionToken?: string, clientId?: string): void {
 		// Don't reconnect if the address was removed from settings
 		if (!this._getConfiguredEntries().some(entry => this._entryAddress(entry) === address)) {
 			this._logService.info(`[RemoteAgentHost] Not reconnecting to ${address}: no longer configured`);
@@ -644,8 +660,12 @@ export class RemoteAgentHostService extends Disposable implements IRemoteAgentHo
 		this._cancelReconnect(address);
 		const timeout = setTimeout(() => {
 			this._reconnectTimeouts.delete(address);
-			if (this._getConfiguredEntries().some(entry => this._entryAddress(entry) === address)) {
-				this._connectTo(address, connectionToken ?? this._tokens.get(address));
+			// The entry is re-read rather than trusted from the closure so a
+			// client id edited in settings while the backoff ran is the one this
+			// attempt presents — the same reason the address is re-checked here.
+			const configured = this._getConfiguredEntries().find(entry => this._entryAddress(entry) === address);
+			if (configured) {
+				this._connectTo(address, connectionToken ?? this._tokens.get(address), configured.clientId ?? clientId);
 			}
 		}, delay);
 		this._reconnectTimeouts.set(address, timeout);
@@ -690,15 +710,22 @@ export class RemoteAgentHostService extends Disposable implements IRemoteAgentHo
 			: inspected.userRemoteValue !== undefined
 				? ConfigurationTarget.USER_REMOTE
 				: ConfigurationTarget.USER;
+		// A dotted user setting under this key (`chat.remoteAgentHosts.foo`)
+		// makes the configuration service synthesize an object where an array is
+		// declared. `?? []` does not catch that, and the resulting throw happens
+		// in this service's constructor — taking down every surface that depends
+		// on it, over one mistyped line in a settings file.
+		const asEntries = (value: unknown): readonly IRawRemoteAgentHostEntry[] =>
+			Array.isArray(value) ? value as IRawRemoteAgentHostEntry[] : [];
 		return {
 			target,
 			entries: !targetOnly
-				? this._configurationService.getValue<IRawRemoteAgentHostEntry[]>(RemoteAgentHostsSettingId) ?? []
+				? asEntries(this._configurationService.getValue(RemoteAgentHostsSettingId))
 				: target === ConfigurationTarget.USER_LOCAL
-					? inspected.userLocalValue ?? []
+					? asEntries(inspected.userLocalValue)
 					: target === ConfigurationTarget.USER_REMOTE
-						? inspected.userRemoteValue ?? []
-						: inspected.userValue ?? [],
+						? asEntries(inspected.userRemoteValue)
+						: asEntries(inspected.userValue),
 		};
 	}
 

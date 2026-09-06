@@ -10,9 +10,6 @@
 
 # Multi-Chat Architecture
 
-> Node runtime service construction is documented separately in
-> [`node/serviceBootstrapping.md`](node/serviceBootstrapping.md).
-
 > **Status: COMPLETE** (2026-07-01)
 > All waves A–D and gates G-B1, G-C1, G-C2, G-D1 are done. Codex, Claude, and
 > Copilot all use the unified orchestrator path.
@@ -46,7 +43,7 @@
   actions. No agent-specific logic leaks into `AgentService` or
   `AgentHostStateManager`.
 - **Composition over inheritance.** All harnesses share one membership path
-  (`addChat`/`removeChat`), one persistence path (`PEER_CHATS_METADATA_KEY`),
+  (`addChat`/`removeChat`), one persistence path (`SESSION_PEER_CHATS_METADATA_KEY`),
   and one restore path (`registerRestoredChatSummary` + `resolveChatState`).
   Per-harness features are expressed
   through `IAgentCapabilities` flags, not `if (provider === 'claude') ...`
@@ -121,15 +118,15 @@ Agents do **not** maintain the chat catalog, persist membership, know whether a 
 **`AgentService` (`node/agentService.ts`):**
 - Owns the `(session, chat)` → `(agent, session URI, chat URI)` mapping.
 - Owns `_providers`, `_sessionToProvider`, and `_findProviderForSession` (which falls back through the session URI's scheme when a session was restored without an `AgentService.createSession` call in this process lifetime).
-- Owns `AgentSessionRegistry`, the durable source of truth for which sessions exist. `listSessions` enumerates the registry, hydrates each initial chat through `IAgent.getChatMetadata`, and applies the existing DB/state overlays.
-- Dispatches user-driven chat lifecycle (`createChat`, `disposeChat`) to `chats.*`.
+- Owns `AgentSessionCatalog` around `AgentSessionRegistry`, the durable source of truth for which sessions exist. The catalog boundary enumerates registry rows, enriches each exact row through `IAgent.getChatMetadata` when available, and classifies cold provisional drafts; `listSessions` applies the remaining DB/live-state presentation overlays.
+- Dispatches user-driven chat lifecycle (`createChat`, AHP `disposeChat` translated to Harness `deleteChat`) to `chats.*`.
 - Disposes every catalog chat in stable order (peers first, initial chat last); releases every catalog chat on idle eviction.
 - Derives the exhaustive per-operation `IAgentChatContext` (persistence scope, opaque configuration scope, catalog origin, host customizations) via the single `createAgentChatContext` helper.
 - Supplies complete resolved `IAgentCreateChatOptions` (`workingDirectories`, `project`, provider config, model/agent, active client, and fork/import/side-chat source) on every creation.
 - Records side-chat provenance in the catalog but leaves hidden context injection and visible-history filtering to the provider. The source is a stable turn id; active-turn partial response and selected text are immutable creation-time snapshots.
 - Passes the full ordered `workingDirectories` set and the initiating `AgentHostClientType` on each send while still supplying transient chat context. Providers launch in index 0, retain additional roots, and attribute usage/telemetry to the correct client surface.
-- Persists and restores the orchestrator-owned peer-chat catalog (`PEER_CHATS_METADATA_KEY` in the session database, serialized per session via `_peerChatCatalogWrites`).
-- Suppresses a peer chat's separately-enumerable backing SDK session (when `IAgentCreateChatResult.backingSession` is set): marks it via `_markPeerChatBacking` and filters it out of `listSessions` (invariant I7).
+- Persists and restores the orchestrator-owned peer-chat catalog (`SESSION_PEER_CHATS_METADATA_KEY` in the session database, serialized per session via `_peerChatCatalogWrites`).
+- Suppresses a chat's separately-enumerable backing SDK session (when `IAgentCreateChatResult.backingSession` is set): marks it via `_markChatBacking` and filters it out of `listSessions` (invariant I7).
 - Routes harness-spawned chats into the catalog (`_onChatSpawned`, `_onChatEnded`).
 - Owns the restore flow (`restoreSession`, `_restorePeerChats`).
 
@@ -190,13 +187,16 @@ The default chat URI is derived from the AH session URI, but its provider identi
 Both user-driven chats (`AgentService.createChat` → `addChat`) and harness-spawned chats (`AgentService._onChatSpawned` → `addChat`) go through `AgentHostStateManager.addChat`. The spawn-channel listener is registered **before** `AgentSideEffects` during `registerProvider` (`node/agentService.ts:registerProvider`) to guarantee the chat exists in the catalog before any turn actions arrive for it (DR1 deterministic sequencing).
 
 **I5 — Orchestrator peer-chat catalog is the restore source of truth (with one-time legacy migration).**
-The orchestrator persists additional chats in `PEER_CHATS_METADATA_KEY` and the initial chat's opaque backing in `defaultChatProviderData`. Restore materializes both through the same provider-data contract — `materializeChat` is the *only* way a default chat is re-attached. When a native catalog session has no persisted blob, the provider recovers its backing from the provider-native session id in the Agent Host session URI and returns canonical provider data, which the host persists additively for later restores; an already-canonical blob is never rewritten. A missing additional-chat catalog triggers the one-time `listLegacyChatBackings` migration. Harness-spawned chats remain transient and are re-derived from tool-origin state. `_persistDefaultChatBacking`'s two writes — the `defaultChatProviderData` blob and the default chat's own `_markChatBacking` call (I7) — are independent: a failure persisting the blob is logged and swallowed rather than skipping the backing marker, since the marker is what keeps the default chat's backing session out of the top-level list and must not be held hostage to an unrelated write's success.
+The orchestrator persists additional chats in `SESSION_PEER_CHATS_METADATA_KEY` and the initial chat's opaque backing in `defaultChatProviderData`. Restore materializes both through the same provider-data contract — `materializeChat` is the *only* way a default chat is re-attached. When a legacy session has no persisted blob, whatever `recoverLegacyChat` recovers is persisted additively under `defaultChatProviderData` so later restores read it directly; an already-canonical blob is never rewritten. If neither a persisted nor a recovered backing exists, the host restores history and logs that the chat has no live backing rather than falling back to identity reuse. A missing additional-chat catalog triggers the one-time `listLegacyChatBackings` migration. Harness-spawned chats remain transient and are re-derived from tool-origin state. `_persistDefaultChatBacking` keeps its two writes independent — a failed provider-data write cannot skip `_markChatBacking` — but propagates the provider-data failure after the marker attempt. Create compensates the provider backing and reservation; provisional materialization stays `Creating` and retries instead of publishing an unrestorable `SessionReady`.
 
 **I6 — `_findProviderForSession` not `_sessionToProvider`.**
 The `_sessionToProvider` map is populated only by `AgentService.createSession`. A restored session (alive in the state manager after a host restart but never created in this process) is absent from it. `_findProviderForSession` (`node/agentService.ts:AgentService._findProviderForSession`) falls back to the session URI scheme, which is what makes restored sessions work.
 
-**I7 — A peer chat's backing SDK session must never surface as a top-level session.**
-Some agents store all SDK conversations in one catalog. `IAgentCreateChatResult.backingSession` lets the orchestrator mark any internal chat backing, including the default Claude backing, so continual external-chat discovery never registers it as a top-level AH session. Providers own native enumeration and push candidates through `onDidDiscoverChats`; Agent Host reconciles those candidates against its registry and suppresses separately enumerable internal backings. Existing AH-created rows retain their provenance. Marking a backing session is a durable metadata write on the backing session's own DB (`_markChatBacking`); a transient failure is retried once, and if it keeps failing the session is suppressed from listing/discovery in-process (`_unpersistedChatBackings`) rather than failing the chat creation that triggered it.
+**I7 — A chat backing SDK session must never surface as a top-level session.**
+Some agents store all SDK conversations in one catalog. `IAgentCreateChatResult.backingSession` lets the orchestrator mark any internal chat backing, including the default Claude backing. New backings never enter `AgentSessionRegistry`; the durable marker and `_unpersistedChatBackings` remain defensive filters for stale registry rows created by older builds. A transient marker failure is retried once and never fails chat creation. Default and peer restore both feed a returned `backingSession` through `_persistDefaultChatBacking` / `_markChatBacking`, so a backing restored on a fresh process cannot leak into the top-level catalog.
+
+**I9 — Identity is reserved before native creation; Ready is a durable commit.**
+`createSession` mints or validates the AH session URI, registers that identity, and persists its provisional marker before `chats.createChat` may create a provider-native backing. `_sessionCreationReservations` hides the row from concurrent list refreshes until live state exists; after a crash the in-memory guard disappears and a marker-only (or no-DB) row with no provider metadata is swept. A crash can therefore leave an AH reservation to sweep, but cannot leave an unowned native session. Provider-create failure compensates both sides. `SessionReady` is published only after the default backing plus the session's restore-critical facts (`workspaceless`, provisional marker, multi-root metadata, config) have committed; provisional materialization uses the same gate and remains retryable in `Creating` on a write failure.
 
 **I8 — Providers are given host facts; they must not re-derive them.**
 Everything a provider needs about a chat and its owning session is published on
@@ -206,63 +206,300 @@ a chat URI. New provider code must consume the seams.
 
 ---
 
-## 3a. Session Registry and External Chat Discovery
+## 3a. Fumie-Owned Session Catalog
 
-`AgentSessionRegistry` (`node/agentSessionRegistry.ts`) stores `{ sessionUri → { provider, startTime, external, source } }` in the orchestrator-owned `agent-host.db`. `external` is durable provenance: explicitly created Agent Host sessions are `false`; sessions first discovered in a provider-native catalog are `true`. Provider session databases do not duplicate this property.
+`AgentSessionRegistry` (`node/agentSessionRegistry.ts`) stores
+`{ sessionUri → { provider, startTime } }` in the orchestrator-owned
+database. Fumie products place it at `FUMIE_HOME/sessions/catalog.db`; products
+without a Fumie home retain the historical profile-local `agent-host.db`.
+This table is the only source of user-visible top-level
+membership. Provider-native `listLegacyChats` results are never imported or
+unioned into `listSessions`; unregistered native sessions remain invisible.
 
-`AgentSessionRegistry.list()` reads the registry once and passes every entry through the migration callback supplied by Agent Service. The callback returns a replacement only for legacy entries whose `external` column is `NULL`, resolving them through the `agentHost.workspaceless` classifier. The registry persists all replacements in one transaction and returns the computed list without rereading the database. Migration uses bounded concurrency. Explicit internal registration sources are preserved; externally classified rows become discovery entries.
+A successful explicit `createSession` reserves its registry identity before
+calling the provider, then announces state only after provider creation. An
+explicit `restoreSession` uses `registerIfNotTombstoned`, while definitive
+delete atomically tombstones and unregisters. Registration preserves the first
+provider and creation time for a URI, and a requested URI whose provider does
+not match the selected harness is rejected before provider creation.
 
-`register` takes the resolved provenance and whether to check tombstones. Explicit `AgentService.createSession` calls skip the tombstone check and clear any tombstone for that session URI; restore and discovery calls atomically decline to register if the session is or concurrently becomes tombstoned. An explicit row is never rewritten by catalog discovery. A migration-time host-owned marker can correct a previously discovered row back to internal provenance.
+`listSessions` enumerates the registry, enriches each exact row with
+`getChatMetadata`, then applies persisted and live state overlays. Missing
+provider metadata falls back to the immutable registry identity rather than
+removing the row. State-only top-level summaries are not a second membership
+path. A provisional session (harness has not yet materialized a real SDK
+backing) is registered and announced immediately, same as any other session;
+only `SessionReady` waits for provider materialization.
 
-Providers own discovery lifecycle and push unknown chats with provider-classified provenance through `onDidDiscoverChats`. Claude, Codex, and Copilot classify their unknown native chats as external, except that Copilot keeps an unknown *legacy extension-host* chat internal because it is adoptable in place rather than someone else's session. Agent Service preserves that classification when it additively registers the event payload. Every provider starts one memoized initial attempt when the first discovery-event listener is attached; that attempt retries internally, but once it settles it is not re-armed by SDK readiness, so the only later trigger is an explicit one (for Copilot, the migrate-legacy toggle). Ordinary list refreshes never enumerate provider catalogs. External discovery has no migration marker or Copilot migrate-legacy gate; only the adoptable legacy extension-host half of Copilot's payload is withheld while migrate-legacy is off. Discovery never prunes a registry row when a provider later omits it and filters subagents and marked internal chat backings.
+Only the *read* accessors for the legacy global and per-provider backfill
+markers remain — `AgentSessionRegistry.isBackfilled` / `isProviderBackfilled`
+over `AgentHostDatabase.isSessionRegistryBackfilled` / `isProviderBackfilled` —
+so an older profile is still interpreted correctly. Their writers, and the
+`isEmpty` registry diagnostic, are gone; the metadata rows and the `migrations`
+array are append-only and untouched, so an old profile stays readable either
+way. Current `AgentService` neither runs provider backfill nor writes any
+marker. Provider enumeration remains only
+behind explicit restore compatibility and the separate one-time migration of
+a restored session's internal peer-chat backing catalog. One consequence worth
+stating plainly: the `migrateLegacyCopilotCliEnabled` setting and Copilot's
+`withSessionEhcliAdoptable` adoptable-legacy marker are now dead ends in
+practice. Nothing calls `listLegacyChats` during ordinary catalog enumeration
+any more — that was the removed backfill sweep — and nothing subscribes to
+`CopilotAgent.onDidChangeChatList` either, so an un-adopted extension-host
+Copilot CLI session is never surfaced into the list regardless of the setting.
+The setting, the marker, and the adopt-on-open path in `_doRestoreSession`
+still exist and still work for a session URI a caller already has in hand, but
+there is no producer left that would ever hand one out.
 
-Discovery is registry-first: Agent Service hands each provider an optional `setKnownSessionsFilter` seam that answers, for a whole candidate set in one registry query, which sessions the host already owns. A provider drops those candidates before any per-session database open, and Copilot additionally skips adoptable legacy classification work (project/Git resolution) while migrate-legacy is off, since those candidates would not be emitted. Agent Service in turn rejects an already-registered candidate before `_isChatBacking()` or any other per-session I/O; provenance of a registered row stays owned by the explicit create/restore paths. Tombstoned sessions are absent from the registry and therefore never reported as known, so an explicitly deleted session still reaches `register`, whose atomic tombstone check declines it.
+Internal default/peer-chat backings are never intentional registry members.
+Their durable backing marker and the in-process failed-write suppression are
+retained defensively so stale rows created by an older build do not surface.
 
-Claude and Codex each use one memoized initial path: resolve/download the SDK, enumerate once, classify the native catalog by stored session metadata, then emit only unknown chats as `external: true`. Provider session databases no longer persist a provider-local external property; legacy `claude.external` and `codex.external` values are recognized only as evidence that a chat was known. An empty or absent sidecar remains unknown.
+### Provisional drafts and host-side archive
 
-If a provider cannot enumerate yet, its initial discovery attempt emits nothing; once ready, it emits the resulting chats through `onDidDiscoverChats`. Registry provenance is projected into `IAgentSessionMetadata._meta` with `readSessionExternal` / `withSessionExternal`, and the normal AHP listSessions round trip carries it to the Sessions provider. There is no external-specific UI behavior.
+A *provisional* session is one that is registered and announced before any
+harness-native backing exists. Two producers create one deliberately: an
+ordinary `createSession` whose harness has not materialized a default chat yet
+(every session passes through this state on its way to `SessionReady`), and the
+editor window's untitled composer — `IAgentHostUntitledProvisionalSessionService`
+for `agent-host-<provider>:/untitled-<uuid>` chat resources — which creates a
+backend session up front so its config chips have a reducer-owned `SessionState`
+to mutate before the first Send. The **Agents window's composer is not a
+producer**: its `NewSession` draft is client-local and issues no `createSession`
+(and no `disposeSession`) until the user actually sends, so an abandoned
+Agents-window draft leaves no row here at all. Builds that predate that change
+did create one eagerly, so their leftover rows are still in the wild and are
+handled by the same classification and sweep described below.
 
-`listSessions()` coalesces concurrent computations per external-sessions mode, so the burst of calls a multi-window restore produces shares one registry traversal instead of one per window. The shared entry records the registry epoch it started at and is invalidated by every registry mutation. A computation whose epoch changes restarts against the new registry, so both existing and later callers receive a complete post-mutation snapshot; each caller receives its own array.
+A live provisional session's state is created before
+`AH_META_PROVISIONAL_DB_KEY` is persisted to its session database
+(`_persistProvisionalMarker`, writing an `IProvisionalDraftMarker` that carries
+the create-time `workingDirectories`) — deliberately in that order, so a
+concurrent `listSessions` can never mistake a live draft for an orphan. The
+write is awaited and retried before create returns. The marker is cleared in
+the same required-facts commit that lets `_onDidMaterializeChat` publish
+`SessionReady`; a backing-receipt or required-facts failure leaves the session
+`Creating` and retryable.
 
-Legacy registry migration uses the `listChatsToMigrate()` contract. An array is authoritative even when empty, while `undefined` means the catalog is unavailable and must not advance migration markers. Agent Service retries an unavailable registration-time catalog once before listing; persistent unavailability rejects the aggregate `listSessions()` call with a typed provider-catalog error so clients preserve their last successful snapshots. `BaseAgentHostSessionsProvider` retries failures with exponential backoff; `AgentHostSessionListStore` leaves its cache invalid and retries on the next controller, lifecycle, or workspace refresh trigger. Replacement retry ownership is compare-and-swap single-flight: overlapping list computations that observed the same failed attempt await the first caller's installed retry rather than queueing another provider enumeration. Successful providers retain their completed migration state when a sibling provider is unavailable.
+A registry row the harness can no longer describe (no `getChatMetadata`
+result) is classified by `AgentSessionCatalog.classifyColdProvisionalDraft`: marker present and
+no live state → a cold provisional draft. A row registered by a build that
+predates the marker counts as one too when its session database shows it was
+never materialized (no `agentHost.workspaceless` flag — written unconditionally
+at materialization — and no `configValues` / peer-chat catalog). Additionally `untouched` (no
+persisted `customTitle`, not archived) marks it an orphan — typically an
+untitled editor-window composer draft abandoned by a quit or crash, or a
+legacy Agents-window draft left by a build that still created its backend
+session eagerly. `listSessions` sweeps an
+untouched orphan (`_sweepOrphanedProvisionalDraft` → `disposeSession`:
+unregister + tombstone + delete its data) instead of listing an unopenable
+"New Session" ghost. A *touched* draft (renamed or archived) stays listed
+(registry-identity fallback row, with DB overlays) and is revived on open:
+`restoreSession` → `_restoreSessionState` calls `_reviveProvisionalDraft`,
+which re-runs `createSession` at the *same* URI with the marker's original
+`workingDirectories`, then replays the persisted title/archived/read flags
+onto the fresh state via `dispatchServerAction` (and `retainSession` — the
+public wrapper of `_markSessionUsed` — when archived, so the freshly revived
+draft is retained against the orphan sweep rather than swept again).
 
-Session-list clients treat only a successful return as authoritative. `BaseAgentHostSessionsProvider` and `AgentHostSessionListStore` retain their last successful snapshots when `listSessions()` rejects; a successful empty array still clears the snapshot. This separation prevents transport, authentication, or catalog failures from becoming deletion deltas.
+`setSessionArchived` is the only archive transaction. Archive is Fumie-local:
+it commits `isArchived` and broadcasts first so renderer/changeset consumers
+quiesce immediately, then one coalesced background job waits for any active turn,
+releases live Harness runtimes, and reclaims the Fumie-owned worktree. The
+Archived row is the durable retry intent across a Host restart; transient
+release/Git failures use bounded backoff without blocking the archive RPC or
+normal workbench use. It never calls Codex `thread/archive`, Claude native
+history mutation, or any provider catalogue API.
+For dirty archives, the same AHP request carries an explicit `preserveChanges`
+receipt. `SessionRecordStore` persists that receipt with the Archived transition
+and consumes it only after cleanup or a successful unarchive, so a Host restart
+can resume the confirmed cleanup. An older client or legacy row without a receipt
+fails closed on Git-visible dirt and retains the checkout for a new confirmation.
+`agentHost.archiveSyncTarget` is read only as a legacy repair input: a build
+that crashed after mutating native state but before committing Fumie state is
+converged locally and the old key is cleared; it is never replayed to a Harness.
 
-Provider-private discovery helpers name their concrete source: Claude uses `_listClaudeCodeChats()` / `_emitClaudeCodeChats()`, Codex uses `_listCodexChats()` / `_emitCodexChats()`, and Copilot uses `_discoverCopilotChats()` / `_emitCopilotChats()`. Providers filter known session metadata before emitting; Agent Service still performs the authoritative additive registry write and atomic tombstone check. Copilot treats the existence of a per-session database (under `{userDataPath}/agentSessionData`, never the shared Copilot home) as "known", which also keeps peer-chat backings out of the payload; it additionally drops a chat whose SDK context carries no working directory, because `_doResumeSession` requires one and a discovered chat has no other source for it.
+Worktree archive storage is Git-object delta storage, not a checkout copy and
+not a commit on the visible session branch. `WorktreeIsolation` asks
+`AgentHostGitService.captureWorktreeArchiveSnapshot` for a tree rooted at the
+current branch tip, writes it under the session-private
+`refs/agents/<session>/archive` only when Git-visible dirt exists, then
+force-removes the worktree. Git-ignored content is outside the delta: required
+ignored inputs use the explicit worktree-include contract, while generated
+output is recreated by setup. Clean worktrees create no archive ref. Unarchive recreates the
+preserved branch, reapplies and verifies the private tree, then consumes the
+ref. A crash after the catalog commit but before checkout removal resumes the
+same cleanup from the Archived row and its optional dirty-change receipt.
 
-For every provider, migration and discovery partition the same native catalog: migration returns known entries as plain metadata, while discovery emits unknown entries with provider-classified provenance (external for Claude and Codex, and for Copilot everything except an unknown legacy extension-host chat, which is emitted as internal and adoptable). The partition is not quite exhaustive for Copilot: a chat whose session database exists but holds none of the metadata keys `listChatsToMigrate` requires is rejected by both halves. That is deliberate — an empty database is how Agent Host records a chat it already touched — and is asserted by `copilotAgent.test.ts`'s "does not discover an extension-host chat with an empty Agent Host database". Central `agent-host.db` remains the durable provenance authority.
+Legacy rows from commit-first builds are reconciled conservatively. If an old
+Archived row still has a clean checkout, the normal archive transaction removes
+it. If the retained checkout has meaningful dirt, `WorktreeIsolation` raises
+`WorktreeArchiveChangesConfirmationRequiredError` before creating a ref or
+removing anything; `AgentService` clears the stale Archived flag so the session
+is Active and the next user archive goes through the mandatory confirmation.
 
-### Server-tool orchestration relationships
+Unarchive is deliberately asymmetric: restore the Fumie-owned worktree first,
+then commit and broadcast `isArchived=false`. A restore failure leaves the
+catalog Archived, so the UI never exposes an Active session with a missing
+checkout; it also keeps or re-arms background cleanup so a retained/partial
+checkout cannot become an orphan. Only a successful restore cancels cleanup and
+re-arms renderer `worktreeCreated` tasks.
+Fumie never mirrors Archive into a Harness. When the exact persisted Codex
+receipt belongs to an older build and `thread/resume` proves that backing is
+still natively archived by naming the identical thread id, the Codex adapter
+sends one `thread/unarchive` for that exact thread and retries resume once. A
+second failure or mismatched id propagates; there is
+no scan, guessed id, native archive call, or unbounded repair loop.
 
-Treat a session as the user-visible unit of work. The `create_chat` tool is the
-default for parallel subtasks that should share one workspace, lifecycle, and
-aggregate diff. Use `create_session` only when a delegated task needs an
-independent workspace, worktree or branch, provider, or lifecycle.
+### Workspace-less hidden execution root
 
-Sessions created by the `create_session` server tool record provider-neutral
-orchestration metadata in the session summary `_meta` bag. The metadata names
-the creating session separately from the hierarchy parent, plus an optional
-label, whether the child may coordinate with its creator, and an optional
-idle-notification policy. Keeping creator identity separate from hierarchy
-placement preserves notification routing if parent relationships evolve.
-`list_sessions` projects and filters hierarchy metadata without involving
-provider harnesses.
+A non-fork `createSession` with no `workingDirectories`
+(`isWorkspacelessCreate`) gets a host-owned hidden execution root —
+`getSessionWorkspacelessRoot(sessionDataService, session)`, i.e.
+`<sessionData>/<sessionId>/workspace` — created by `_ensureWorkspacelessRoot`
+and handed to the provider as the sole `workingDirectories` entry (the process
+cwd). The host's own create-time config keeps `workingDirectories` absent so
+the session stays tagged workspace-less. The root is retained in host
+`SessionState.workingDirectories` (it feeds permission auto-approval,
+checkpoints, changesets, and peer-chat placement) but is stripped from the
+public catalog projection in `listSessions`; a workspace-less session's
+`project` is never set. Restore best-effort recreates the root when the
+persisted cwd is the hidden root; delete removes it with the rest of the
+session's data directory. User workspaces are never touched.
 
-`SessionCoordinationService` owns idle-notification status observation,
-per-child sequencing, creator restoration, and delivery. Its durable
-`creatorNotificationState` is `waitingForCompletion` after work starts and
-`notified` after the next input-needed/idle/error transition wakes the creator.
-The `always` policy returns to `waitingForCompletion` on the next work cycle. A
-busy creator default chat receives a queued system notification rather than a
-new active turn, so concurrent child completion cannot overwrite creator work.
-The existing pending-message drain starts that queued notification when the
-creator chat becomes idle.
+### Session titles — one naming path, two sources
 
-`list_sessions` exposes a session's configured project URI separately from its
-primary and additional working directories. `create_session` accepts those URIs
-directly and can resolve a unique project display name, preferring the
-configured project root over a transient worktree. Ambiguous names require an
-explicit project URI.
+**Read side.** `SessionRecordStore.resolveTitle(metadata, harnessSummary)`
+(`node/fumie/sessionRecordStore.ts`) is the entire rule: persisted title then
+harness summary, with the caller supplying the `"New Session"` placeholder when
+neither side has anything. There is no priority chain and no source to consult —
+every title Fumie shows is one Fumie itself persisted, so the persisted title
+always wins and the harness's own summary is only the fallback for a session
+Fumie has not titled yet. `listSessions` and `restoreSession` are both callers;
+both fold `SESSION_RECORD_METADATA_KEYS` into the batched `getMetadataObject`
+read they already do, so the session database is still hit exactly once.
+
+`SessionRecordStore` (same file) is the typed view over those `session.db`
+metadata keys — `{ title, titleSource, titleLocked, isRead, isArchived }` — and
+the only place the raw key names and the open/close dance live. The keys and
+stored values are unchanged, so there is nothing to migrate. Its
+`projectStatus` projection preserves the difference between an absent flag and
+an explicit false value so list/restore overlays do not erase provider state.
+
+**Sources.** Exactly two: `'user'` — the user renamed by hand, which locks the
+title (`ISessionRecord.titleLocked`) against every other writer — and `'auto'`,
+which covers everything Fumie generates (placeholder and model-generated title
+alike). The `'provider'`, `'prompt'`, and `'agent'` rungs are gone, along with
+`canProviderTitleApply`, `isCanonicalAgentHostTitleSource`, the in-memory
+`_titleSources` map, and restore's `seedTitleSource` seeding. An older build's
+`'agent'` row is read like any other unrecognised source
+(`parseAgentHostTitleSource` returns `undefined`): the persisted title stands,
+unlocked.
+
+**An agent cannot write the catalog.** The `rename_session`, `rename_chat`, and
+`delete_session` server tools are gone, and with them the
+`activeAgentTitleGeneration` experiment that gated the two rename tools. The
+session tool group is `list_sessions`, `get_current_session`, `create_session`,
+`create_chat`, `send_message`, `get_session_context` — read plus spawn, no
+mutation of a title or a catalog row. `/rename` remains the one agent-visible
+rename path and it is the user's, routed through
+`SessionTitleService.onUserRename` plus a `'user'`-sourced persist.
+
+**Write side.** `SessionTitleService` (`node/fumie/sessionTitleService.ts`),
+which replaces the deleted `AgentHostSessionTitleController`. Four methods and
+one piece of state — `_inflight`, one `CancellationTokenSource` per session or
+peer chat (the default chat maps to its session, so a target is always exactly
+one of the two):
+
+| Method | When | What it does |
+|---|---|---|
+| `onFirstUserMessage(session, chat, prompt)` | the opening message of a still-untitled target with no turns | writes the prompt as a placeholder, then makes the one naming request |
+| `onFork(session, chat, turns, placeholder, sourceTitle?)` | a fork or import, which inherits history plus a `Forked: …` placeholder and will never see a first user message | its one naming request, built from the inherited turns instead of a prompt |
+| `onUserRename(session, chat?)` | user rename | cancels the in-flight request so a late title cannot clobber the user's choice (persisting the `'user'` source is the caller's job) |
+| `clear(session, chats)` | dispose / idle eviction | cancels every in-flight request for the session and its chats |
+
+The naming path itself is one straight line. The placeholder — the prompt with
+whitespace collapsed, capped at 200 characters — is written synchronously with
+source `'auto'`, so a row is never a bare `"New Session"`. Then
+`IAgent.generateTitle(session, { prompt, modelId }, token)` is called **exactly
+once**, with `modelId` resolved from the target's current model
+(`node/fumie/currentSessionModel.ts:resolveCurrentSessionModel`) and raced
+against a 30 s timeout (a reasoning model needs it: an observed Codex
+`gpt-5.6-sol` naming turn answered at 19 s). A reply goes through `_cleanTitle` (first non-empty
+line, strip wrapping quotes and trailing punctuation, discard a refusal, cap at
+200 characters, strip a hallucinated trailing Han suffix) and is applied only if
+the title is still not user-locked at that moment — the lock is re-read from the
+database right before the write, so a rename that landed while the harness was
+thinking still wins. A failure, a timeout, a cancellation, an empty reply, or no
+registered agent all simply leave the placeholder standing — but never silently:
+every request logs one `info` line when it starts and exactly one when it ends
+(`Applied the generated title …` or `Kept the placeholder for …: <reason>`), so a
+missing title is always diagnosable from `agenthost.log`. There is no fallback
+model and no second refinement pass: `refineTitleFromFirstTurn`,
+`seedProvisionalTitle`, `seedPromptPlaceholder`, `markTitleAuto`,
+`prepareInstructionForAgent`, and `_shouldGenerateSessionTitle` are all gone.
+The one enrichment kept from the old controller is GitHub context: issue and
+pull-request URLs in the prompt are fetched through
+`IAgentHostOctoKitService` and appended to the naming request within a 20k-char
+budget that reserves 4k for the enrichment. That budget is the service's alone —
+no provider re-truncates the request text it is handed.
+
+**Every provider names with its own model.** `generateTitle` is a required
+`IAgent` member, and its contract is: never touch the user's transcript or
+turns, never write the harness's own session metadata, honour the cancellation
+token, return `undefined` on any failure, never throw.
+
+| Provider | How it names a session |
+|---|---|
+| Copilot | the CAPI utility completion (`copilotApiService.utilityChatCompletion`) — a real title-only side channel, so no conversation is created. The session's model is passed as `modelFamily`. |
+| Claude | the SDK control request `generateSessionTitle` with `persist: false`, on the default chat's `ClaudeAgentSession`. Because the host names a session off its first message, a still-materializing session is waited for (`whenPipelineReady`) so the request lands on the first send's own subprocess; a session with no runtime at all keeps the placeholder rather than being resumed just to be named. |
+| Codex | the app-server has no one-shot completion, so one turn runs on a hidden `ephemeral` thread (`thread/start` with the session's model and cwd, `sandbox: 'read-only'`, `approvalPolicy: 'never'`) → `turn/start` (with `effort: 'low'`, because an ephemeral thread otherwise inherits the user's configured effort — an observed `ultra` naming turn spent 19 s and an `exec_command` call on a one-line title). An ephemeral thread is never persisted, so there is nothing to `thread/delete`. |
+| DeepSeek | a hidden throwaway harness agent under a fresh uuid, disposed again. Its id is in neither `_sessions` nor the registry, so the harness event hooks ignore its stream. |
+| Kimi | a hidden throwaway harness session (harness-minted id, tool calls and questions auto-rejected), closed again. |
+
+`IAgent.ownsSessionTitles` no longer exists — no harness is exempt from Fumie
+naming, and no harness is asked to name anything through its own prompt. Gone
+with it is the utility-model path that titled every session with a hard-coded
+`gpt-4o-mini` behind a GitHub Copilot token: a Fumie session is now named by the
+model the user picked for it, and a provider with no Copilot token does not lose
+naming altogether.
+
+**Harness-pushed titles are ignored.**
+`AgentSideEffects._handleAgentSignal` drops every provider-originated
+`SessionTitleChanged` signal with a trace line — Codex `thread/name/updated`,
+Claude's backend title. Codex still emits the signal; nothing applies it, and
+`_applyProviderSessionTitle` is gone. Nor does Fumie rename a session inside its
+harness: `IAgent.onTitleChanged` no longer exists, so a title is a Fumie-side
+fact only and never travels back into a provider.
+
+### Current model
+
+A session's current model is the default chat's `ChatState.draft.model` — set
+by the client-dispatchable `chat/draftChanged` action, applied by the reducer,
+and broadcast to every subscriber on that chat via the shared `ChatState`
+(chat state is one object per chat, not per client, so every subscriber sees
+the same draft). `AgentSideEffects._persistChatDraft` persists the whole draft
+including its model on every `chat/draftChanged`. A turn's model is captured
+once, at `ChatTurnStarted`, into `ChatState.activeTurn.message.model`, so
+changing the draft mid-turn never touches an in-flight turn — the *next*
+`ChatTurnStarted` carries the new model, and
+`AgentSideEffects._sendTurnMessage` calls `agent.chats.changeModel` for it. On
+restore, a provider-reported current model (`IAgentChatMetadata.model`, used
+for provider-driven continuity such as a Codex Desktop session whose model
+changed outside AHP's own flow) always overrides the persisted draft's own
+model field; the persisted model is used verbatim only when the provider
+reports none. No protocol change was needed for any of this — it is entirely
+the existing `draft.model` mechanism.
+
+### Per-session FIFO for RPC mutations
+
+`AgentSessionLifecycleService` owns the one per-session mutation tail used by
+client dispatches, create/delete chat, archive/unarchive, and session Delete.
+Synchronous dispatch keeps its fast path only when that tail is empty and the
+durable lifecycle store is ready. Delete closes the synchronous guard before it
+waits in the tail, persists an immutable target snapshot in `catalog.db`, and
+rejects later send/fork/config mutations. This replaces the old independent
+`_dispatchQueues` / `_sessionArchiveOperations` snapshot waits.
 
 ---
 
@@ -342,9 +579,9 @@ sequenceDiagram
     AS->>SM: addChat(session, chatUri, { providerData })
     SM-->>UI: ActionEnvelope (SessionChatAdded)
     AS->>AS: _persistPeerChat(session, chatUri, providerData)
-    Note over AS: enqueued per-session RMW of PEER_CHATS_METADATA_KEY
+    Note over AS: enqueued per-session RMW of SESSION_PEER_CHATS_METADATA_KEY
     opt backingSession set (I7)
-        AS->>AS: _markPeerChatBacking(backingSession, chatUri)
+        AS->>AS: _markChatBacking(backingSession, chatUri)
         Note over AS: writes peerChatBacking marker into the backing session's DB<br/>so listSessions filters it out
     end
 ```
@@ -367,7 +604,7 @@ sequenceDiagram
     SM-->>AS: ChatSummary
     Note over SE: AgentSideEffects listener fires next, chat already in catalog (DR1)
     SE->>SM: dispatch turn lifecycle actions for the spawned chat
-    Note over AS: Spawned chats are NOT persisted to PEER_CHATS_METADATA_KEY\n(transient, re-derived from event log on restore)
+    Note over AS: Spawned chats are NOT persisted to SESSION_PEER_CHATS_METADATA_KEY\n(transient, re-derived from event log on restore)
 ```
 
 On restart, AgentService discovers completed subagents from the already-restored
@@ -375,6 +612,17 @@ parent turns and registers metadata-only read-only chat summaries. Their
 provider transcripts are resolved through `AgentHostStateManager.resolveChatState`
 only when the child chat is subscribed, matching restored peer-chat laziness;
 no provider-wide eager child enumeration remains.
+
+One path breaks that laziness: turn-id validation. A `chat/turnStarted` on any
+chat of a session must not reuse a turn id another chat already owns, so
+`AgentService` eagerly resolves every unresolved peer chat of the session before
+applying the action. Resolution failures there are isolated per chat — a chat
+whose transcript cannot be reconstructed (an interrupted subagent transcript,
+for one) is logged once, remembered as unresolvable, and skipped by every later
+turn of that session. The turn is dispatched without validating its id against
+that one chat; the alternative — failing the dispatch — would wedge the session
+permanently. The record is dropped when the session's state is evicted or
+deleted, so a later restore retries resolution.
 
 ### 5d. Sequence: Restore
 
@@ -400,7 +648,7 @@ sequenceDiagram
     AS->>AS: _readPersistedChatTitle(session, defaultChatUri)
     AS->>SM: restoreSession(summary, turns, {draft, defaultChatTitle})
     SM->>SM: _ensureDefaultChat(sessionKey, summary, turns)
-    Note over AS: Peer chats: read PEER_CHATS_METADATA_KEY from DB
+    Note over AS: Peer chats: read SESSION_PEER_CHATS_METADATA_KEY from DB
     alt catalog present (defined)
         loop for each IPersistedPeerChat (in catalog order)
             AS->>SM: registerRestoredChatSummary(session, chatUri, {title, draft, providerData, resolver})
@@ -413,7 +661,7 @@ sequenceDiagram
             AS->>SM: registerRestoredChatSummary(session, chatUri, {resolver, providerData})
             Note over SM: Create a retryable entry-owned resolver
         end
-        AS->>AS: _persistPeerChat(...) writes PEER_CHATS_METADATA_KEY (drain once)
+        AS->>AS: _persistPeerChat(...) writes SESSION_PEER_CHATS_METADATA_KEY (drain once)
     end
     AS-->>C: IStateSnapshot
     C->>AS: subscribe(peerChatUri, clientId)
@@ -465,12 +713,12 @@ The orchestrator resolves the owning **session** from the session URI for sessio
 
 Claude deliberately has no AH-session container and no membership/role concept of its own:
 - `_chatEntriesBySdkId: DisposableMap<string, ClaudeChatEntry>` is the single disposable owner of every live SDK conversation and provides direct SDK-callback routing.
-- `_chatBackings: Map<string, IClaudeChatBacking>` maps each exact host-supplied chat URI to only its provider-owned `{ sdkSessionId, model?, sideChat? }` backing data. It deliberately does **not** retain the owning AH session or a storage URI: AH supplies the owning session and persistence/config resource transiently on every operation (`IAgentChatContext`).
+- `_chatBackings: Map<string, IClaudeChatBacking>` maps each exact host-supplied chat URI to its provider-owned SDK id, model/side-chat data, and versioned storage routing receipt. It deliberately does **not** retain AH membership: AH supplies the owning session and persistence/config resource transiently on every operation (`IAgentChatContext`).
 - `IClaudeChatBacking` is the source of truth for both live and released chats: releasing a chat drops its `_chatEntriesBySdkId` leaf but keeps the backing data so a later send can cold-resume the corresponding `ClaudeAgentSession`.
 
 Every chat operation resolves exactly one backing and routes to exactly one live leaf; there is no default-vs-additional branch and no cascade between chats of the same session. An additional chat's send after restart resumes only that chat's `ClaudeAgentSession`. Capabilities remain `multipleChats: { fork: true }`.
 
-Each additional chat is backed by a fresh top-level SDK session (`sdkSessionId = generateUuid()`) minted in the same global Claude project store that `listSessions` enumerates. `_createChat` therefore returns `backingSession: AgentSession.uri(this.id, sdkSessionId)` so the orchestrator can suppress that backing from the top-level session list (invariant I7); without it the additional chat would leak as a phantom session. The SDK exposes no delete-chat RPC, so `disposeChat` leaves the backing transcript on disk — the orchestrator-owned catalog simply drops the entry so it is never resumed again. (Claude writes no legacy `claude.chats` blob and has no legacy migration: Claude multi-chat shipped only with the orchestrator-owned catalog, so there is nothing to drain. Copilot keeps its own `copilot.chats` migration because `copilot.chats` predates the catalog.)
+Each additional chat is backed by a fresh top-level SDK session (`sdkSessionId = generateUuid()`). `_createChat` returns `backingSession: AgentSession.uri(this.id, sdkSessionId)` so the orchestrator can mark it internal and suppress a stale registry row (invariant I7). `deleteChat` waits for the live subprocess to exit, calls the SDK's `deleteSession`, and drops the receipt only after success; cold delete decodes the receipt without materializing. The versioned `ClaudeSessionStore` exists behind a dark launch, but pinned SDK 0.3.247 cannot combine it with file checkpointing and treats it as a fallible local-first mirror, so production isolation is not yet switched on.
 
 
 ### Copilot (`node/copilot/copilotAgent.ts`)
@@ -494,6 +742,18 @@ explicitly bound to the concrete chat URI AH supplies:
 - Initializing `chats.createChat` binds a thread to the exact host-supplied chat URI at provisioning time (including restored/forked threads); `materializeChat` re-attaches any chat's backing thread on restore.
 - A cold `getChatMetadata` read caches the backing thread's summary, timestamps, and working directories on the live runtime. Later metadata reads return those fields from memory (the app-server may be blocked on a dynamic tool call), so hydrating a runtime must never erase an already-listed session title.
 
+Codex has two explicit backing generations. New sessions use the primary Fumie
+connection with `CODEX_HOME=CODEX_SQLITE_HOME=$FUMIE_HOME/providers/codex` and
+write a versioned receipt naming `storage: fumie`. Pre-isolation, unversioned
+receipts use a separate native compatibility connection whose rollout and
+SQLite roots both resolve to the configured native home (normally `~/.codex`).
+Every thread operation routes from the retained receipt/store identity; there
+is no cross-store fallback, history scan, or automatic migration. Only the
+effective global `AGENTS.override.md` or `AGENTS.md` is linked into the isolated
+home. Auth, config, databases, rollouts, locks, plugins, hooks, memories, caches,
+and worktrees remain independently owned; user and workspace skills are found
+through their normal `~/.agents/skills` and workspace discovery paths.
+
 An additional chat is backed by a **fresh top-level thread minted eagerly** in
 `chats.createChat` (via `thread/start` or `thread/fork` at the
 requested turn, reusing `_forkSession`). For these internal peer backings only,
@@ -503,16 +763,102 @@ peer-chat-backing marker a stable `codex:/<threadId>` database across restart.
 `_createChat`/`fork` therefore return
 `backingSession: AgentSession.uri(this.id, threadId)` so the orchestrator
 suppresses that backing from the top-level session list (invariant I7), plus an
-opaque `providerData` blob (the backing thread id + model) that `materializeChat`
-decodes on restore. The additional chat inherits the parent session's working
-directory, model, and permissions. Exact disposal/release affects only the
-addressed chat's own thread — there is no cascade between chats of the same
+opaque `providerData` blob (receipt version + store + backing/thread ids + model)
+that `materializeChat` decodes on restore. The additional chat inherits the parent session's working
+directory, model, and permissions. Exact `deleteChat` calls `thread/delete`;
+`releaseChat` calls only `thread/unsubscribe`. Both affect only the addressed
+chat's own thread — there is no cascade between chats of the same
 session. The persisted `codex.threadId`, `codex.cwd`, and `codex.model` keys and
 app-server protocol are unchanged, and Codex still never recognizes or derives a
 default-chat URI. The orchestrator registry contains the parent AH session, not
-these chat backing URIs; provider-owned discovery pushes external chats through
-`onDidDiscoverChats`. Capabilities are `multipleChats: { fork: true }`.
+these chat backing URIs; `listLegacyChats` is only an explicit-restore
+compatibility fallback and never seeds top-level membership. Capabilities are
+`multipleChats: { fork: true }`.
 
+
+### 6a. Model catalog and request routing (BYOK)
+
+Every model an agent-host harness offers beyond its own subscription catalog
+comes from one place: the renderer's BYOK language-model providers, reached over
+the bridge. There is no gateway URL and no gateway credential anywhere in
+`node/**` — a harness that needed one would be re-introducing a second source of
+truth for the same models.
+
+Ambient model-provider environment variables are not a second compatibility
+path. Both Agent Host entry points scrub them before any provider loads, and
+every CLI environment builder repeats the filtering. Official native Claude is
+published only after `accountInfo()` confirms a first-party login with settings
+sources disabled; env/API-helper/gateway setups belong in the renderer Provider
+catalog instead.
+
+**Listing.** `IByokLmBridgeRegistry.getModels()` returns the serving window's
+whole BYOK catalog. Each harness filters only on the provider-owned
+`supportedHarnesses` declaration and projects the rows verbatim: id =
+`getByokLmAgentModelId(m)` (`<vendor>/<provider-local id>`), name and metadata as
+published, `_meta` carrying `createAgentModelByokMeta(m.modelIdentifier, m.hidden)`
+so the picker can honour the model's visibility toggle. **Filter only** — nothing
+here renames, re-groups or dedupes; those are the provider's.
+
+The catalog includes rows the serving window has hidden in "Manage Models",
+carried as `IByokLmModelInfo.hidden` rather than dropped: a client that reaches
+the catalog only through the host has no other account of that state, and cannot
+un-hide a row it was never told about. Harness model lists keep the hidden rows
+and pass the flag on; **anything that offers a model for selection** — the proxy
+`/models` listings, a session's provider config, a harness resolving a model spec
+— narrows the catalog with `visibleByokLmModels()` first.
+
+Provider capability metadata also owns model configuration. In particular,
+`supportedReasoningEfforts` / `defaultReasoningEffort` cross the bridge into
+the harness model's `thinkingLevel` schema; the selected value then follows the
+harness-native runtime path (Codex turn effort, Claude `output_config.effort`,
+or Kimi's native thinking setter). Never infer an effort picker from the model
+name in a consumer.
+
+**Running a turn.** `INativeModelProviderProxyService` binds one loopback
+listener for native harnesses. Every runtime sends its complete bridge model id;
+the proxy resolves the owning provider group and secret through the renderer,
+rewrites only `body.model` to the provider-local id, and streams the native wire
+unchanged. There is no Messages/Chat Completions translation layer:
+
+| harness         | wire               | where it is configured                                              |
+|-----------------|--------------------|---------------------------------------------------------------------|
+| Copilot CLI     | `responses`        | upstream BYOK LM proxy (`resolveByokSessionConfig`)                    |
+| Codex           | `responses`        | spawn-time `model_providers.fumie-provider`                            |
+| Claude          | `messages`         | CLI subprocess env, `byok` transport (`buildOptions`)                  |
+| Kimi / DeepSeek | `chat-completions` | in-process SDK config / credential service                              |
+
+The request body's `model` is always the **provider-local** half of the id; the
+vendor is in the path.
+
+`customendpoint` resolves its configured URL/key and declared wire.
+`ollama` resolves its configured local URL, sends no upstream credential, and
+passes Responses, Messages, or Chat Completions through unchanged. Current
+Ollama exposes all three wires, so its discovered models declare compatibility
+with Codex, Claude, Kimi, and DeepSeek. Do not add a consumer-side vendor
+allowlist; `supportedHarnesses` is the authority.
+
+**Handle lifetime.** The handle is refcounted and rebinds on a new port/nonce
+after the last release, so it must outlive every runtime it was handed to: the
+Codex handle is owned by the app-server connection, Claude's by the agent (freed
+in `dispose`, after the session wrappers), Kimi's and DeepSeek's by their SDK
+service (freed in `close`, after the harness). See `IByokLmProxyHandle`.
+
+**Scope.** The remote agent host wires `NullByokLmProxyService` /
+`NullByokLmBridgeRegistry` (no extension host runs beside it), so BYOK rows are
+simply absent there; a harness with no models surfaces as "no models available"
+rather than falling back to anything.
+
+**Local initialization order.** The renderer's first bridge snapshot waits for
+the language-model configuration file, installed-extension registration, and
+initial resolution of every configured provider. The local utility-process host
+registers BYOK-only harnesses (Kimi, DeepSeek, and Pi) only after that first
+authoritative snapshot reaches `ByokLmBridgeRegistry`. Their session types can
+therefore never be published from a transient startup-empty catalog. There is no
+timer or UI-side readiness guess. Every local renderer initialize/reconnect
+handshake also waits for that renderer connection's first snapshot before taking
+its root-state snapshot, so a window reload cannot observe the catalog-empty gap
+created while its previous renderer disconnects. Remote/child hosts without a
+renderer bridge keep their immediate registration behavior.
 
 ---
 
@@ -528,12 +874,14 @@ pointer.
 
 ### The seam
 
-- **Create.** `AgentService._createProviderSession` mints the AH session URI,
-  derives its initial chat URI, resolves complete chat options, and calls
+- **Create.** `AgentService.createSession` mints or validates and reserves the
+  AH session URI before `_createProviderSession` derives its initial chat URI,
+  resolves complete chat options, and calls
   `chats.createChat`, which
   provisions and binds that chat in one provider call for fresh, fork, and
-  import creation. The result preserves provisional /
-  `onDidMaterializeChat` / deferred-`sessionAdded` semantics.
+  import creation. Provisional creation registers and emits `sessionAdded`
+  immediately; `onDidMaterializeChat` commits the backing receipt and required
+  restore facts before readiness.
 - **Fork a session.** The AHP request identifies a source session and turn. The
   protocol adapter derives that session's exact default-chat URI and
   `IAgentCreateSessionConfig.fork.chat` is required at the provider boundary.
@@ -542,10 +890,12 @@ pointer.
 - **Add a chat.** `AgentService.createChat` also dispatches to `chats.createChat`,
   supplying the owning session's resolved roots, project, config, and optional
   fork/side-chat source so the agent never reads them back from another chat.
-- **Dispose/release.** `AgentService` calls `chats.disposeChat` for every chat,
-  peers first and the initial chat last. Providers release shared configuration
-  resources when their final exact-chat reference disappears. Idle eviction
-  calls `chats.releaseChat`, which remains non-destructive.
+- **Delete/release.** `AgentService` snapshots exact live/persisted receipts in
+  `SessionLifecycleStore` and calls `chats.deleteChat` without materializing cold
+  targets, peers first and the initial chat last. Per-target completion is
+  durable; cleanup failure leaves the intent retryable, and final catalog
+  tombstone/unregister/intent removal is one transaction. Idle eviction calls
+  `chats.releaseChat`, which remains non-destructive.
 - **Config.** Live provider runtimes that react to session config subscribe to
   `IAgentConfigurationService.onDidSessionConfigChange` using their explicit
   config resource. `AgentSideEffects` does not enumerate chats or fan config
@@ -554,9 +904,8 @@ pointer.
   exact chat and client. Providers receive no sibling list (§8c).
 - **Enumerate.** `AgentService.listSessions` enumerates
   `AgentSessionRegistry`, asks the registered provider for that exact session's
-  metadata via `getChatMetadata`, and applies persisted and live state overlays.
-  Provider-owned code activates additive external-chat discovery;
-  `listChatsToMigrate` remains the one-time registry migration seam.
+  metadata via `getChatMetadata` when available, and applies persisted and live
+  state overlays. Provider catalogs never add or remove top-level rows.
 
 ### No provider-side default-chat derivation
 
@@ -580,17 +929,17 @@ All three harnesses use the single `createChat` operation for fresh, fork,
 import, and additional-chat provisioning. There is no bind fallback: an initial
 chat is re-attached only through `materializeChat`.
 The change is storage-preserving: existing session URIs, provider stores,
-`providerData`, and `PEER_CHATS_METADATA_KEY` formats are unchanged, and the
+`providerData`, and `SESSION_PEER_CHATS_METADATA_KEY` formats are unchanged, and the
 one-time `defaultChatProviderData` backfill for old databases is purely
-additive. Registry adoption is separate from provider-data
-migration.
+additive. Existing registry rows remain authoritative; unregistered native
+sessions are deliberately not guessed or migrated.
 
 ### Interface surface
 
-Provider-native external-chat discovery is pushed through `onDidDiscoverChats`; one-time
-registry migration is through `listChatsToMigrate`; direct metadata lookup uses
-`getChatMetadata`. Conversation history, provisioning, restoration, and teardown
-are all exact-chat-addressed.
+Direct metadata lookup uses `getChatMetadata`. `listLegacyChats` remains only as
+an explicit-restore fallback for an exact requested URI; it is never a listing
+or membership source. Conversation history, provisioning, restoration, and
+teardown are all exact-chat-addressed.
 
 ---
 
@@ -693,7 +1042,9 @@ can share one session URI), skips a no-op write, merges rather than replaces
 `IAgentHostSessionTitleSignal` (`node/agentHostSessionTitleSignal.ts`) fires
 `{ provider, session, conversationId, title }`. The provider filter and the
 `AgentSession.id` conversation-id derivation happen once, centrally, so a
-provider emitting title telemetry needs only this seam.
+provider emitting title telemetry needs only this seam. It is a telemetry sink,
+not a title producer: it reports a title Fumie already decided on, and a
+provider cannot push a title back through it (§3a).
 
 ### 8f. Session config (already centralized)
 
@@ -703,9 +1054,9 @@ resource. `AgentSideEffects` does not enumerate chats or fan config values
 through provider hooks.
 
 Both `IAgentHostPromptCache` and `IAgentHostSessionTitleSignal` are constructed
-and registered by `createAgentServiceComposition`. Consumers resolve their
-service identifiers through constructor injection; `AgentService` neither owns
-nor exposes them.
+by `AgentService`, exposed as `agentService.promptCache` /
+`agentService.sessionTitleSignal`, and registered in the `agentHostMain` /
+`agentHostServerMain` DI containers next to `IAgentHostStateManager`.
 
 ### 8g. Seam → provider read it replaces
 

@@ -9,6 +9,8 @@
 .new-chat-in-session .new-chat-widget-container,
 .new-chat-in-session .new-chat-widget-container.revealed {
 	justify-content: flex-end;
+	/* Keep the in-session follow-up at transcript width; only the empty landing card is narrowed. */
+	align-items: flex-start;
 	padding: 0;
 }
 

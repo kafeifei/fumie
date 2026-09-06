@@ -20,6 +20,7 @@ import { IProductService } from '../../product/common/productService.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { ISessionDataService } from '../common/sessionDataService.js';
 import type { IAgent } from '../common/agent.js';
+import { IAgentPluginManager } from '../common/agentPluginManager.js';
 import { createAgentHostTelemetryService } from './agentHostTelemetryService.js';
 import { AgentService, IAgentServiceOptions } from './agentService.js';
 import { createAgentServiceComposition } from './agentServiceComposition.js';
@@ -34,6 +35,8 @@ import { SessionDataService } from './sessionDataService.js';
 import { IAgentCustomizationSettingsRegistration } from '../common/agentCustomizationSettings.js';
 import { AgentHostLaunchKind } from '../common/agentHostTelemetry.js';
 import { AgentHostClientConnectionService, IAgentHostClientConnectionService } from './agentHostClientConnectionService.js';
+import type { IAgentHostDatabase } from './agentHostDatabase.js';
+import { AgentPluginManager } from './agentPluginManager.js';
 
 export interface ICreateAgentHostRuntimeOptions {
 	readonly environmentService: INativeEnvironmentService;
@@ -44,6 +47,12 @@ export interface ICreateAgentHostRuntimeOptions {
 	readonly transientProxyConfiguration: boolean;
 	readonly hostLaunchKind: AgentHostLaunchKind;
 	readonly providerConfigurations: readonly IAgentCustomizationSettingsRegistration[];
+	/** Optional Fumie-owned durable roots. Defaults preserve stock Code OSS paths. */
+	readonly sessionDataHome?: URI;
+	readonly rootConfigResource?: URI;
+	readonly storageResource?: URI;
+	readonly orchestratorDatabase?: IAgentHostDatabase;
+	readonly pluginBasePath?: URI;
 	/**
 	 * The utility-process host has a renderer bridge; standalone hosts use the
 	 * unavailable variant but still register the same complete service graph.
@@ -101,7 +110,11 @@ export async function createAgentHostRuntime(options: ICreateAgentHostRuntimeOpt
 		const fileService = infrastructure.add(new FileService(logService));
 		infrastructure.add(fileService.registerProvider(Schemas.file, infrastructure.add(new DiskFileSystemProvider(logService))));
 		infrastructure.add(registerPendingEditContentProvider(fileService));
-		const sessionDataService = new SessionDataService(URI.file(environmentService.userDataPath), fileService, logService);
+		if (options.sessionDataHome) {
+			await fileService.createFolder(options.sessionDataHome);
+		}
+		const userDataPath = URI.file(environmentService.userDataPath);
+		const sessionDataService = new SessionDataService(userDataPath, fileService, logService, undefined, options.sessionDataHome);
 		const services = new AgentHostServiceCollection(
 			[INativeEnvironmentService, environmentService],
 			[ILogService, logService],
@@ -111,10 +124,11 @@ export async function createAgentHostRuntime(options: ICreateAgentHostRuntimeOpt
 		);
 		services.set(IAgentHostClientConnectionService, infrastructure.add(new AgentHostClientConnectionService()));
 		const agentServiceOptions: IAgentServiceOptions = {
-			rootConfigResource: joinPath(environmentService.appSettingsHome, 'globalStorage', 'agent-host-config.json'),
+			rootConfigResource: options.rootConfigResource ?? joinPath(environmentService.appSettingsHome, 'globalStorage', 'agent-host-config.json'),
 			providerConfigurations: options.providerConfigurations,
 			hostLaunchKind: options.hostLaunchKind,
-			storageResource: joinPath(environmentService.appSettingsHome, 'globalStorage', 'agent-host-storage.json'),
+			storageResource: options.storageResource ?? joinPath(environmentService.appSettingsHome, 'globalStorage', 'agent-host-storage.json'),
+			orchestratorDatabase: options.orchestratorDatabase,
 			debugLogsEnvironment: {
 				logsHome: environmentService.logsHome,
 				tmpDir: environmentService.tmpDir,
@@ -144,6 +158,9 @@ export async function createAgentHostRuntime(options: ICreateAgentHostRuntimeOpt
 		services.set(ITelemetryService, telemetryService);
 		const byokBridgeRegistry = options.byok.kind === 'renderer' ? options.byok.bridgeRegistry : new NullByokLmBridgeRegistry();
 		services.set(IByokLmBridgeRegistry, byokBridgeRegistry);
+		if (options.pluginBasePath) {
+			services.set(IAgentPluginManager, new AgentPluginManager(userDataPath, fileService, logService, undefined, options.pluginBasePath));
+		}
 		const coreServiceIds = registerAgentHostCoreServices(services, {
 			storageResource: agentServiceOptions.storageResource,
 			fetchFn,

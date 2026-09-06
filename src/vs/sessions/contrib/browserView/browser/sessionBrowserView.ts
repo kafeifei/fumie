@@ -6,16 +6,24 @@
 import { Disposable, DisposableMap, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { URI } from '../../../../base/common/uri.js';
+import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IWorkbenchContribution } from '../../../../workbench/common/contributions.js';
 import { IBrowserViewWorkbenchService } from '../../../../workbench/contrib/browserView/common/browserView.js';
 import { BrowserEditorInput } from '../../../../workbench/contrib/browserView/common/browserEditorInput.js';
 import { IEditorService } from '../../../../workbench/services/editor/common/editorService.js';
 import { IEditorGroupsService } from '../../../../workbench/services/editor/common/editorGroupsService.js';
+import { isAgentsEmbeddedBrowserEditor, isAgentsEmbeddedBrowserResource } from '../../../common/agentsEmbeddedBrowser.js';
 import { ISessionsManagementService } from '../../../services/sessions/common/sessionsManagement.js';
 import { ISessionsService } from '../../../services/sessions/browser/sessionsService.js';
 import { ISession } from '../../../services/sessions/common/session.js';
 import { runOnChange } from '../../../../base/common/observable.js';
 
+/**
+ * Agents-window policy for the integrated browser: never embed a browser
+ * editor (or Simple Browser webview) in the main editor area. Agent tools
+ * may still create browser-view models and emit transcript cards; this
+ * controller only refuses to surface them as chrome.
+ */
 export class SessionBrowserViewController extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'workbench.contrib.sessionBrowserViewController';
@@ -32,26 +40,54 @@ export class SessionBrowserViewController extends Disposable implements IWorkben
 		@IBrowserViewWorkbenchService private readonly _browserViewService: IBrowserViewWorkbenchService,
 		@IEditorService private readonly _editorService: IEditorService,
 		@IEditorGroupsService private readonly _editorGroupsService: IEditorGroupsService,
+		@IOpenerService openerService: IOpenerService,
 	) {
 		super();
 
-		// Catch editors opened via normal user/tool actions.
+		this._register(openerService.registerOpener({
+			open: async resource => {
+				if (isAgentsEmbeddedBrowserResource(resource)) {
+					return true;
+				}
+				return false;
+			},
+		}));
+
+		// Never auto-open a browser tab for a newly created agent browser view.
+		this._register(this._browserViewService.registerOpenHandler({
+			shouldOpenEditor: () => false,
+		}));
+
 		this._register(this._editorService.onWillOpenEditor(e => {
+			if (isAgentsEmbeddedBrowserEditor(e.editor)) {
+				this._closeEmbeddedBrowser(e.editor, e.groupId);
+			}
 			if (e.editor instanceof BrowserEditorInput) {
 				this._attachLifecycle(e.editor);
 			}
 		}));
 
-		// Catch editors restored from a working set swap — onWillOpenEditor
-		// does not fire for deserialized editors, but onDidAddGroup fires
-		// after the group (with its editors) has been created.
 		this._register(this._editorGroupsService.onDidAddGroup(group => {
 			for (const editor of group.editors) {
+				if (isAgentsEmbeddedBrowserEditor(editor)) {
+					this._closeEmbeddedBrowser(editor, group.id);
+				}
 				if (editor instanceof BrowserEditorInput) {
 					this._attachLifecycle(editor);
 				}
 			}
 		}));
+
+		for (const group of this._editorGroupsService.groups) {
+			for (const editor of group.editors) {
+				if (isAgentsEmbeddedBrowserEditor(editor)) {
+					this._closeEmbeddedBrowser(editor, group.id);
+				}
+				if (editor instanceof BrowserEditorInput) {
+					this._attachLifecycle(editor);
+				}
+			}
+		}
 
 		// Restrict the window's contextual browser views to those owned by the
 		// active session (or those with no known owning session).
@@ -124,6 +160,12 @@ export class SessionBrowserViewController extends Disposable implements IWorkben
 			return undefined;
 		}
 		return this._sessionManagementService.getSessionForChatResource(resource)?.session ?? this._sessionManagementService.getSession(resource);
+	}
+
+	private _closeEmbeddedBrowser(editor: { typeId?: string }, groupId: number): void {
+		queueMicrotask(() => {
+			void this._editorService.closeEditor({ editor: editor as BrowserEditorInput, groupId }, { preserveFocus: true });
+		});
 	}
 
 	private _attachLifecycle(input: BrowserEditorInput): void {

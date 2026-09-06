@@ -107,7 +107,7 @@ function getElevatedWarningCopy(level: ChatPermissionLevel, defaultSettingKey: s
 				detail: localize('permissions.autopilot.warning.detail', "Autopilot will auto-approve all tool calls and continue working autonomously until the task is complete. This includes terminal commands, file edits, and external tool calls. The agent will make decisions on your behalf without asking for confirmation.\n\nYou can stop the agent at any time by clicking the stop button. This applies to the current session only.\n\nTo make this the starting permission level for new sessions, change the [{0}](command:workbench.action.openSettings?%5B%22{0}%22%5D) setting.", defaultSettingKey),
 			};
 		case ChatPermissionLevel.AutoApprove:
-			levelLabel ??= localize('permissions.autoApprove', "Bypass Approvals");
+			levelLabel ??= localize('permissions.autoApprove', "Full Access");
 			return {
 				title: localize('permissions.autoApprove.warning.title', "Enable {0}?", levelLabel),
 				confirm: localize('permissions.autoApprove.warning.confirm', "Enable"),

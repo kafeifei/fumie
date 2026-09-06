@@ -79,6 +79,7 @@ export {
 	type SessionAddedParams,
 	type SessionRemovedParams,
 	type SessionSummaryChangedParams,
+	type SessionSummaryChanges,
 	type ProgressParams,
 	type AuthRequiredParams,
 } from './protocol/notifications.js';

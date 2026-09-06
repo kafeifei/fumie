@@ -50,6 +50,22 @@ suite('AgentHostLocalTurns', () => {
 		assert.deepStrictEqual((await db.getLocalTurns()).map(r => r.turnId), ['local-b']);
 	});
 
+	test('a failed awaited write propagates but does not poison the next write or reload', async () => {
+		const db = new TestSessionDatabase();
+		const data = createSessionDataService(db);
+		const registry = new AgentHostLocalTurns(data, new NullLogService());
+		const chat = 'ahp-chat://default/retry';
+		const insert = db.insertLocalTurn.bind(db);
+		const failure = new Error('temporary database failure');
+		db.insertLocalTurn = async () => { throw failure; };
+		await assert.rejects(registry.recordAndWait(session, chat, turn('failed'), undefined), error => error === failure);
+		db.insertLocalTurn = insert;
+		await registry.recordAndWait(session, chat, turn('saved'), undefined);
+		assert.deepStrictEqual((await registry.loadForChat(session, chat)).map(record => record.turnId), ['saved']);
+		const restarted = new AgentHostLocalTurns(data, new NullLogService());
+		assert.deepStrictEqual((await restarted.loadForChat(session, chat)).map(record => JSON.parse(record.payload).message.text), ['saved']);
+	});
+
 	test('load re-populates the in-memory index from the database, scoped per chat', async () => {
 		const db = new TestSessionDatabase();
 		const chatA = 'ahp-chat://default/a';

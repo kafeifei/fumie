@@ -11,6 +11,8 @@ import { Disposable, DisposableMap, DisposableStore, IDisposable, MutableDisposa
 import { ResourceMap } from '../../../../base/common/map.js';
 import { IObservable, observableValue } from '../../../../base/common/observable.js';
 import { URI } from '../../../../base/common/uri.js';
+import { localize } from '../../../../nls.js';
+import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { agentHostAuthority } from '../../../../platform/agentHost/common/agentHostUri.js';
 import { IRemoteAgentHostService } from '../../../../platform/agentHost/common/remoteAgentHostService.js';
@@ -22,14 +24,13 @@ import { IChatRequestVariableEntry } from '../../../../workbench/contrib/chat/co
 import { IPathService } from '../../../../workbench/services/path/common/pathService.js';
 import { IUriIdentityService } from '../../../../platform/uriIdentity/common/uriIdentity.js';
 import { getSessionReferenceResource } from './sessionReference.js';
-import { ICreateNewChatInSessionOptions, ICreateNewSessionOptions, IDeferredNewSessionRequestOptions, IProviderSessionType, ISendRequestOptions, ISendRequestSentEvent, ISessionsChangeEvent, ISessionsManagementService, NewSessionRequestOptions, WorkspaceNotTrustedError } from '../common/sessionsManagement.js';
+import { IArchiveSessionOptions, ICreateNewChatInSessionOptions, ICreateNewSessionOptions, IDeferredNewSessionRequestOptions, IProviderSessionType, ISendRequestOptions, ISendRequestSentEvent, ISessionsChangeEvent, ISessionsManagementService, NewSessionRequestOptions, WorkspaceNotTrustedError } from '../common/sessionsManagement.js';
 import { ISessionsProvidersChangeEvent, ISessionsProvidersService } from './sessionsProvidersService.js';
 import { IDeleteChatOptions, ISessionChangeEvent, ISessionsProvider, type SessionResourceResolveReason } from '../common/sessionsProvider.js';
-import { ChatModelSource, IChat, ISession, ISessionWorkspace, ISideChatSelection, SessionStatus, ISessionType } from '../common/session.js';
+import { ChatModelSource, IChat, ISession, ISessionWorkspace, ISideChatSelection, SessionStatus, ISessionType, sessionUncommittedChangesState } from '../common/session.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
-import { localize } from '../../../../nls.js';
 
 /** Storage key for the last session type used to create a quick chat. */
 const LAST_USED_QUICK_CHAT_SESSION_TYPE_STORAGE_KEY = 'sessions.quickChat.lastUsedSessionType';
@@ -48,10 +49,16 @@ export class SessionsManagementService extends Disposable implements ISessionsMa
 	private readonly _onDidSendRequest = this._register(new Emitter<ISendRequestSentEvent>());
 	readonly onDidSendRequest: Event<ISendRequestSentEvent> = this._onDidSendRequest.event;
 
+	private readonly _onWillArchiveSession = this._register(new Emitter<ISession>());
+	readonly onWillArchiveSession: Event<ISession> = this._onWillArchiveSession.event;
 	private readonly _onDidArchiveSession = this._register(new Emitter<ISession>());
 	readonly onDidArchiveSession: Event<ISession> = this._onDidArchiveSession.event;
 	private readonly _onDidUnarchiveSession = this._register(new Emitter<ISession>());
 	readonly onDidUnarchiveSession: Event<ISession> = this._onDidUnarchiveSession.event;
+	private readonly _onWillDeleteSession = this._register(new Emitter<ISession>());
+	readonly onWillDeleteSession: Event<ISession> = this._onWillDeleteSession.event;
+	private readonly _onDidFailSessionTeardown = this._register(new Emitter<ISession>());
+	readonly onDidFailSessionTeardown: Event<ISession> = this._onDidFailSessionTeardown.event;
 	private readonly _onDidDeleteSession = this._register(new Emitter<ISession>());
 	readonly onDidDeleteSession: Event<ISession> = this._onDidDeleteSession.event;
 	private readonly _onDidDeleteChat = this._register(new Emitter<ISession>());
@@ -106,6 +113,7 @@ export class SessionsManagementService extends Disposable implements ISessionsMa
 		@IPathService private readonly pathService: IPathService,
 		@IRemoteAgentHostService private readonly remoteAgentHostService: IRemoteAgentHostService,
 		@IWorkspaceTrustManagementService private readonly workspaceTrustManagementService: IWorkspaceTrustManagementService,
+		@IDialogService private readonly dialogService: IDialogService,
 	) {
 		super();
 
@@ -113,6 +121,19 @@ export class SessionsManagementService extends Disposable implements ISessionsMa
 		this._register(this.sessionsProvidersService.onDidChangeProviders(e => {
 			this._onProvidersChanged(e);
 			this._updateSessionTypes();
+
+			// Providers can register after the Sessions list has already taken its
+			// initial snapshot (notably the local Agent Host contribution at
+			// `AfterRestored`). A newly-registered provider may already have a
+			// hydrated session cache, and its first backend reconciliation can then
+			// be a no-op that emits no per-provider session event. Publish the
+			// provider's current contents here so every management-service consumer
+			// observes the same transition as `getSessions()`.
+			const added = e.added.flatMap(provider => provider.getSessions());
+			const removed = e.removed.flatMap(provider => provider.getSessions());
+			if (added.length > 0 || removed.length > 0) {
+				this._onDidChangeSessions.fire({ added, removed, changed: [] });
+			}
 		}));
 		this._subscribeToProviders(this.sessionsProvidersService.getProviders());
 		this._sessionTypes = this._collectSessionTypes();
@@ -1099,8 +1120,33 @@ export class SessionsManagementService extends Disposable implements ISessionsMa
 		}
 	}
 
-	async archiveSession(session: ISession): Promise<void> {
-		await this._getProvider(session)?.archiveSession(session.sessionId);
+	async archiveSession(session: ISession, options?: IArchiveSessionOptions): Promise<void> {
+		const hasChanges = sessionUncommittedChangesState(session, undefined);
+		const preserveChanges = hasChanges !== false;
+		if (!options?.userConfirmed && preserveChanges) {
+			const confirmation = await this.dialogService.confirm({
+				message: hasChanges === true
+					? localize('archiveSession.confirmDirty', "Archive '{0}' with uncommitted changes?", session.title.get())
+					: localize('archiveSession.confirm', "Archive '{0}'?", session.title.get()),
+				detail: hasChanges === true
+					? localize('archiveSession.confirmDirtyDetail', "This session has uncommitted changes. Confirm that they should be preserved with the session before its local workspace is reclaimed.")
+					: localize('archiveSession.confirmDetail', "You can restore this session later if needed from the sessions view."),
+				primaryButton: localize('archiveSession.confirmButton', "Archive"),
+			});
+			if (!confirmation.confirmed) {
+				return;
+			}
+		}
+		this._onWillArchiveSession.fire(session);
+		try {
+			await this._getProvider(session)?.archiveSession(
+				session.sessionId,
+				preserveChanges ? { preserveChanges: true } : undefined,
+			);
+		} catch (error) {
+			this._onDidFailSessionTeardown.fire(session);
+			throw error;
+		}
 		this._onDidArchiveSession.fire(session);
 	}
 
@@ -1126,11 +1172,21 @@ export class SessionsManagementService extends Disposable implements ISessionsMa
 	}
 
 	async deleteSession(session: ISession): Promise<void> {
-		await this._getProvider(session)?.deleteSession(session.sessionId);
+		this._onWillDeleteSession.fire(session);
+		try {
+			await this._getProvider(session)?.deleteSession(session.sessionId);
+		} catch (error) {
+			this._onDidFailSessionTeardown.fire(session);
+			throw error;
+		}
 		this._onDidDeleteSession.fire(session);
 	}
 
 	async deleteSessions(sessions: readonly ISession[]): Promise<void> {
+		for (const session of sessions) {
+			this._onWillDeleteSession.fire(session);
+		}
+
 		const byProvider = new Map<ISessionsProvider, ISession[]>();
 		for (const session of sessions) {
 			const provider = this._getProvider(session);
@@ -1153,6 +1209,9 @@ export class SessionsManagementService extends Disposable implements ISessionsMa
 					this._onDidDeleteSession.fire(session);
 				}
 			} catch (error) {
+				for (const session of providerSessions) {
+					this._onDidFailSessionTeardown.fire(session);
+				}
 				firstError ??= error;
 			}
 		}

@@ -7,6 +7,7 @@ import { IInstantiationService, IConstructorSignature, ServicesAccessor, Branded
 import { ILifecycleService, LifecyclePhase } from '../services/lifecycle/common/lifecycle.js';
 import { Registry } from '../../platform/registry/common/platform.js';
 import { IdleDeadline, DeferredPromise, runWhenGlobalIdle } from '../../base/common/async.js';
+import { setTimeout0 } from '../../base/common/platform.js';
 import { mark } from '../../base/common/performance.js';
 import { ILogService } from '../../platform/log/common/log.js';
 import { IEnvironmentService } from '../../platform/environment/common/environment.js';
@@ -138,12 +139,42 @@ interface IWorkbenchContributionRegistration {
 	readonly ctor: IConstructorSignature<IWorkbenchContribution>;
 }
 
+/**
+ * The deadline handed to a slice that is no longer waiting for idle time. It
+ * reports nothing left, so the slice runs on its own wall-clock budget alone.
+ */
+const NO_IDLE_TIME_LEFT: IdleDeadline = Object.freeze({ didTimeout: true, timeRemaining: () => 0 });
+
 export class WorkbenchContributionsRegistry extends Disposable implements IWorkbenchContributionsRegistry {
 
 	static readonly INSTANCE = new WorkbenchContributionsRegistry();
 
 	private static readonly BLOCK_BEFORE_RESTORE_WARN_THRESHOLD = 20;
 	private static readonly BLOCK_AFTER_RESTORE_WARN_THRESHOLD = 100;
+
+	/**
+	 * How long one idle slice may keep creating contributions, even after the
+	 * browser says its idle time is spent.
+	 *
+	 * An idle callback that ran because its timeout elapsed rather than because
+	 * the window went idle reports no remaining time at all, so a deadline
+	 * check on its own lets exactly one contribution through per slice. One
+	 * frame's worth of work is the same budget the `requestIdleCallback`
+	 * fallback in `async.ts` hands out, and it is small enough not to be felt.
+	 */
+	private static readonly IDLE_SLICE_BUDGET = 15;
+
+	/**
+	 * How long a phase may spend waiting for idle time before it stops asking
+	 * for it.
+	 *
+	 * Yielding for idle time that never arrives is the difference between a
+	 * workbench that finishes starting and one that does not: whatever sits at
+	 * the end of the queue is never constructed, and on the sessions shell that
+	 * is the wiring between a connected agent host and the session list — the
+	 * phone renders, holds a healthy connection, and shows nothing.
+	 */
+	private static readonly IDLE_PHASE_BUDGET = 10000;
 
 	private instantiationService: IInstantiationService | undefined;
 	private lifecycleService: ILifecycleService | undefined;
@@ -342,14 +373,31 @@ export class WorkbenchContributionsRegistry extends Disposable implements IWorkb
 
 		let i = 0;
 		const forcedTimeout = phase === LifecyclePhase.Eventually ? 3000 : 500;
+		const phaseDeadline = Date.now() + WorkbenchContributionsRegistry.IDLE_PHASE_BUDGET;
+
+		// A window that stays busy through its whole startup — a phone painting
+		// the sessions shell over a slow link is the case that found this —
+		// hands out idle callbacks late and with nothing left on the clock, and
+		// the queue then drains at roughly one contribution per callback. Give
+		// every slice a small budget of its own, and once the phase has spent
+		// long enough hoping for idle time, stop hoping and finish on ordinary
+		// tasks instead.
+		const scheduleNext = () => {
+			if (Date.now() < phaseDeadline) {
+				runWhenGlobalIdle(instantiateSome, forcedTimeout);
+			} else {
+				setTimeout0(() => instantiateSome(NO_IDLE_TIME_LEFT));
+			}
+		};
 
 		const instantiateSome = (idle: IdleDeadline) => {
+			const sliceDeadline = Date.now() + WorkbenchContributionsRegistry.IDLE_SLICE_BUDGET;
 			while (i < contributions.length) {
 				const contribution = contributions[i++];
 				this.safeCreateContribution(instantiationService, logService, environmentService, contribution, phase);
-				if (idle.timeRemaining() < 1) {
+				if (idle.timeRemaining() < 1 && Date.now() >= sliceDeadline) {
 					// time is up -> reschedule
-					runWhenGlobalIdle(instantiateSome, forcedTimeout);
+					scheduleNext();
 					break;
 				}
 			}
@@ -363,7 +411,7 @@ export class WorkbenchContributionsRegistry extends Disposable implements IWorkb
 			}
 		};
 
-		runWhenGlobalIdle(instantiateSome, forcedTimeout);
+		scheduleNext();
 	}
 
 	private safeCreateContribution(instantiationService: IInstantiationService, logService: ILogService, environmentService: IEnvironmentService, contribution: IWorkbenchContributionRegistration, phase: LifecyclePhase): void {

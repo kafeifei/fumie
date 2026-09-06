@@ -5,9 +5,11 @@
 
 import './media/sessionChangesEditor.css';
 import { $, append, Dimension } from '../../../../base/browser/dom.js';
-import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { timeout } from '../../../../base/common/async.js';
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { isCancellationError, onUnexpectedError } from '../../../../base/common/errors.js';
 import { Disposable, DisposableStore, IDisposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
-import { autorun, derivedObservableWithCache, IObservable, observableValue } from '../../../../base/common/observable.js';
+import { autorun, derivedObservableWithCache, IObservable, observableValue, waitForState } from '../../../../base/common/observable.js';
 import { Range } from '../../../../editor/common/core/range.js';
 import { URI } from '../../../../base/common/uri.js';
 import { IDiffEditor } from '../../../../editor/common/editorCommon.js';
@@ -31,7 +33,7 @@ import { IEditorGroup, IEditorGroupsService } from '../../../../workbench/servic
 import { IEditorService } from '../../../../workbench/services/editor/common/editorService.js';
 import { MultiDiffEditorWidget } from '../../../../editor/browser/widget/multiDiffEditor/multiDiffEditorWidget.js';
 import { MultiDiffEditorViewModel } from '../../../../editor/browser/widget/multiDiffEditor/multiDiffEditorViewModel.js';
-import { IMultiDiffEditorOptions, IMultiDiffEditorViewState } from '../../../../editor/browser/widget/multiDiffEditor/multiDiffEditorWidgetImpl.js';
+import { IMultiDiffEditorOptions, IMultiDiffEditorOptionsViewState, IMultiDiffEditorViewState } from '../../../../editor/browser/widget/multiDiffEditor/multiDiffEditorWidgetImpl.js';
 import { MultiDiffEditorLogger } from '../../../../editor/browser/widget/multiDiffEditor/multiDiffEditorLogging.js';
 import { IDiffEditorOptions } from '../../../../editor/common/config/editorOptions.js';
 import { ITextResourceConfigurationService } from '../../../../editor/common/services/textResourceConfiguration.js';
@@ -56,6 +58,7 @@ import { getChangesEditorFileStats } from './changesEditorLabels.js';
 import { IDiffEditorOptionsService } from '../../editor/common/diffEditorOptionsService.js';
 
 const HEADER_HEIGHT = 35;
+export const SESSION_CHANGES_MODEL_RESOLVE_DELAY_MS = 200;
 
 /**
  * Optimizes the embedded diffs for the narrow Agents window panel while
@@ -167,6 +170,10 @@ export class SessionChangesEditor extends AbstractEditorWithViewState<IMultiDiff
 	private widget: MultiDiffEditorWidget | undefined;
 	private viewModel: MultiDiffEditorViewModel | undefined;
 	private bodyContainer: HTMLElement | undefined;
+	private _modelGeneration = 0;
+	private _pendingReveal: { readonly input: SessionChangesEditorInput; readonly data: NonNullable<IMultiDiffEditorOptionsViewState['revealData']> } | undefined;
+	private readonly _pendingRevealWait = this._register(new MutableDisposable<DisposableStore>());
+	private readonly _restoreVisibleInputWait = this._register(new MutableDisposable<DisposableStore>());
 
 	private _singlePane = false;
 	private _scopedInstantiationService: IInstantiationService | undefined;
@@ -222,6 +229,28 @@ export class SessionChangesEditor extends AbstractEditorWithViewState<IMultiDiff
 		);
 
 		this._logger = this._register(new MultiDiffEditorLogger(logService));
+
+		// The side pane can appear while this editor is already the group's active
+		// input, which leaves `setInput` gated off and no `setEditorVisible` to
+		// follow. Resolve the changeset once the pane it renders into is on screen.
+		this._register(this.layoutService.onDidChangePartVisibility(() => {
+			if (this._canResolveModels()) {
+				void this._restoreVisibleInput();
+			}
+		}));
+	}
+
+	/**
+	 * Whether this editor may build the changeset's text models. The editor pane
+	 * reports itself visible as soon as it is its group's active input, which in
+	 * the Agents window happens while the side pane is still collapsed — the
+	 * docked Changes tab is opened on every session switch. Resolving there costs
+	 * a `resourceRead` plus a `stat` per changed file over the Agent Host
+	 * connection for diffs that have nowhere to render, which is cheap on a local
+	 * socket and very slow over a Dev Tunnel.
+	 */
+	private _canResolveModels(): boolean {
+		return this.isVisible() && this.layoutService.isEditorPaneVisible();
 	}
 
 	protected override createEditor(parent: HTMLElement): void {
@@ -296,11 +325,33 @@ export class SessionChangesEditor extends AbstractEditorWithViewState<IMultiDiff
 	}
 
 	override async setInput(input: SessionChangesEditorInput, options: IMultiDiffEditorOptions | undefined, context: IEditorOpenContext, token: CancellationToken): Promise<void> {
+		const generation = ++this._modelGeneration;
+		this._restoreVisibleInputWait.clear();
+		this._pendingRevealWait.clear();
+		this._pendingReveal = options?.viewState?.revealData ? { input, data: options.viewState.revealData } : undefined;
 		await super.setInput(input, options, context, token);
 		const sessionResource = this.sessionChangesService.getSessionResource(input.multiDiffSource);
 		this._inputSessionResource.set(sessionResource, undefined);
-		const viewModel = await input.getViewModel();
-		if (token.isCancellationRequested) {
+		if (!this._canResolveModels()) {
+			return;
+		}
+		let viewModel: MultiDiffEditorViewModel;
+		try {
+			// A session row is often only transiently active while the user moves
+			// through the list. Give it a short stability window before creating
+			// thousands of diff text models; superseded generations never start.
+			await timeout(SESSION_CHANGES_MODEL_RESOLVE_DELAY_MS, token);
+			if (generation !== this._modelGeneration || this.input !== input || !this._canResolveModels()) {
+				return;
+			}
+			viewModel = await input.getViewModel({ waitForDiffOr1s: false });
+		} catch (error) {
+			if (token.isCancellationRequested || generation !== this._modelGeneration || this.input !== input || !this._canResolveModels() || isCancellationError(error)) {
+				return;
+			}
+			throw error;
+		}
+		if (token.isCancellationRequested || generation !== this._modelGeneration || this.input !== input || !this._canResolveModels()) {
 			return;
 		}
 		this.viewModel = viewModel;
@@ -315,7 +366,7 @@ export class SessionChangesEditor extends AbstractEditorWithViewState<IMultiDiff
 			hasPersistedViewState: !!viewState,
 		});
 		this.widget?.setViewModel(viewModel, { preserveFocus: options?.preserveFocus, viewState });
-		this._applyOptions(options);
+		this._startPendingReveal(input, viewModel, generation);
 	}
 
 	protected override setEditorVisible(visible: boolean): void {
@@ -327,8 +378,61 @@ export class SessionChangesEditor extends AbstractEditorWithViewState<IMultiDiff
 			this._pendingFocus.clear();
 			this._logger.log('changes editor hidden, saving view state');
 			this.saveCurrentEditorViewState();
+			this._releaseResolvedInput();
 		}
 		super.setEditorVisible(visible);
+		if (visible) {
+			void this._restoreVisibleInput();
+		}
+	}
+
+	private _releaseResolvedInput(): void {
+		this._modelGeneration++;
+		this._restoreVisibleInputWait.clear();
+		this._pendingRevealWait.clear();
+		this.viewModel = undefined;
+		this.widget?.setViewModel(undefined);
+		if (this.input instanceof SessionChangesEditorInput) {
+			this.input.clear();
+		}
+	}
+
+	private async _restoreVisibleInput(): Promise<void> {
+		const input = this.input;
+		if (!(input instanceof SessionChangesEditorInput) || this.viewModel || !this._canResolveModels()) {
+			return;
+		}
+
+		const generation = ++this._modelGeneration;
+		const restoreStore = new DisposableStore();
+		const cancellation = new CancellationTokenSource();
+		restoreStore.add({ dispose: () => cancellation.dispose(true) });
+		this._restoreVisibleInputWait.value = restoreStore;
+		try {
+			await timeout(SESSION_CHANGES_MODEL_RESOLVE_DELAY_MS, cancellation.token);
+			if (generation !== this._modelGeneration || this.input !== input || !this._canResolveModels()) {
+				return;
+			}
+			const viewModel = await input.getViewModel({ waitForDiffOr1s: false });
+			if (generation !== this._modelGeneration || this.input !== input || !this._canResolveModels()) {
+				return;
+			}
+			this.viewModel = viewModel;
+			const viewState = this.loadEditorViewState(input);
+			this._logger.log('changes editor restored after becoming visible', {
+				hasPersistedViewState: !!viewState,
+			});
+			this.widget?.setViewModel(viewModel, { preserveFocus: true, viewState });
+			this._startPendingReveal(input, viewModel, generation);
+		} catch (error) {
+			if (!cancellation.token.isCancellationRequested && generation === this._modelGeneration && !isCancellationError(error)) {
+				onUnexpectedError(error);
+			}
+		} finally {
+			if (this._restoreVisibleInputWait.value === restoreStore) {
+				this._restoreVisibleInputWait.clear();
+			}
+		}
 	}
 
 	protected override computeEditorViewState(_resource: URI): IMultiDiffEditorViewState | undefined {
@@ -384,22 +488,62 @@ export class SessionChangesEditor extends AbstractEditorWithViewState<IMultiDiff
 
 
 	override setOptions(options: IMultiDiffEditorOptions | undefined): void {
-		this._applyOptions(options);
-	}
-
-	private _applyOptions(options: IMultiDiffEditorOptions | undefined): void {
 		const revealData = options?.viewState?.revealData;
-		if (!revealData) {
+		const input = this.input;
+		if (!revealData || !(input instanceof SessionChangesEditorInput)) {
 			return;
 		}
-		this.widget?.reveal(revealData.resource, {
-			range: revealData.range ? Range.lift(revealData.range) : undefined,
-			highlight: true,
-		});
+		this._pendingReveal = { input, data: revealData };
+		if (this.viewModel) {
+			this._startPendingReveal(input, this.viewModel, this._modelGeneration);
+		}
+	}
+
+	private _startPendingReveal(input: SessionChangesEditorInput, viewModel: MultiDiffEditorViewModel, generation: number): void {
+		const pending = this._pendingReveal;
+		if (!pending || pending.input !== input) {
+			return;
+		}
+
+		const waitStore = new DisposableStore();
+		const cancellation = new CancellationTokenSource();
+		waitStore.add({ dispose: () => cancellation.dispose(true) });
+		this._pendingRevealWait.value = waitStore;
+		void (async () => {
+			try {
+				await waitForState(viewModel.items, items => items.some(item =>
+					item.originalUri?.toString() === pending.data.resource.original?.toString()
+					&& item.modifiedUri?.toString() === pending.data.resource.modified?.toString()
+				), undefined, cancellation.token);
+				if (generation !== this._modelGeneration || this.input !== input || this.viewModel !== viewModel || this._pendingReveal !== pending || !this.isVisible()) {
+					return;
+				}
+				const widget = this.widget;
+				if (!widget) {
+					return;
+				}
+				widget.reveal(pending.data.resource, {
+					range: pending.data.range ? Range.lift(pending.data.range) : undefined,
+					highlight: true,
+				});
+				this._pendingReveal = undefined;
+				if (this._pendingRevealWait.value === waitStore) {
+					this._pendingRevealWait.clear();
+				}
+			} catch (error) {
+				if (!isCancellationError(error)) {
+					onUnexpectedError(error);
+				}
+			}
+		})();
 	}
 
 	override clearInput(): void {
 		const input = this.input;
+		this._modelGeneration++;
+		this._restoreVisibleInputWait.clear();
+		this._pendingReveal = undefined;
+		this._pendingRevealWait.clear();
 		this._pendingFocus.clear();
 		this._logger.log('changes editor clear input');
 		// Let the base capture the current view state (it reads the widget) before the
@@ -410,6 +554,13 @@ export class SessionChangesEditor extends AbstractEditorWithViewState<IMultiDiff
 		if (input instanceof SessionChangesEditorInput) {
 			input.clear();
 		}
+	}
+
+	override dispose(): void {
+		this._pendingReveal = undefined;
+		this._pendingFocus.clear();
+		this._releaseResolvedInput();
+		super.dispose();
 	}
 
 	override focus(): void {
@@ -468,14 +619,14 @@ class ChangesetReviewActionViewItem extends CheckboxActionViewItem {
 		container.classList.add('changeset-review-action');
 	}
 
-	override updateChecked(): void {
+	protected override updateChecked(): void {
 		super.updateChecked();
 
 		this.updateAriaLabel();
 		this.updateTooltip();
 	}
 
-	override getTooltip(): string {
+	protected override getTooltip(): string {
 		return this.action.checked
 			? localize('changeset.viewed.tooltip', "Mark as Not Viewed")
 			: localize('changeset.notViewed.tooltip', "Mark as Viewed");

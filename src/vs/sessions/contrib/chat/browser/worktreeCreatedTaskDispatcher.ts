@@ -35,8 +35,9 @@ export const AGENT_HOST_RUN_WORKTREE_CREATED_TASKS_SETTING = 'chat.agentHost.run
  * disposed when the session is marked done (archived) or removed, so the
  * long-running setup/build processes don't leak. See #321021.
  *
- * We deliberately ignore sessions that predate this contribution so restored
- * sessions don't re-run setup tasks when the agents window opens.
+ * We deliberately ignore sessions that predate this contribution so opening
+ * the agents window does not re-run setup. A successful explicit unarchive
+ * re-arms the restored session for one new dispatch.
  */
 export class WorktreeCreatedTaskDispatcher extends Disposable implements IWorkbenchContribution {
 
@@ -55,6 +56,10 @@ export class WorktreeCreatedTaskDispatcher extends Disposable implements IWorkbe
 		super();
 
 		this._register(this._sessionsManagementService.onDidStartSession(session => this._trackSession(session)));
+		this._register(this._sessionsManagementService.onWillArchiveSession(session => this._stopTrackingSession(session)));
+		this._register(this._sessionsManagementService.onWillDeleteSession(session => this._stopTrackingSession(session)));
+		this._register(this._sessionsManagementService.onDidFailSessionTeardown(session => this._trackSession(session)));
+		this._register(this._sessionsManagementService.onDidUnarchiveSession(session => this._trackSession(session)));
 		this._register(this._sessionsManagementService.onDidChangeSessions(e => this._onDidRemoveSessions(e.removed)));
 	}
 
@@ -62,6 +67,10 @@ export class WorktreeCreatedTaskDispatcher extends Disposable implements IWorkbe
 		for (const session of removed) {
 			this._sessionDisposables.deleteAndDispose(session.sessionId);
 		}
+	}
+
+	private _stopTrackingSession(session: ISession): void {
+		this._sessionDisposables.deleteAndDispose(session.sessionId);
 	}
 
 	private _trackSession(session: ISession): void {
@@ -82,6 +91,9 @@ export class WorktreeCreatedTaskDispatcher extends Disposable implements IWorkbe
 			if (session.loading.read(reader)) {
 				return;
 			}
+			if (session.isArchived.read(reader)) {
+				return;
+			}
 			if (session.status.read(reader) === SessionStatus.Untitled) {
 				return;
 			}
@@ -89,7 +101,7 @@ export class WorktreeCreatedTaskDispatcher extends Disposable implements IWorkbe
 				return;
 			}
 			reader.dispose();
-			this._dispatchWorktreeCreatedTasks(session, taskHandles);
+			this._dispatchWorktreeCreatedTasks(session, store, taskHandles);
 		});
 
 		store.add(autorun(reader => {
@@ -99,7 +111,7 @@ export class WorktreeCreatedTaskDispatcher extends Disposable implements IWorkbe
 		}));
 	}
 
-	private async _dispatchWorktreeCreatedTasks(session: ISession, taskHandles: DisposableStore): Promise<void> {
+	private async _dispatchWorktreeCreatedTasks(session: ISession, sessionStore: DisposableStore, taskHandles: DisposableStore): Promise<void> {
 		if (isAgentHostProviderId(session.providerId) && !this._configurationService.getValue<boolean>(AGENT_HOST_RUN_WORKTREE_CREATED_TASKS_SETTING)) {
 			this._logService.trace(`${LOG_PREFIX} Skipping worktreeCreated tasks for agent host session '${session.sessionId}' — '${AGENT_HOST_RUN_WORKTREE_CREATED_TASKS_SETTING}' is disabled.`);
 			return;
@@ -112,8 +124,14 @@ export class WorktreeCreatedTaskDispatcher extends Disposable implements IWorkbe
 			this._logService.warn(`${LOG_PREFIX} Failed to read tasks for session '${session.sessionId}': ${err}`);
 			return;
 		}
+		if (sessionStore.isDisposed) {
+			return;
+		}
 
 		for (const { task } of tasks) {
+			if (sessionStore.isDisposed) {
+				return;
+			}
 			if (task.runOptions?.runOn !== 'worktreeCreated') {
 				continue;
 			}
@@ -121,7 +139,7 @@ export class WorktreeCreatedTaskDispatcher extends Disposable implements IWorkbe
 			try {
 				const handle = await this._sessionsTasksService.runTask(task, session);
 				if (handle) {
-					if (session.isArchived.get()) {
+					if (sessionStore.isDisposed || session.isArchived.get()) {
 						handle.dispose();
 					} else {
 						taskHandles.add(handle);

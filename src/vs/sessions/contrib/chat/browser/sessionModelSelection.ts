@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
 import { LRUCache } from '../../../../base/common/map.js';
 import { autorun, IObservable, observableValue } from '../../../../base/common/observable.js';
@@ -12,16 +13,22 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IStorageService, StorageScope } from '../../../../platform/storage/common/storage.js';
 import { ChatInputModelSelectionController, IChatInputModelSelectionRuntime } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputModelSelectionController.js';
 import { ChatModelSelectionDiagnostics } from '../../../../workbench/contrib/chat/browser/widget/input/chatModelSelectionDiagnostics.js';
+import { isModelHiddenInPicker } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputModelUtils.js';
 import { getSelectedModelStorageKey, getStoredSelectedModel, storeSelectedModel } from '../../../../workbench/contrib/chat/common/chatSelectedModel.js';
+import { IChatSessionsService } from '../../../../workbench/contrib/chat/common/chatSessionsService.js';
 import { ChatAgentLocation, ChatConfiguration } from '../../../../workbench/contrib/chat/common/constants.js';
-import { ILanguageModelChatMetadataAndIdentifier } from '../../../../workbench/contrib/chat/common/languageModels.js';
+import { ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService } from '../../../../workbench/contrib/chat/common/languageModels.js';
 import { IntendedModelSlot } from '../../../../workbench/contrib/chat/common/model/chatModel.js';
-import { IPendingModelSelection, isInConversationModelChoice, ModelSelectionReason, RestoredModelReason } from '../../../../workbench/contrib/chat/common/modelSelection.js';
+import { getRegisteredLanguageModels, IPendingModelSelection, isInConversationModelChoice, ModelSelectionReason, resolveConfiguredModel, resolveModelIdentifier, RestoredModelReason } from '../../../../workbench/contrib/chat/common/modelSelection.js';
+import { isAgentHostProviderId } from '../../../common/agentHostSessionsProvider.js';
 import { ISessionsProvidersService } from '../../../services/sessions/browser/sessionsProvidersService.js';
 import { ChatModelSource, SessionStatus } from '../../../services/sessions/common/session.js';
 import { ISessionsProvider } from '../../../services/sessions/common/sessionsProvider.js';
-import { IActiveSession } from '../../../services/sessions/common/sessionsManagement.js';
+import { IActiveSession, IProviderSessionType, ISessionsManagementService } from '../../../services/sessions/common/sessionsManagement.js';
+import { advertisedHarnessForModel, isClaudeHarnessId, mixOfficialSubscriptionModels, persistableModelOnHarness, resolveModelOnHarness } from './sessionModelHarness.js';
+import { presentSessionPickerModel, presentSessionPickerModels } from './sessionModelPickerPresentation.js';
 import { createModelSelectionState, EMPTY_MODEL_SELECTION_STATE, INormalizedSessionModelPickerOptions, ISessionModelSelectionState, normalizeModelPickerOptions } from './sessionModelPickerState.js';
+import { IPickedSessionType, readPreferredSessionType } from './sessionTypePicker.js';
 
 /** Bounded: a long-lived window binds arbitrarily many chats, and old ones are not worth the memory. */
 const CONVERSATION_CACHE_SIZE = 50;
@@ -65,6 +72,7 @@ export const ISessionModelSelection = createDecorator<ISessionModelSelection>('s
 export interface ISessionModelSelection {
 	readonly _serviceBrand: undefined;
 	readonly state: IObservable<ISessionModelSelectionState>;
+	readonly onDidRequestSessionType: Event<IPickedSessionType>;
 	selectModel(modelIdentifier: string): boolean;
 }
 
@@ -83,6 +91,8 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 
 	private readonly _state = observableValue<ISessionModelSelectionState>(this, EMPTY_MODEL_SELECTION_STATE);
 	readonly state: IObservable<ISessionModelSelectionState> = this._state;
+	private readonly _onDidRequestSessionType = this._register(new Emitter<IPickedSessionType>());
+	readonly onDidRequestSessionType = this._onDidRequestSessionType.event;
 
 	private readonly _providerListener = this._register(new MutableDisposable());
 	private readonly _diagnostics: ChatModelSelectionDiagnostics;
@@ -105,6 +115,8 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 	private _chatIsEmpty = false;
 	/** The conversation's own model is unknown but presumed to exist: show a selection, never write it. */
 	private _displayOnly = false;
+	/** A model pick waiting for the new-session composer to replace the draft with its owning harness. */
+	private _pendingHarness: { readonly model: ILanguageModelChatMetadataAndIdentifier; readonly pick: IPickedSessionType } | undefined;
 
 	constructor(
 		private readonly _session: IObservable<IActiveSession | undefined>,
@@ -112,6 +124,9 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 		@IStorageService private readonly _storageService: IStorageService,
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
 		@ILogService logService: ILogService,
+		@ILanguageModelsService private readonly _languageModelsService?: ILanguageModelsService,
+		@ISessionsManagementService private readonly _sessionsManagementService?: ISessionsManagementService,
+		@IChatSessionsService private readonly _chatSessionsService?: IChatSessionsService,
 	) {
 		super();
 		this._diagnostics = new ChatModelSelectionDiagnostics(logService, this._storageService, () => {
@@ -146,6 +161,20 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 			}
 		}));
 		this._register(this._sessionsProvidersService.onDidChangeProviders(() => this._refresh('providers')));
+		if (this._sessionsManagementService) {
+			this._register(this._sessionsManagementService.onDidChangeSessionTypes(() => this._refresh('providers')));
+		}
+		if (this._languageModelsService) {
+			this._register(this._languageModelsService.onDidChangeModelVisibility(() => this._refresh('models')));
+			// With no session there is no provider relaying its pool, so the catalog is watched
+			// directly for the default agent's models. A session's own pool already arrives
+			// through `ISessionsProvider.onDidChangeModels`.
+			this._register(this._languageModelsService.onDidChangeLanguageModels(() => {
+				if (!this._session.get()) {
+					this._refresh('models');
+				}
+			}));
+		}
 		this._register(this._storageService.onDidChangeValue(StorageScope.PROFILE, undefined, this._store)(event => {
 			this._diagnostics.logStorageChange(event, this._state.get().currentModel?.identifier);
 		}));
@@ -155,35 +184,47 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 		const session = this._session.get();
 		const provider = session ? this._sessionsProvidersService.getProvider(session.providerId) : undefined;
 		if (!session || !provider) {
-			this._diagnostics.report('selection-rejected', {
-				requestedModel: modelIdentifier,
-				reason: !session ? 'noSession' : 'noProvider',
-			}, 'info');
-			return false;
+			return this._selectDefaultAgentModel(modelIdentifier, !session ? 'noSession' : 'noProvider');
 		}
 
 		// Fresh snapshot: the pool the picker rendered from may already be stale.
 		const snapshot = provider.getModelsSnapshot(session.sessionId);
 		this._modelTarget = snapshot.modelTarget;
-		this._models = snapshot.models;
-		const model = snapshot.models.find(model => model.identifier === modelIdentifier);
+		this._models = presentSessionPickerModels(this._catalogModelsForPicker(session.sessionType, this._chatSessionType(session), snapshot.models));
+		const model = this._models.find(model => model.identifier === modelIdentifier);
 		if (!model) {
 			this._diagnostics.report('selection-rejected', {
 				requestedModel: modelIdentifier,
 				reason: 'modelUnavailable',
-				availableModels: snapshot.models.map(model => model.identifier).join(','),
+				availableModels: this._models.map(model => model.identifier).join(','),
 			}, 'info');
 			return false;
 		}
+
+		const requestedHarness = this._requestedHarness(session, model);
+		if (requestedHarness) {
+			this._pendingHarness = { model, pick: requestedHarness };
+			this._diagnostics.report('explicit-selection', {
+				model: model.identifier,
+				requestedSessionType: requestedHarness.sessionTypeId,
+			}, 'info');
+			this._onDidRequestSessionType.fire(requestedHarness);
+			return true;
+		}
+
+		const persistModel = this._presentedModel(
+			persistableModelOnHarness(model, snapshot.models, session.sessionType, this._chatSessionType(session)),
+			this._models,
+		);
 
 		const options = normalizeModelPickerOptions(provider.getModelPickerOptions(session.sessionId));
 		const providerModelBefore = session.modelId.get();
 		const storageKey = getSelectedModelStorageKey(ChatAgentLocation.Chat, snapshot.modelTarget);
 		const conversation = this._conversation();
 		try {
-			this._controller.applySelection(model, () => {
-				provider.setModel(session.sessionId, session.activeChat.get().resource, model.identifier, ChatModelSource.Chosen);
-				storeSelectedModel(this._storageService, ChatAgentLocation.Chat, snapshot.modelTarget, model.identifier);
+			this._controller.applySelection(persistModel, () => {
+				provider.setModel(session.sessionId, session.activeChat.get().resource, persistModel.identifier, ChatModelSource.Chosen);
+				storeSelectedModel(this._storageService, ChatAgentLocation.Chat, snapshot.modelTarget, persistModel.identifier);
 			}, true, true);
 		} catch (error) {
 			this._diagnostics.report('provider-selection-failed', {
@@ -198,7 +239,7 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 		conversation.seeded = true;
 		this._publish(options, undefined);
 		this._diagnostics.report('provider-selection-applied', {
-			requestedModel: modelIdentifier,
+			requestedModel: persistModel.identifier,
 			providerModelBefore,
 			providerModelAfter: session.modelId.get(),
 			storedModelAfter: this._storageService.get(storageKey, StorageScope.PROFILE),
@@ -251,9 +292,7 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 			this._chatIsEmpty = false;
 			this._displayOnly = false;
 			// Nothing to clear: each conversation's state lives in its own record.
-			this._models = [];
-			this._modelTarget = undefined;
-			this._state.set(EMPTY_MODEL_SELECTION_STATE, undefined);
+			this._publishDefaultAgentPool();
 			return;
 		}
 
@@ -275,13 +314,23 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 		const desiredModelId = chatModelId ?? remembered;
 		const snapshot = desiredModelId === chatModelId ? baseSnapshot : provider.getModelsSnapshot(session.sessionId, desiredModelId);
 
-		this._models = snapshot.models;
+		const catalogModels = this._catalogModelsForPicker(session.sessionType, this._chatSessionType(session), snapshot.models);
+		this._models = presentSessionPickerModels(catalogModels);
 		this._modelTarget = snapshot.modelTarget;
 		const options = normalizeModelPickerOptions(provider.getModelPickerOptions(session.sessionId));
+		const catalogDesiredModelResolution = catalogModels === snapshot.models
+			? undefined
+			: resolveModelIdentifier(this._models, desiredModelId, true);
+		// A mixed-in subscription row can satisfy a desired id the provider does not publish itself.
+		// Otherwise retain the provider's pending/alias answer so the shared controller keeps its
+		// upstream late-publication semantics.
+		const desiredModelResolution = catalogDesiredModelResolution?.kind === 'available'
+			? catalogDesiredModelResolution
+			: snapshot.desiredModelResolution;
 		// The provider resolves the desired model: a host republishes it under its own identifier,
 		// so matching the raw one would miss it.
-		const resolvedDesiredModel = snapshot.desiredModelResolution.kind === 'available'
-			? snapshot.desiredModelResolution.model
+		const resolvedDesiredModel = desiredModelResolution.kind === 'available'
+			? this._presentedModel(desiredModelResolution.model, this._models)
 			: undefined;
 
 		// Bind first, so whatever the controller intends is recorded against this conversation.
@@ -295,21 +344,25 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 			// Unconditional: what spoke for the previous conversation must not outlive it.
 			this._controller.beginConversationSwitch();
 		}
+		if (this._applyPendingHarness(session, provider, snapshot.models)) {
+			this._publish(options, undefined);
+			return;
+		}
 
 		// Only a conversation that could be written to has anything to wait for. A display-only one
 		// writes nothing either way (see `_pushModelToProvider`), so waiting would blank its picker
 		// and block its composer to prevent a write that was never going to happen.
-		if (snapshot.desiredModelResolution.kind === 'pending'
+		if (desiredModelResolution.kind === 'pending'
 			&& !this._displayOnly
 			&& !this._controller.configuredDefaultToSeed(chatModelReason)) {
 			// Wait rather than push a stand-in through to the backend; re-seed once the pool settles.
 			this._conversation().seeded = false;
 			this._diagnostics.report('await-desired-model', {
 				trigger,
-				desiredModel: snapshot.desiredModelResolution.identifier,
-				availableModels: snapshot.models.map(model => model.identifier).join(','),
+				desiredModel: desiredModelResolution.identifier,
+				availableModels: this._models.map(model => model.identifier).join(','),
 			}, 'info');
-			this._publish(options, { reference: snapshot.desiredModelResolution.identifier });
+			this._publish(options, { reference: desiredModelResolution.identifier });
 			return;
 		}
 
@@ -444,6 +497,219 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 		currentModel = this._controller.currentModel.get(),
 	): void {
 		this._state.set(createModelSelectionState(this._models, options, currentModel, pendingSelection), undefined);
+	}
+
+	/** Applies a model picked on the previous draft once its owning harness has replaced that draft. */
+	private _applyPendingHarness(
+		session: IActiveSession,
+		provider: ISessionsProvider,
+		providerModels: readonly ILanguageModelChatMetadataAndIdentifier[],
+	): boolean {
+		const pending = this._pendingHarness;
+		if (!pending || !this._pendingHarnessMatches(session, pending.pick)) {
+			return false;
+		}
+
+		const resolved = resolveModelOnHarness(pending.model, providerModels);
+		const persistModel = persistableModelOnHarness(
+			resolved ?? pending.model,
+			providerModels,
+			session.sessionType,
+			this._chatSessionType(session),
+		);
+		if (!resolved && persistModel.identifier === pending.model.identifier) {
+			// An empty pool may still publish the mapped model. A resolved non-empty pool is final.
+			if (providerModels.length > 0) {
+				this._pendingHarness = undefined;
+			}
+			return false;
+		}
+
+		this._pendingHarness = undefined;
+		const presentedModel = this._presentedModel(persistModel, this._models);
+		const providerModelBefore = session.modelId.get();
+		const conversation = this._conversation();
+		this._controller.applySelection(presentedModel, () => {
+			provider.setModel(session.sessionId, session.activeChat.get().resource, persistModel.identifier, ChatModelSource.Chosen);
+			storeSelectedModel(this._storageService, ChatAgentLocation.Chat, this._modelTarget, persistModel.identifier);
+		}, true, true);
+		conversation.seeded = true;
+		this._diagnostics.report('provider-selection-applied', {
+			requestedModel: pending.model.identifier,
+			resolvedModel: persistModel.identifier,
+			providerModelBefore,
+			providerModelAfter: session.modelId.get(),
+		}, 'info');
+		return true;
+	}
+
+	private _chatSessionType(session: IActiveSession): string | undefined {
+		const advertised = this._offeredTypes(session).find(type =>
+			type.providerId === session.providerId && type.sessionType.id === session.sessionType);
+		if (advertised?.sessionType.chatSessionType) {
+			return advertised.sessionType.chatSessionType;
+		}
+		const scheme = session.resource?.scheme;
+		return scheme && /claude|kimi/i.test(scheme) ? scheme : undefined;
+	}
+
+	/** Harness rows plus visible compatible official subscription rows, with picker-only presentation. */
+	private _catalogModelsForPicker(
+		sessionTypeId: string,
+		chatSessionType: string | undefined,
+		sessionModels: readonly ILanguageModelChatMetadataAndIdentifier[],
+	): readonly ILanguageModelChatMetadataAndIdentifier[] {
+		const languageModelsService = this._languageModelsService;
+		if (!languageModelsService) {
+			return sessionModels;
+		}
+		return mixOfficialSubscriptionModels(
+			sessionTypeId,
+			sessionModels,
+			this._visibleRegisteredModels(languageModelsService),
+			chatSessionType,
+		);
+	}
+
+	private _visibleRegisteredModels(languageModelsService: ILanguageModelsService): readonly ILanguageModelChatMetadataAndIdentifier[] {
+		return getRegisteredLanguageModels(languageModelsService).filter(model =>
+			model.metadata.isUserSelectable !== false
+			&& !isModelHiddenInPicker(model, identifier => languageModelsService.isModelHidden(identifier))
+		);
+	}
+
+	/**
+	 * What the picker shows before any session exists. There is nothing for a provider to scope a
+	 * snapshot by, but the agent a new session would start on is already known — Settings names the
+	 * same one — so the picker can name the model that session would run on instead of showing
+	 * nothing. When no agent advertises a pool the state stays empty, and
+	 * {@link ISessionModelSelectionState.poolResolved} false with it, so the shared widget cannot
+	 * read the empty list as Copilot needing sign-in.
+	 */
+	private _publishDefaultAgentPool(): void {
+		const type = this._defaultAgentType();
+		const modelTarget = type ? type.sessionType.chatSessionType ?? type.sessionType.id : undefined;
+		const models = type && modelTarget ? this._defaultAgentModels(type, modelTarget) : [];
+		this._models = models;
+		this._modelTarget = models.length > 0 ? modelTarget : undefined;
+		if (models.length === 0 || !modelTarget) {
+			this._state.set(EMPTY_MODEL_SELECTION_STATE, undefined);
+			return;
+		}
+		const options: INormalizedSessionModelPickerOptions = {
+			...normalizeModelPickerOptions(undefined),
+			// Presentation is the provider's to state and there is no session to ask it about.
+			// Only Auto is worth resolving here: offering it on a harness that requires an explicit
+			// model would remember a model that harness cannot run.
+			showAutoModel: this._chatSessionsService?.supportsAutoModelForSessionType(modelTarget) ?? true,
+		};
+		this._state.set(createModelSelectionState(models, options, this._defaultAgentModel(models), undefined), undefined);
+	}
+
+	/**
+	 * The agent a new session would start on: the remembered pick while it is still advertised,
+	 * else the first advertised agent host. Read from every provider's types rather than a folder's,
+	 * so it answers before a workspace has been picked.
+	 */
+	private _defaultAgentType(): IProviderSessionType | undefined {
+		const types = this._sessionsManagementService?.getAllProviderSessionTypes() ?? [];
+		const preferred = readPreferredSessionType(this._storageService);
+		const remembered = preferred && types.find(type => type.sessionType.id === preferred.sessionTypeId
+			&& (preferred.providerId === undefined || type.providerId === preferred.providerId));
+		// Unremembered falls to the first agent host, the same one Settings names as the default
+		// agent: an agent host is what advertises the `chatSessionType` its models are registered
+		// against, so it is the only kind whose pool can be found without a session to ask.
+		return remembered || types.find(type => isAgentHostProviderId(type.providerId));
+	}
+
+	/** That agent's pool, read straight from the catalog: its models are registered against its target. */
+	private _defaultAgentModels(
+		type: IProviderSessionType,
+		modelTarget: string,
+	): readonly ILanguageModelChatMetadataAndIdentifier[] {
+		const languageModelsService = this._languageModelsService;
+		if (!languageModelsService) {
+			return [];
+		}
+		const targeted = this._visibleRegisteredModels(languageModelsService)
+			.filter(model => model.metadata.targetChatSessionType === modelTarget);
+		return presentSessionPickerModels(
+			this._catalogModelsForPicker(type.sessionType.id, type.sessionType.chatSessionType, targeted));
+	}
+
+	/**
+	 * The model that agent would start on, by the precedence
+	 * {@link ChatInputModelSelectionController.initialize} applies to a conversation with no
+	 * history: `chat.defaultModel`, then the remembered preference, then the pool's own default.
+	 */
+	private _defaultAgentModel(
+		models: readonly ILanguageModelChatMetadataAndIdentifier[],
+	): ILanguageModelChatMetadataAndIdentifier | undefined {
+		const configured = resolveConfiguredModel(this._configurationService.getValue<string>(ChatConfiguration.DefaultModel), models);
+		const remembered = getStoredSelectedModel(this._storageService, ChatAgentLocation.Chat, this._modelTarget);
+		return configured
+			?? models.find(model => model.identifier === remembered)
+			?? models.find(model => model.metadata.isDefaultForLocation[ChatAgentLocation.Chat])
+			?? models[0];
+	}
+
+	/**
+	 * A pick made before a session exists. There is no chat to write it to, so it is only
+	 * remembered for that agent's pool — which is what seeds the session once it is created.
+	 */
+	private _selectDefaultAgentModel(modelIdentifier: string, reason: string): boolean {
+		const modelTarget = this._modelTarget;
+		if (!modelTarget || !this._models.some(model => model.identifier === modelIdentifier)) {
+			this._diagnostics.report('selection-rejected', {
+				requestedModel: modelIdentifier,
+				reason,
+			}, 'info');
+			return false;
+		}
+		storeSelectedModel(this._storageService, ChatAgentLocation.Chat, modelTarget, modelIdentifier);
+		this._publishDefaultAgentPool();
+		return true;
+	}
+
+	private _presentedModel(
+		model: ILanguageModelChatMetadataAndIdentifier,
+		pickerModels: readonly ILanguageModelChatMetadataAndIdentifier[],
+	): ILanguageModelChatMetadataAndIdentifier {
+		return pickerModels.find(candidate => candidate.identifier === model.identifier)
+			?? presentSessionPickerModel(model);
+	}
+
+	private _offeredTypes(session: IActiveSession): readonly IProviderSessionType[] {
+		if (!this._sessionsManagementService) {
+			return [];
+		}
+		if (session.isQuickChat?.get() ?? false) {
+			return this._sessionsManagementService.getQuickChatSessionTypes();
+		}
+		const folderUri = session.workspace?.get()?.folders[0]?.root;
+		return folderUri ? this._sessionsManagementService.getSessionTypesForFolder(folderUri) : [];
+	}
+
+	private _requestedHarness(
+		session: IActiveSession,
+		model: ILanguageModelChatMetadataAndIdentifier,
+	): IPickedSessionType | undefined {
+		if (session.status.get() !== SessionStatus.Untitled || !this._sessionsManagementService) {
+			return undefined;
+		}
+		const harness = advertisedHarnessForModel(model, this._offeredTypes(session));
+		if (!harness || (harness.providerId === session.providerId && harness.sessionTypeId === session.sessionType)) {
+			return undefined;
+		}
+		// Configured provider rows intentionally stay on Claude Code even when their family resembles another harness.
+		if (isClaudeHarnessId(session.sessionType, this._chatSessionType(session))) {
+			return undefined;
+		}
+		return harness;
+	}
+
+	private _pendingHarnessMatches(session: IActiveSession, pick: IPickedSessionType): boolean {
+		return session.providerId === pick.providerId && session.sessionType === pick.sessionTypeId;
 	}
 
 	/** The remembered preference, migrating the legacy key forward the first time it is seen. */

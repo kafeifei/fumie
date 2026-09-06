@@ -440,7 +440,7 @@ export class WorkbenchAssignmentService extends Disposable implements IAssignmen
 			// Route the assignments request through the main-process request service so it is
 			// not subject to renderer CORS (parity with how core reaches api.github.com).
 			assignmentsFetch: assignmentsEndpoint
-				? (url, init) => (revoked ? Promise.resolve({ status: 0, json: async () => ({}) }) : service.assignmentsFetch(url, init))
+				? (url: string, init: { method: 'POST'; headers: Record<string, string>; body: string }) => (revoked ? Promise.resolve({ status: 0, json: async () => ({}) }) : service.assignmentsFetch(url, init))
 				: undefined,
 			refetchInterval: ASSIGNMENT_REFETCH_INTERVAL,
 		});

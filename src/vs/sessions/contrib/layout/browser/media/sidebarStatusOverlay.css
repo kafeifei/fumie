@@ -1,0 +1,150 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.sessions-sidebar-status-overlay-host {
+	position: relative;
+}
+
+.sessions-sidebar-status-overlay {
+	position: absolute;
+	top: 8px;
+	right: 12px;
+	z-index: 100;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 10px 12px;
+	border-radius: var(--vscode-cornerRadius-large);
+	border: var(--vscode-strokeThickness) solid var(--vscode-agentsCard-border, var(--vscode-agentsPanel-border, var(--vscode-widget-border, transparent)));
+	background-color: var(--vscode-agentsPanel-background);
+	color: var(--vscode-agentsPanel-foreground);
+	box-shadow: var(--vscode-shadow-lg);
+	font-size: var(--vscode-agents-fontSize-label1, 12px);
+	line-height: 1.4;
+	user-select: none;
+	min-width: 200px;
+	max-width: 280px;
+}
+
+.hc-black .sessions-sidebar-status-overlay,
+.hc-light .sessions-sidebar-status-overlay {
+	box-shadow: none;
+}
+
+.sessions-sidebar-status-overlay > .sessions-sidebar-status-overlay-changes {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 8px;
+	border-radius: var(--vscode-cornerRadius-medium);
+	cursor: pointer;
+	width: 100%;
+	box-sizing: border-box;
+}
+
+.sessions-sidebar-status-overlay-changes > .sessions-sidebar-status-overlay-files {
+	flex: 1;
+}
+
+.sessions-sidebar-status-overlay-changes:hover {
+	background-color: var(--vscode-toolbar-hoverBackground);
+}
+
+.sessions-sidebar-status-overlay-changes:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.sessions-sidebar-status-overlay-changes > .codicon {
+	font-size: 14px;
+	flex-shrink: 0;
+}
+
+.sessions-sidebar-status-overlay-actions:empty {
+	display: none;
+}
+
+.sessions-sidebar-status-overlay-actions {
+	display: flex;
+	flex-direction: column;
+	width: 100%;
+}
+
+.sessions-sidebar-status-overlay-actions .monaco-toolbar {
+	width: 100%;
+	height: auto !important;
+}
+
+.sessions-sidebar-status-overlay-actions .monaco-toolbar .actions-container {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 2px;
+	width: 100%;
+}
+
+.sessions-sidebar-status-overlay-actions .monaco-toolbar .actions-container > .action-item {
+	padding: 4px 8px;
+	border-radius: var(--vscode-cornerRadius-medium);
+	width: 100%;
+}
+
+.sessions-sidebar-status-overlay-actions .monaco-toolbar .actions-container > .action-item:hover {
+	background-color: var(--vscode-toolbar-hoverBackground);
+}
+
+.sessions-sidebar-status-overlay-added {
+	color: var(--vscode-gitDecoration-addedResourceForeground);
+}
+
+.sessions-sidebar-status-overlay-removed {
+	color: var(--vscode-gitDecoration-deletedResourceForeground);
+}
+
+/* Button bar (commit/push/create PR): one full-width row per button. */
+.sessions-sidebar-status-overlay .changes-actions-bar {
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+	gap: 2px;
+	width: 100%;
+}
+
+.sessions-sidebar-status-overlay .changes-actions-bar .monaco-button,
+.sessions-sidebar-status-overlay .changes-actions-bar .monaco-button-dropdown {
+	justify-content: flex-start;
+	width: 100%;
+	height: auto;
+	padding: 4px 8px;
+	border-radius: var(--vscode-cornerRadius-medium);
+	font-size: var(--vscode-agents-fontSize-label1, 12px);
+	box-sizing: border-box;
+}
+
+/* Project chrome: chips stack so each reads as its own status row. */
+.sessions-sidebar-status-overlay .action-item.agent-sessions-titlebar-workspace,
+.sessions-sidebar-status-overlay .agent-sessions-titlebar-workspace-row {
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+	gap: 2px;
+	width: 100%;
+	height: auto;
+}
+
+.sessions-sidebar-status-overlay .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip {
+	width: 100%;
+	max-width: none;
+	height: auto;
+	padding: 4px 8px;
+	border-radius: var(--vscode-cornerRadius-medium);
+	color: inherit;
+	opacity: 1;
+	box-sizing: border-box;
+}
+
+/* Label takes the slack so a trailing chevron parks on the right edge. */
+.sessions-sidebar-status-overlay .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip-label {
+	flex: 1;
+}

@@ -24,6 +24,7 @@ import { FileService } from '../../../files/common/fileService.js';
 import { IFileService, type IStat } from '../../../files/common/files.js';
 import { InMemoryFileSystemProvider } from '../../../files/common/inMemoryFilesystemProvider.js';
 import { IInstantiationService } from '../../../instantiation/common/instantiation.js';
+import { IProductService } from '../../../product/common/productService.js';
 import { InstantiationService } from '../../../instantiation/common/instantiationService.js';
 import { ServiceCollection } from '../../../instantiation/common/serviceCollection.js';
 import { ILogService, LogLevel, NullLogService } from '../../../log/common/log.js';
@@ -79,6 +80,7 @@ import { SessionDatabase } from '../../node/sessionDatabase.js';
 import { createNullSessionDataService } from '../common/sessionTestHelpers.js';
 import { ActiveClientToolSet } from '../../node/activeClientState.js';
 import { ByokLmBridgeRegistry, IByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ICopilotApiService, type ICopilotApiServiceRequestOptions, type ICopilotUtilityChatCompletionRequest, type IRestrictedTelemetryContext } from '../../node/shared/copilotApiService.js';
 import type { IAgentHostInternalTelemetryContext, IAgentHostRestrictedTelemetryContext } from '../../node/agentHostRestrictedTelemetry.js';
 
@@ -149,7 +151,7 @@ async function provisionSession(agent: CopilotAgent, config: IAgentCreateSession
  */
 async function disposeProvisionedSession(agent: CopilotAgent, session: URI): Promise<void> {
 	const chat = defaultChatUri(session);
-	await agent.chats.disposeChat(chat, exactChatContext(session, chat, session));
+	await agent.chats.deleteChat(chat, exactChatContext(session, chat, session));
 }
 
 async function materializeLegacyDefaultChat(agent: CopilotAgent, session: URI): Promise<void> {
@@ -873,6 +875,7 @@ function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, optio
 	});
 	const managedSettingsService = disposables.add(new AgentHostManagedSettingsService());
 	services.set(ILogService, logService);
+	services.set(IProductService, { _serviceBrand: undefined } as IProductService);
 	services.set(IFileService, fileService);
 	services.set(IAgentConfigurationService, configService);
 	services.set(IAgentHostManagedSettingsService, managedSettingsService);
@@ -1411,6 +1414,81 @@ suite('CopilotAgent', () => {
 		} finally {
 			await disposeAgent(agent);
 		}
+	});
+
+	suite('session titles', () => {
+
+		async function generateTitle(copilotApiService: TestCopilotApiService, request: { readonly prompt: string; readonly modelId?: string }, authenticated = true): Promise<string | undefined> {
+			const agent = createTestAgent(disposables, { copilotApiService });
+			try {
+				if (authenticated) {
+					await agent.authenticate('https://api.github.com', 'gh-token');
+				}
+				return await agent.generateTitle(AgentSession.uri('copilot', 'title-session'), request, CancellationToken.None);
+			} finally {
+				await disposeAgent(agent);
+			}
+		}
+
+		test('names a session through the utility endpoint on the session\'s own model', async () => {
+			const copilotApiService = new TestCopilotApiService();
+			copilotApiService.response = '  Fix the login bug  ';
+
+			const title = await generateTitle(copilotApiService, { prompt: 'Please fix the login bug', modelId: 'claude-sonnet-4' });
+
+			assert.deepStrictEqual({
+				// The raw reply: trimming and shortening belong to the caller.
+				title,
+				token: copilotApiService.utilityCalls[0]?.token,
+				messages: copilotApiService.utilityCalls[0]?.request.messages,
+				maxTokens: copilotApiService.utilityCalls[0]?.request.maxTokens,
+				modelFamily: copilotApiService.utilityCalls[0]?.request.modelFamily,
+			}, {
+				title: '  Fix the login bug  ',
+				token: 'gh-token',
+				messages: [{
+					role: 'user',
+					content: 'Reply with only a concise 3-8 word title for this coding session, no quotes, no punctuation at the end: Please fix the login bug',
+				}],
+				maxTokens: 32,
+				modelFamily: 'claude-sonnet-4',
+			});
+		});
+
+		test('keeps the utility default model when the session has none, and passes a long prompt through', async () => {
+			const copilotApiService = new TestCopilotApiService();
+			copilotApiService.response = 'Generated title';
+
+			const title = await generateTitle(copilotApiService, { prompt: `Investigate ${'x'.repeat(5000)}` });
+			const content = copilotApiService.utilityCalls[0]?.request.messages[0].content ?? '';
+
+			assert.deepStrictEqual({
+				title,
+				modelFamily: copilotApiService.utilityCalls[0]?.request.modelFamily,
+				promptLength: content.slice(content.indexOf('Investigate')).length,
+			}, {
+				title: 'Generated title',
+				modelFamily: undefined,
+				promptLength: `Investigate ${'x'.repeat(5000)}`.length,
+			});
+		});
+
+		test('returns undefined without a request when the agent has no GitHub token', async () => {
+			const copilotApiService = new TestCopilotApiService();
+
+			const title = await generateTitle(copilotApiService, { prompt: 'Nothing to name this with' }, false);
+
+			assert.deepStrictEqual({ title, calls: copilotApiService.utilityCalls.length }, { title: undefined, calls: 0 });
+		});
+
+		test('returns undefined when the utility request fails', async () => {
+			const copilotApiService = new TestCopilotApiService();
+			copilotApiService.error = new Error('CAPI chat completion request failed');
+
+			const title = await generateTitle(copilotApiService, { prompt: 'Fix the login bug' });
+
+			assert.deepStrictEqual({ title, calls: copilotApiService.utilityCalls.length }, { title: undefined, calls: 1 });
+		});
 	});
 
 	test('computeFolderPickerDecision hides the picker unless multiple folders carry .github/hooks', async () => {
@@ -7476,7 +7554,7 @@ suite('CopilotAgent', () => {
 					dispose: () => { disposed = true; },
 				}, chatUri);
 
-				await assert.rejects(() => agent.chats.disposeChat(chatUri, exactChatContext(session, chatUri)), /boom/);
+				await assert.rejects(() => agent.chats.deleteChat(chatUri, exactChatContext(session, chatUri)), /boom/);
 
 				assert.deepStrictEqual({
 					tracked: hasLiveChat(agent, chatUri),
@@ -7513,7 +7591,7 @@ suite('CopilotAgent', () => {
 				}, chatUri);
 
 				// A confirmed-gone SDK session is swallowed so a retried teardown completes.
-				await agent.chats.disposeChat(chatUri, exactChatContext(session, chatUri));
+				await agent.chats.deleteChat(chatUri, exactChatContext(session, chatUri));
 
 				assert.deepStrictEqual({
 					tracked: hasLiveChat(agent, chatUri),
@@ -7716,6 +7794,7 @@ suite('CopilotAgent', () => {
 			const stateManager = disposables.add(new AgentHostStateManager(logService));
 			const services = new ServiceCollection();
 			services.set(ILogService, logService);
+			services.set(IProductService, { _serviceBrand: undefined } as IProductService);
 			services.set(IFileService, disposables.add(new FileService(logService)));
 			services.set(IAgentConfigurationService, disposables.add(new AgentConfigurationService(stateManager, logService)));
 			services.set(IAgentHostManagedSettingsService, disposables.add(new AgentHostManagedSettingsService()));
@@ -7843,6 +7922,7 @@ suite('CopilotAgent', () => {
 			const otel = new RecordingTitleOTelService();
 			const services = new ServiceCollection();
 			services.set(ILogService, logService);
+			services.set(IProductService, { _serviceBrand: undefined } as IProductService);
 			services.set(IFileService, disposables.add(new FileService(logService)));
 			services.set(IAgentConfigurationService, disposables.add(new AgentConfigurationService(stateManager, logService)));
 			services.set(IAgentHostManagedSettingsService, disposables.add(new AgentHostManagedSettingsService()));
@@ -8280,7 +8360,7 @@ suite('CopilotAgent', () => {
 				// restore handing back the persisted providerData.
 				await agent.materializeChat(chatUri, session, JSON.stringify({ sdkSessionId: 'sdk-a' }));
 
-				await agent.chats.disposeChat(chatUri, exactChatContext(session, chatUri));
+				await agent.chats.deleteChat(chatUri, exactChatContext(session, chatUri));
 
 				const remaining = await db.object.getMetadata('copilot.chats');
 				assert.deepStrictEqual({
@@ -8874,7 +8954,7 @@ suite('CopilotAgent', () => {
 				for (let i = 0; i < 50 && !initialized; i++) {
 					await timeout(0);
 				}
-				const dispose = agent.chats.disposeChat(chat, exactChatContext(session, chat));
+				const dispose = agent.chats.deleteChat(chat, exactChatContext(session, chat));
 				await timeout(0);
 				const deletedBeforeResume = client.deletedSessionIds.includes('sdk-a');
 				gate.complete();
@@ -9982,7 +10062,7 @@ suite('CopilotAgent', () => {
 				// Disposing it while the default chat still shares the scope must
 				// release only that key: the scope is still live, so nothing
 				// scope-wide is released or finalized.
-				await agent.chats.disposeChat(peerChat, exactChatContext(session, peerChat));
+				await agent.chats.deleteChat(peerChat, exactChatContext(session, peerChat));
 
 				assert.deepStrictEqual({
 					peerDisposed: peerRec.disposed,
@@ -10002,7 +10082,7 @@ suite('CopilotAgent', () => {
 				// resource coincides with the scope — finalizes the scope too:
 				// its key is released once for the chat's own teardown and once
 				// more (idempotently) by scope finalization.
-				await agent.chats.disposeChat(defaultChat, exactChatContext(session, defaultChat, session));
+				await agent.chats.deleteChat(defaultChat, exactChatContext(session, defaultChat, session));
 
 				assert.deepStrictEqual(otelService.released, [peerChat.toString(), session.toString(), session.toString()]);
 			} finally {

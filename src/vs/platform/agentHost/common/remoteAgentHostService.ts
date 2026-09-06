@@ -189,6 +189,19 @@ export type RemoteAgentHostConnection = IRemoteAgentHostWebSocketConnection | IR
 export interface IRemoteAgentHostEntry {
 	readonly name: string;
 	readonly connectionToken?: string;
+	/**
+	 * The client id to present to this host instead of minting a fresh one per
+	 * connection. Only the mobile web client sets it — the page keeps an id in
+	 * the browser so a reload is the same client to the host rather than a new
+	 * one, which is what lets the host's reconnect and replay treat it the way
+	 * it treats an in-page reconnect.
+	 *
+	 * It is an identity, never a credential: nothing may be granted, trusted or
+	 * made visible because of it. Anyone who can reach the page can set it to
+	 * whatever they like. Authentication is the connection token below, and for
+	 * the phone the capability in the request path plus the session cookie.
+	 */
+	readonly clientId?: string;
 	readonly connection: RemoteAgentHostConnection;
 }
 
@@ -197,6 +210,8 @@ export interface IRawRemoteAgentHostEntry {
 	readonly address: string;
 	readonly name: string;
 	readonly connectionToken?: string;
+	/** See {@link IRemoteAgentHostEntry.clientId} — an identity, not a credential. */
+	readonly clientId?: string;
 	readonly sshConfigHost?: string;
 	readonly sshHostName?: string;
 	readonly sshUser?: string;
@@ -255,9 +270,9 @@ export const WEBSOCKET_ENTRY_TYPE_CONFIG: IPersistedEntryTypeConfig<IRemoteAgent
 	normalizedAddress: true,
 	address: connection => connection.address,
 	toRaw: (entry, connection) => ({
-		address: connection.address, name: entry.name, connectionToken: entry.connectionToken,
+		address: connection.address, name: entry.name, connectionToken: entry.connectionToken, clientId: entry.clientId,
 	}),
-	fromRaw: raw => ({ name: raw.name, connectionToken: raw.connectionToken, connection: { type: RemoteAgentHostEntryType.WebSocket, address: raw.address } }),
+	fromRaw: raw => ({ name: raw.name, connectionToken: raw.connectionToken, clientId: raw.clientId, connection: { type: RemoteAgentHostEntryType.WebSocket, address: raw.address } }),
 };
 
 export const SSH_ENTRY_TYPE_CONFIG: IPersistedEntryTypeConfig<IRemoteAgentHostSSHConnection> = {

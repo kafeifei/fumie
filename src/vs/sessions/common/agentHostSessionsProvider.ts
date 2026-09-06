@@ -56,6 +56,13 @@ export interface IAgentHostSessionsProvider extends ISessionsProvider {
 	// -- Remote Connection (optional, used by remote agent host providers) --
 	/** Connection status observable, present on remote providers. */
 	readonly connectionStatus?: IObservable<RemoteAgentHostConnectionStatus>;
+	/**
+	 * Whether a live connection is wired up right now. Unlike
+	 * {@link connectionStatus}, which a tunnel host also uses to report that
+	 * the host is merely online, this is `true` only when the transport
+	 * behind this provider's sessions actually exists.
+	 */
+	readonly hasLiveConnection?: IObservable<boolean>;
 	/** Progress messages during on-demand connect. */
 	readonly onDidReportConnectProgress?: Event<IAgentHostConnectProgress>;
 	/** Remote address string, present on remote providers. */
@@ -86,6 +93,13 @@ export interface IAgentHostSessionsProvider extends ISessionsProvider {
 	 * it. Present on remote providers that manage their own transport.
 	 */
 	disconnect?(): Promise<void>;
+	/**
+	 * Forget this host entirely: drop any persisted session snapshot and
+	 * remove whatever entry recreates this provider on the next launch.
+	 * Unlike {@link disconnect}, this is not meant to be undone by
+	 * {@link connect} — the user has to add the host back.
+	 */
+	forget?(): Promise<void>;
 
 	/**
 	 * When `true`, the workspace picker keeps this provider's browse
@@ -185,12 +199,15 @@ export interface IAgentHostSessionsProvider extends ISessionsProvider {
 	readonly onDidChangeCustomizations: Event<void>;
 
 	/**
-	 * Returns the full set of customizations.
+	 * Returns the full set of customizations. An unsent draft has no session on
+	 * the agent host, so it reports what the host advertises for its agent
+	 * instead of per-session customizations.
 	 */
 	getCustomizations(sessionId: string): readonly Customization[];
 
 	/**
-	 * Returns the working directory for the session, if provided by the host.
+	 * Returns the working directory for the session, if provided by the host —
+	 * or, for an unsent draft, the folder the draft was composed against.
 	 */
 	getWorkingDirectory(sessionId: string): string | undefined;
 
@@ -246,6 +263,14 @@ export interface IAgentHostSessionsProvider extends ISessionsProvider {
 }
 
 export const LOCAL_AGENT_HOST_PROVIDER_ID = 'local-agent-host';
+
+/**
+ * Storage key under which the agent-host session-config picker remembers the
+ * values chosen for new sessions. Owned by the agent-host sessions provider;
+ * exported so the Agent Settings view can read/write the same preference
+ * through this shared contract instead of duplicating the key.
+ */
+export const STORAGE_KEY_REMEMBERED_SESSION_CONFIG_VALUES = 'sessions.agentHost.sessionConfigPicker.selectedValues';
 
 export const REMOTE_AGENT_HOST_PROVIDER_PREFIX = 'agenthost-';
 export const REMOTE_AGENT_HOST_PROVIDER_RE = /^agenthost-/;

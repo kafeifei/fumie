@@ -5,11 +5,12 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+import Severity from '../../../../../../base/common/severity.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
-import { Separator } from '../../../../../../base/common/actions.js';
+import { Separator, toAction } from '../../../../../../base/common/actions.js';
 import { ILanguageModelChatMetadata, ILanguageModelProviderDescriptor } from '../../../common/languageModels.js';
-import { buildAddModelsDropdownActions, getModelHoverContent } from '../../../browser/chatManagement/chatModelsWidget.js';
-import { ILanguageModel } from '../../../browser/chatManagement/chatModelsViewModel.js';
+import { buildAddModelsDropdownActions, getModelHoverContent, runStatusEntryAction } from '../../../browser/chatManagement/chatModelsWidget.js';
+import { ILanguageModel, IStatusEntry } from '../../../browser/chatManagement/chatModelsViewModel.js';
 import { ChatAgentLocation } from '../../../common/constants.js';
 
 function createModel(overrides: Partial<ILanguageModelChatMetadata> = {}): ILanguageModel {
@@ -44,6 +45,26 @@ function createVendor(vendor: string, displayName: string, deprecation?: { link?
 suite('ChatModelsWidget', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('runs an actionable status from the row without duplicating toolbar clicks', async () => {
+		let runCount = 0;
+		const entry: IStatusEntry = {
+			type: 'status',
+			id: 'status.connect',
+			message: 'Connect account',
+			severity: Severity.Warning,
+			action: toAction({ id: 'connect', label: 'Connect', run: () => { runCount++; } }),
+		};
+
+		assert.strictEqual(await runStatusEntryAction(entry, document.createElement('div')), true);
+		assert.strictEqual(runCount, 1);
+
+		const actionContainer = document.createElement('div');
+		actionContainer.classList.add('actions-container');
+		const actionButton = actionContainer.appendChild(document.createElement('a'));
+		assert.strictEqual(await runStatusEntryAction(entry, actionButton), false);
+		assert.strictEqual(runCount, 1);
+	});
 
 	suite('getModelHoverContent', () => {
 
@@ -139,6 +160,37 @@ suite('ChatModelsWidget', () => {
 
 			assert.ok(value.includes('Input Cost'));
 			assert.ok(value.includes('0 credits per 1M tokens'));
+		});
+	});
+
+	suite('runStatusEntryAction', () => {
+
+		function statusEntry(overrides: Partial<IStatusEntry>, run: () => void): IStatusEntry {
+			return {
+				type: 'status',
+				id: 'status.provider',
+				message: 'Signed in',
+				severity: Severity.Info,
+				action: toAction({ id: 'signOut', label: 'Sign out', run }),
+				...overrides,
+			};
+		}
+
+		test('a recovery status runs from the row, an explicit-action-only one does not', async () => {
+			let recoveryRuns = 0;
+			let signOutRuns = 0;
+			const recovery = statusEntry({}, () => { recoveryRuns++; });
+			const signOut = statusEntry({ explicitActionOnly: true }, () => { signOutRuns++; });
+
+			const ranRecovery = await runStatusEntryAction(recovery, null);
+			const ranSignOut = await runStatusEntryAction(signOut, null);
+
+			assert.deepStrictEqual({ ranRecovery, recoveryRuns, ranSignOut, signOutRuns }, {
+				ranRecovery: true,
+				recoveryRuns: 1,
+				ranSignOut: false,
+				signOutRuns: 0,
+			});
 		});
 	});
 
@@ -269,6 +321,33 @@ suite('ChatModelsWidget', () => {
 			}, {
 				shape: ['enable-acme', 'separator', 'enable-customendpoint'],
 				ran: ['acme', 'customendpoint'],
+			});
+		});
+
+		test('drops a singleton vendor once its entry exists, and keeps offering the rest', () => {
+			const vendors = [
+				createVendor('acme', 'Acme'),
+				{ ...createVendor('claude-subscription', 'Claude Subscription'), singleton: true },
+				{ ...createVendor('codex-subscription', 'Codex Subscription'), singleton: true },
+			];
+
+			const shape = (vendorsWithGroups: string[]) => buildAddModelsDropdownActions(
+				vendors,
+				true,
+				() => { },
+				undefined,
+				new Set(vendorsWithGroups),
+			).map(action => action instanceof Separator ? 'separator' : action.id);
+
+			assert.deepStrictEqual({
+				none: shape([]),
+				claudeAdded: shape(['claude-subscription']),
+				// A non-singleton vendor stays addable however many entries it has.
+				acmeAdded: shape(['acme']),
+			}, {
+				none: ['enable-acme', 'enable-claude-subscription', 'enable-codex-subscription'],
+				claudeAdded: ['enable-acme', 'enable-codex-subscription'],
+				acmeAdded: ['enable-acme', 'enable-claude-subscription', 'enable-codex-subscription'],
 			});
 		});
 

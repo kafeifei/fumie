@@ -36,7 +36,10 @@ import { ISessionsService } from '../../../../services/sessions/browser/sessions
 import { ISessionChangesService } from '../../../changes/browser/sessionChangesService.js';
 import { NewChangesTabAction, NewFileTabAction, NewSearchTabAction } from '../../browser/addTabActions.js';
 import { EmptyFileEditorInput, EmptyFileEditorSerializer } from '../../browser/emptyFileEditorInput.js';
-import { EditorTabsVisibleContext, IsAuxiliaryWindowContext, IsSessionsWindowContext, IsTopRightEditorGroupContext } from '../../../../../workbench/common/contextkeys.js';
+import { ActiveEditorCannotCloseContext, ActiveEditorDirtyContext, ActiveEditorStickyContext, EditorTabsVisibleContext, IsAuxiliaryWindowContext, IsSessionsWindowContext, IsTopRightEditorGroupContext } from '../../../../../workbench/common/contextkeys.js';
+import { CLOSE_EDITOR_COMMAND_ID, CLOSE_EDITORS_IN_GROUP_COMMAND_ID, UNPIN_EDITOR_COMMAND_ID } from '../../../../../workbench/browser/parts/editor/editorCommands.js';
+import { IMenuItem, isIMenuItem, MenuRegistry } from '../../../../../platform/actions/common/actions.js';
+import { Menus } from '../../../../browser/menus.js';
 import { TestEnvironmentService } from '../../../../../workbench/test/browser/workbenchTestServices.js';
 import { IsQuickChatSessionContext, SessionIsCreatedContext, SinglePaneChangesTabAvailableContext, SinglePaneChangesTabMissingContext, SinglePaneFilesTabAvailableContext, SinglePaneFilesTabMissingContext } from '../../../../common/contextkeys.js';
 
@@ -162,6 +165,57 @@ suite('Sessions - Editor Contribution', () => {
 			changes: { singleTabAlreadyOpen: true, multipleTabsAlreadyOpen: false, multipleTabsMissing: true, dockOnlyMissing: true, unsupported: false },
 			searchInDockOnly: true,
 			searchInQuickChat: false,
+		});
+	});
+
+	// The single-pane layout points the editor group's `editorActions` menu at
+	// `Menus.SessionsEditorTitle` and forces `showTabs: 'single'`. Upstream only
+	// registers the close/unpin toolbar buttons for that mode on
+	// `MenuId.EditorTitle`, and the editor-title bridge deliberately mirrors
+	// extension contributions only, so the Agents window registers them itself.
+	test('single-tab close and unpin buttons are registered on the Sessions editor title menu', () => {
+		const evaluate = (expression: ContextKeyExpression | null | undefined, values: Record<string, ContextKeyValue>): boolean => expression?.evaluate({
+			getValue: <T extends ContextKeyValue>(key: string) => values[key] as T | undefined
+		} satisfies IContext) ?? false;
+
+		const itemsFor = (commandId: string) => MenuRegistry.getMenuItems(Menus.SessionsEditorTitle)
+			.filter(isIMenuItem)
+			.filter(item => item.command.id === commandId);
+		const closeItems = itemsFor(CLOSE_EDITOR_COMMAND_ID);
+		const unpinItems = itemsFor(UNPIN_EDITOR_COMMAND_ID);
+		const visible = (items: readonly IMenuItem[], values: Record<string, ContextKeyValue>) => items.some(item => evaluate(item.when, values));
+
+		// A plain, saved, unpinned, closable editor while a single tab is shown.
+		const singleTab: Record<string, ContextKeyValue> = {
+			[EditorTabsVisibleContext.key]: false,
+			[ActiveEditorDirtyContext.key]: false,
+			[ActiveEditorStickyContext.key]: false,
+			[ActiveEditorCannotCloseContext.key]: false,
+		};
+
+		assert.deepStrictEqual({
+			registered: closeItems.length > 0,
+			primaryToolbar: closeItems.every(item => item.group === 'navigation'),
+			closesAllAsAlternative: closeItems.every(item => item.alt?.id === CLOSE_EDITORS_IN_GROUP_COMMAND_ID),
+			plainEditor: visible(closeItems, singleTab),
+			dirtyEditor: visible(closeItems, { ...singleTab, [ActiveEditorDirtyContext.key]: true }),
+			// The Changes / Files placeholder tabs must keep no close button.
+			cannotCloseEditor: visible(closeItems, { ...singleTab, [ActiveEditorCannotCloseContext.key]: true }),
+			// With a real tab bar the tab carries its own close button.
+			multipleTabs: visible(closeItems, { ...singleTab, [EditorTabsVisibleContext.key]: true }),
+			// A sticky editor offers Unpin instead of Close.
+			stickyEditorCloses: visible(closeItems, { ...singleTab, [ActiveEditorStickyContext.key]: true }),
+			stickyEditorUnpins: visible(unpinItems, { ...singleTab, [ActiveEditorStickyContext.key]: true }),
+		}, {
+			registered: true,
+			primaryToolbar: true,
+			closesAllAsAlternative: true,
+			plainEditor: true,
+			dirtyEditor: true,
+			cannotCloseEditor: false,
+			multipleTabs: false,
+			stickyEditorCloses: false,
+			stickyEditorUnpins: true,
 		});
 	});
 

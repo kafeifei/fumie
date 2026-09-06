@@ -26,8 +26,8 @@ const DEFAULT_NEW_SESSION_VISIBILITY_STATE: ISidePaneVisibilityState = {
 	auxiliaryBarVisible: true,
 };
 const DEFAULT_EXISTING_SESSION_VISIBILITY_STATE: ISidePaneVisibilityState = {
-	editorVisible: true,
-	auxiliaryBarVisible: false,
+	editorVisible: false,
+	auxiliaryBarVisible: true,
 };
 
 /**

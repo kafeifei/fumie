@@ -248,6 +248,15 @@ export interface ILanguageModelChatMetadata {
 
 	readonly name: string;
 	readonly id: string;
+	/**
+	 * For an agent-host model whose published {@link id} carries a decoration the
+	 * agent's own runtime never echoes back (a provider qualification, a BYOK
+	 * vendor route), the raw id that runtime reports in usage and transcripts.
+	 * Carried straight from `SessionModelInfo.underlyingModelId` so a model an
+	 * agent reports as running can be matched back to the row that selects it.
+	 * Absent for every other model.
+	 */
+	readonly underlyingModelId?: string;
 	readonly vendor: string;
 	readonly version: string;
 	readonly tooltip?: string;
@@ -315,6 +324,18 @@ export interface ILanguageModelChatMetadata {
 	 * models.
 	 */
 	readonly byokModelIdentifier?: string;
+	/**
+	 * For an agent-host copy of an extension-provided BYOK model, whether the host's
+	 * serving window has the original hidden in its own "Manage Models" page.
+	 *
+	 * The host owns this state — it lives in the profile storage of the window that
+	 * holds the provider configuration. A window that reaches the catalogue only
+	 * through a host (the Agents window in a browser) has no copy of it, so it takes
+	 * the host's answer: the row is listed, greyed, and kept out of the picker, and
+	 * its own visibility toggle does not apply. Absent for every other model, and for
+	 * a host old enough not to report it.
+	 */
+	readonly byokModelHidden?: boolean;
 	/**
 	 * An optional JSON schema describing the per-model configuration options.
 	 * Used to validate user-provided per-model configuration in `chatLanguageModels.json`.
@@ -427,6 +448,34 @@ export namespace ILanguageModelChatMetadata {
 	}
 }
 
+/**
+ * Splits a BYOK "Manage Models" identifier — `<vendor>/<group>/<id>`, or
+ * `<vendor>/<id>` for a provider configured without a group — into the provider
+ * group the model was registered under. A model id may itself contain `/`, so
+ * only the leading segments are read.
+ *
+ * The name is the provider's, as the user typed it when configuring it. A window
+ * that does not host the provider itself — the Agents window in a browser, whose
+ * models arrive as agent-host copies — has no registered model to read the group
+ * off, and this identifier is the only place it survives the bridge.
+ */
+export function parseByokModelIdentifierGroup(identifier: string): { vendor: string; name?: string } | undefined {
+	const segments = identifier.split('/');
+	if (segments.length < 2 || !segments[0]) {
+		return undefined;
+	}
+	if (segments.length < 3 || !segments[1]) {
+		return { vendor: segments[0] };
+	}
+	let name = segments[1];
+	try {
+		name = decodeURIComponent(name);
+	} catch {
+		// A group name that is not valid percent-encoding is used as written.
+	}
+	return { vendor: segments[0], name };
+}
+
 export interface ILanguageModelChatResponse {
 	stream: AsyncIterable<IChatResponsePart | IChatResponsePart[]>;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -466,6 +515,11 @@ export async function getTextResponseFromStream(response: ILanguageModelChatResp
 export interface ILanguageModelChatProvider {
 	readonly onDidChange: Event<void>;
 	provideLanguageModelChatInfo(options: ILanguageModelChatInfoOptions, token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]>;
+	/**
+	 * Optional status for a successful resolution. It may coexist with models so
+	 * consumers that filter projected rows can still present provider recovery.
+	 */
+	provideLanguageModelChatStatus?(options: ILanguageModelChatInfoOptions, token: CancellationToken): Promise<ILanguageModelProviderStatus | undefined>;
 	sendChatRequest(modelId: string, messages: IChatMessage[], from: ExtensionIdentifier | undefined, options: ILanguageModelChatRequestOptions, token: CancellationToken): Promise<ILanguageModelChatResponse>;
 	provideTokenCount(modelId: string, message: string | IChatMessage, token: CancellationToken): Promise<number>;
 }
@@ -524,18 +578,43 @@ export interface ILanguageModelChatRequestOptions {
 	readonly [name: string]: any;
 }
 
+export interface ILanguageModelProviderStatus {
+	readonly message: string;
+	readonly severity: Severity;
+	readonly action?: IAction;
+	/**
+	 * Keeps {@link action} to its own control instead of also arming the whole
+	 * status row. A status whose action recovers the row — sign in, download,
+	 * retry — is worth triggering from anywhere on it; one that undoes something
+	 * the user has, like signing out, must be asked for deliberately, so a stray
+	 * click on the row cannot perform it.
+	 */
+	readonly explicitActionOnly?: boolean;
+}
+
 export interface ILanguageModelsGroup {
 	readonly group?: ILanguageModelsProviderGroup;
 	readonly modelIdentifiers: string[];
-	readonly status?: {
-		readonly message: string;
-		readonly severity: Severity;
-	};
+	readonly status?: ILanguageModelProviderStatus;
+}
+
+/**
+ * A provider group resolved for trusted workbench consumers. Secret-valued
+ * fields contain their current values rather than the placeholders persisted in
+ * `chatLanguageModels.json`.
+ */
+export interface IResolvedLanguageModelsProviderGroup {
+	readonly name: string;
+	readonly vendor: string;
+	readonly configuration: IStringDictionary<unknown>;
 }
 
 export interface ILanguageModelsService {
 
 	readonly _serviceBrand: undefined;
+
+	/** Resolves after configured providers have completed their initial model resolution. */
+	readonly whenReady: Promise<void>;
 
 	readonly onDidChangeLanguageModelVendors: Event<readonly string[]>;
 	readonly onDidChangeLanguageModels: Event<string>;
@@ -552,6 +631,9 @@ export interface ILanguageModelsService {
 	lookupLanguageModelByQualifiedName(qualifiedName: string): ILanguageModelChatMetadataAndIdentifier | undefined;
 
 	getLanguageModelGroups(vendor: string): ILanguageModelsGroup[];
+
+	/** Resolve the provider group that owns a model, including secret fields. */
+	resolveLanguageModelProviderGroup(modelIdentifier: string): Promise<IResolvedLanguageModelsProviderGroup | undefined>;
 
 	/**
 	 * Returns true if the given vendor's provider has completed at least one
@@ -825,13 +907,41 @@ const languageModelChatProviderType = {
 	}
 } as const satisfies IJSONSchema;
 
-export type IUserFriendlyLanguageModel = Omit<TypeFromJsonSchema<typeof languageModelChatProviderType>, 'deprecation'> & {
+export type IUserFriendlyLanguageModel = Omit<TypeFromJsonSchema<typeof languageModelChatProviderType>, 'configuration' | 'deprecation'> & {
+	/**
+	 * Schema of the settings a provider group of this vendor carries, and what
+	 * the Manage Models add flow prompts for. Declared here rather than derived
+	 * from the contribution schema, whose `anyOf` (a JSON Schema by reference)
+	 * carries no usable TypeScript shape.
+	 */
+	readonly configuration?: IJSONSchema;
 	/**
 	 * Marks a provider as deprecated. The Manage Models view renders a link
 	 * (pointing to a replacement, e.g. a `vscode:extension/<publisher>.<name>` URI)
 	 * next to the provider name. Optional so existing provider descriptors are unaffected.
 	 */
 	readonly deprecation?: { readonly link?: string };
+	/**
+	 * A vendor that can be added at most once, because the thing it stands for is
+	 * itself singular — the machine's one signed-in subscription, say, rather than
+	 * an endpoint the user may hold several of. The Add Models dropdown drops such
+	 * a vendor once a group for it exists. Not part of the extension point: only
+	 * providers registered at runtime declare it.
+	 */
+	readonly singleton?: boolean;
+	/**
+	 * Keeps this vendor out of the Manage Models list without changing anything
+	 * about it elsewhere — it stays registered, its models stay registered, and
+	 * the picker is untouched.
+	 *
+	 * For a vendor that exists to route a harness's models rather than to be an
+	 * entry the user owns. Such a vendor has no configuration, so the list could
+	 * only render it as a row with no rename, no delete and nothing to configure,
+	 * sitting alongside the providers that genuinely are the user's to manage.
+	 * Not part of the extension point: only providers registered at runtime
+	 * declare it.
+	 */
+	readonly hiddenFromManagement?: boolean;
 };
 
 export interface ILanguageModelProviderDescriptor extends IUserFriendlyLanguageModel {
@@ -971,6 +1081,7 @@ export class LanguageModelsService implements ILanguageModelsService {
 
 	private readonly _onLanguageModelChange = this._store.add(new Emitter<string>());
 	readonly onDidChangeLanguageModels: Event<string> = this._onLanguageModelChange.event;
+	readonly whenReady: Promise<void>;
 
 	private _recentlyUsedModelIds: string[] = [];
 	private _pinnedModelIds: string[] = [];
@@ -1034,6 +1145,16 @@ export class LanguageModelsService implements ILanguageModelsService {
 			this._refreshModelsControlManifest();
 		}));
 		this._store.add(this._languageModelsConfigurationService.onDidChangeLanguageModelGroups(changedGroups => this._onDidChangeLanguageModelGroups(changedGroups)));
+		const installedExtensionsRegistered = this._extensionService.whenInstalledExtensionsRegistered?.() ?? Promise.resolve(true);
+		this.whenReady = Promise.all([
+			this._languageModelsConfigurationService.whenReady,
+			installedExtensionsRegistered,
+		]).then(async () => {
+			const configuredVendors = new Set(this._languageModelsConfigurationService.getLanguageModelsProviderGroups().map(group => group.vendor));
+			await Promise.all([...configuredVendors].map(vendor => this._resolveAllLanguageModels(vendor, true)));
+		}).catch(error => {
+			this._logService.error('[LM] Failed to resolve configured language models after configuration loading', error);
+		});
 
 		this._store.add(languageModelChatProviderExtensionPoint.setHandler((extensions, { added, removed }) => {
 			const addedVendors: IUserFriendlyLanguageModel[] = [];
@@ -1091,11 +1212,18 @@ export class LanguageModelsService implements ILanguageModelsService {
 				managementCommand: item.managementCommand,
 				deprecation: item.deprecation,
 				when: item.when,
+				singleton: item.singleton,
+				hiddenFromManagement: item.hiddenFromManagement,
 				isDefault: item.vendor === COPILOT_VENDOR_ID
 			};
 			this._vendors.set(item.vendor, vendor);
 			addedVendorIds.push(item.vendor);
 			// Have some models we want from this vendor, so activate the extension
+			if (this._languageModelsConfigurationService.getLanguageModelsProviderGroups?.().some(group => group.vendor === item.vendor)) {
+				void this._resolveAllLanguageModels(item.vendor, true).catch(error => {
+					this._logService.error(`[LM] Failed to resolve configured language models for vendor ${item.vendor}`, error);
+				});
+			}
 		}
 
 		for (const item of removed) {
@@ -1184,23 +1312,31 @@ export class LanguageModelsService implements ILanguageModelsService {
 			const languageModelsGroups: ILanguageModelsGroup[] = [];
 
 			try {
-				const models = await provider.provideLanguageModelChatInfo({ silent }, CancellationToken.None);
+				const options = { silent };
+				const models = await provider.provideLanguageModelChatInfo(options, CancellationToken.None);
+				const status = await provider.provideLanguageModelChatStatus?.(options, CancellationToken.None);
+				const modelIdentifiers = [];
 				if (models.length) {
+					// Every model is registered — `allModels` feeds the cache, so a model
+					// stays resolvable by identifier whatever the picker shows. Only the
+					// display list is filtered: a vendor may register what its agent can
+					// run while another vendor is the one that offers those rows.
 					allModels.push(...models);
-					const modelIdentifiers = [];
 					for (const m of models) {
-						if (vendor.isDefault) {
-							// Special case for copilot models - they are all user selectable unless marked otherwise
-							if (m.metadata.isUserSelectable !== false) {
-								modelIdentifiers.push(m.identifier);
-							} else {
-								this._logService.trace(`[LM] Skipping model ${m.identifier} from model picker as it is not user selectable.`);
-							}
-						} else {
+						if (m.metadata.isUserSelectable !== false) {
 							modelIdentifiers.push(m.identifier);
+						} else {
+							this._logService.trace(`[LM] Skipping model ${m.identifier} from model picker as it is not user selectable.`);
 						}
 					}
-					languageModelsGroups.push({ modelIdentifiers });
+				}
+				// No visible rows is no group: pushing an empty one would render a
+				// vendor with nothing under it. A vendor whose models are all hidden
+				// therefore looks exactly like one with no models at all.
+				if (modelIdentifiers.length) {
+					languageModelsGroups.push({ modelIdentifiers, ...(status && { status }) });
+				} else if (status) {
+					languageModelsGroups.push({ modelIdentifiers: [], status });
 				}
 			} catch (error) {
 				languageModelsGroups.push({
@@ -1240,7 +1376,9 @@ export class LanguageModelsService implements ILanguageModelsService {
 				const configuration = await this._resolveConfiguration(group, vendor.configuration);
 
 				try {
-					const models = await provider.provideLanguageModelChatInfo({ group: group.name, silent, configuration }, CancellationToken.None);
+					const options = { group: group.name, silent, configuration };
+					const models = await provider.provideLanguageModelChatInfo(options, CancellationToken.None);
+					const status = await provider.provideLanguageModelChatStatus?.(options, CancellationToken.None);
 					if (models.length) {
 						// Provide a sensible default for `metadata.detail` so that
 						// multiple instances of the same vendor (e.g. multiple
@@ -1254,7 +1392,9 @@ export class LanguageModelsService implements ILanguageModelsService {
 							}
 						}
 						allModels.push(...models);
-						languageModelsGroups.push({ group, modelIdentifiers: models.map(m => m.identifier) });
+						languageModelsGroups.push({ group, modelIdentifiers: models.map(m => m.identifier), ...(status && { status }) });
+					} else if (status) {
+						languageModelsGroups.push({ group, modelIdentifiers: [], status });
 					}
 
 					// Collect per-model configurations from the group
@@ -1506,6 +1646,27 @@ export class LanguageModelsService implements ILanguageModelsService {
 	getModelConfiguration(modelId: string): IStringDictionary<unknown> | undefined {
 		const metadata = this._modelCache.get(modelId);
 		return this._resolveModelConfigurationWithDefaults(modelId, metadata);
+	}
+
+	async resolveLanguageModelProviderGroup(modelIdentifier: string): Promise<IResolvedLanguageModelsProviderGroup | undefined> {
+		const metadata = this._modelCache.get(modelIdentifier);
+		if (!metadata) {
+			return undefined;
+		}
+		const group = this._modelsGroups.get(metadata.vendor)
+			?.find(candidate => candidate.modelIdentifiers.includes(modelIdentifier))
+			?.group;
+		if (!group) {
+			return undefined;
+		}
+		const configured = this._languageModelsConfigurationService.getLanguageModelsProviderGroups()
+			.find(candidate => candidate.vendor === group.vendor && candidate.name === group.name) ?? group;
+		const schema = this._vendors.get(metadata.vendor)?.configuration;
+		return {
+			name: configured.name,
+			vendor: configured.vendor,
+			configuration: await this._resolveConfiguration(configured, schema),
+		};
 	}
 
 	async setModelConfiguration(modelId: string, values: IStringDictionary<unknown>): Promise<void> {

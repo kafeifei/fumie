@@ -21,7 +21,7 @@ import { IAuthenticationMcpUsageService } from '../../../../../services/authenti
 import { IAuthenticationService, type IAuthenticationProvider } from '../../../../../services/authentication/common/authentication.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { CHAT_SETUP_ACTION_ID } from '../../../browser/actions/chatActions.js';
-import { AgentHostAuthenticationRecovery, authenticateProtectedResources, resolveAuthenticationInteractively, resolveTokenForResource, AgentHostAuthTokenCache, agentHostMcpServerId, resolveMcpServerAuthentication, modelRequiresAgentAuthentication, type IAgentHostAuthenticationOptions } from '../../../browser/agentSessions/agentHost/agentHostAuth.js';
+import { AgentHostAuthenticationRecovery, authenticateProtectedResources, forwardsWorkbenchCredentials, resolveAuthenticationInteractively, resolveTokenForResource, AgentHostAuthTokenCache, agentHostMcpServerId, resolveMcpServerAuthentication, modelRequiresAgentAuthentication, type IAgentHostAuthenticationOptions } from '../../../browser/agentSessions/agentHost/agentHostAuth.js';
 import { createAgentModelByokMeta } from '../../../../../../platform/agentHost/common/agentModelByokMeta.js';
 
 class TestCommandService extends mock<ICommandService>() {
@@ -1061,6 +1061,29 @@ suite('resolveMcpServerAuthentication', () => {
 				},
 			],
 			removedProviders: [dynamicProviderId, dynamicProviderId],
+		});
+	});
+});
+
+suite('forwardsWorkbenchCredentials', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('is off for the minimal Sessions product, whose harnesses own their credentials', () => {
+		// Both halves are load-bearing: a shell that still requires the default
+		// account is a product that does resolve and push a workbench token.
+		assert.deepStrictEqual({
+			minimalShellWithoutDefaultAccount: forwardsWorkbenchCredentials({ sessionsMinimalShell: true, sessionsRequireDefaultAccount: false }),
+			minimalShellRequiringDefaultAccount: forwardsWorkbenchCredentials({ sessionsMinimalShell: true, sessionsRequireDefaultAccount: true }),
+			minimalShellWithoutTheFlag: forwardsWorkbenchCredentials({ sessionsMinimalShell: true }),
+			fullShell: forwardsWorkbenchCredentials({ sessionsMinimalShell: false, sessionsRequireDefaultAccount: false }),
+			stockProduct: forwardsWorkbenchCredentials({}),
+		}, {
+			minimalShellWithoutDefaultAccount: false,
+			minimalShellRequiringDefaultAccount: true,
+			minimalShellWithoutTheFlag: true,
+			fullShell: true,
+			stockProduct: true,
 		});
 	});
 });

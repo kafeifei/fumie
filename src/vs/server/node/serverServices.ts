@@ -82,6 +82,7 @@ import { RemoteUserDataProfilesServiceChannel } from '../../platform/userDataPro
 import { NodePtyHostStarter } from '../../platform/terminal/node/nodePtyHostStarter.js';
 import { NodeAgentHostStarter } from '../../platform/agentHost/node/nodeAgentHostStarter.js';
 import { ServerAgentHostManager } from './serverAgentHostManager.js';
+import { agentHostWebSocketUrl, createServerFumieWebShell, IFumieWebShellServer, type IAgentHostEndpoint } from './fumie/serverFumieWebShell.js';
 import { AgentHostChannel, UnavailableAgentHostChannel } from './agentHostChannel.js';
 import { AgentHostIpcChannels } from '../../platform/agentHost/common/agentService.js';
 import { IServerLifetimeService, ServerLifetimeService } from './serverLifetimeService.js';
@@ -139,7 +140,7 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 	// ExtensionHost Debug broadcast service
 	socketServer.registerChannel(ExtensionHostDebugBroadcastChannel.ChannelName, new ExtensionHostDebugBroadcastChannel());
 
-	// TODO: @Sandy @Joao need dynamic context based router
+	// TODO: @Fumie @Joao need dynamic context based router
 	const router = new StaticRouter<RemoteAgentConnectionContext>(ctx => ctx.clientId === 'renderer');
 
 	// Files
@@ -214,7 +215,7 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 	services.set(IExtensionGalleryService, new SyncDescriptor(ExtensionGalleryServiceWithNoStorageService));
 
 	const downloadChannel = socketServer.getChannel('download', router);
-	services.set(IDownloadService, new DownloadServiceChannelClient(downloadChannel, () => getUriTransformer('renderer') /* TODO: @Sandy @Joao need dynamic context based router */));
+	services.set(IDownloadService, new DownloadServiceChannelClient(downloadChannel, () => getUriTransformer('renderer') /* TODO: @Fumie @Joao need dynamic context based router */));
 
 	services.set(IExtensionsProfileScannerService, new SyncDescriptor(ExtensionsProfileScannerService));
 	services.set(IExtensionsScannerService, new SyncDescriptor(ExtensionsScannerService));
@@ -263,6 +264,15 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 	// The explicit configurations are deliberately separable so that scenarios
 	// with an externally-managed agent host don't accidentally fork a duplicate.
 
+	// The Fumie web shell bridges a browser onto the very agent host this block
+	// wires up, so each branch below records how to dial it. A branch that ends
+	// up with no agent host leaves this unset and the shell serves the page but
+	// refuses the bridge, which is the same thing it does when the host is down.
+	let resolveAgentHostUrl: (() => Promise<string>) | undefined;
+	const bridgeFumieWebShellTo = (endpoint: IAgentHostEndpoint) => {
+		resolveAgentHostUrl = async () => agentHostWebSocketUrl(endpoint);
+	};
+
 	const spawnPort = args['agent-host-port'];
 	const spawnPath = args['agent-host-path'];
 	const spawnAgentHost = !!(spawnPort || spawnPath);
@@ -307,6 +317,7 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 				logService,
 			));
 			socketServer.registerChannel(AgentHostIpcChannels.RemoteProxy, agentHostBridge);
+			bridgeFumieWebShellTo({ host: bridgeHost, port: bridgePort, socketPath: bridgePath, connectionToken: bridgeToken });
 			logService.info(`[AgentHostChannel] Registered IPC channel '${AgentHostIpcChannels.RemoteProxy}' (upstream: ${bridgePath ?? `${bridgeHost}:${bridgePort}`})`);
 		} else {
 			socketServer.registerChannel(AgentHostIpcChannels.RemoteProxy, new UnavailableAgentHostChannel<RemoteAgentConnectionContext>());
@@ -329,6 +340,7 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 				logService,
 			));
 			socketServer.registerChannel(AgentHostIpcChannels.RemoteProxy, agentHostBridge);
+			bridgeFumieWebShellTo({ host: bridgeHost, port: bridgePort, socketPath: bridgePath, connectionToken: bridgeToken });
 			logService.info(`[AgentHostChannel] Registered IPC channel '${AgentHostIpcChannels.RemoteProxy}' (upstream: ${bridgePath ?? `${bridgeHost}:${bridgePort}`})`);
 		} else {
 			socketServer.registerChannel(AgentHostIpcChannels.RemoteProxy, new UnavailableAgentHostChannel<RemoteAgentConnectionContext>());
@@ -360,12 +372,29 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
 				logService,
 			));
 			socketServer.registerChannel(AgentHostIpcChannels.RemoteProxy, agentHostBridge);
+			resolveAgentHostUrl = async () => {
+				await agentHostManager.ensureStarted();
+				return agentHostWebSocketUrl({ socketPath, connectionToken });
+			};
 			logService.info(`[AgentHostChannel] Registered lazy IPC channel '${AgentHostIpcChannels.RemoteProxy}' (upstream: ${socketPath})`);
 		} catch (error) {
 			socketServer.registerChannel(AgentHostIpcChannels.RemoteProxy, new UnavailableAgentHostChannel<RemoteAgentConnectionContext>());
 			logService.error(`[AgentHostChannel] Failed to register IPC channel '${AgentHostIpcChannels.RemoteProxy}'`, error);
 		}
 	}
+
+	// ---- Fumie web shell ---------------------------------------------------
+	//
+	// Served on this server's own HTTP face under `/fumie`, so the CLI's
+	// `serve-web` reverse proxy carries it without knowing it exists and the
+	// shell needs no second port that only this machine could reach.
+	services.set(IFumieWebShellServer, disposables.add(await createServerFumieWebShell(
+		environmentService,
+		logService,
+		() => resolveAgentHostUrl
+			? resolveAgentHostUrl()
+			: Promise.reject(new Error('This server has no agent host to bridge onto.')),
+	)));
 
 	services.set(IAllowedMcpServersService, new SyncDescriptor(AllowedMcpServersService));
 	services.set(IMcpResourceScannerService, new SyncDescriptor(McpResourceScannerService));

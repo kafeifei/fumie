@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import type { GetSessionMessagesOptions, GetSubagentMessagesOptions, ListSubagentsOptions, Options, Query, SDKSessionInfo, SDKUserMessage, SessionMessage, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
+import type { GetSessionMessagesOptions, GetSubagentMessagesOptions, ListSubagentsOptions, Options, Query, SDKSessionInfo, SDKUserMessage, SessionMessage, SessionStore, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -42,6 +42,13 @@ class FakeSdkService implements IClaudeAgentSdkService {
 	getSessionMessagesCalls: { sessionId: string; options: unknown }[] = [];
 	listSubagentsCalls: string[] = [];
 	getSubagentMessagesCalls: { sessionId: string; agentId: string }[] = [];
+	/**
+	 * The routing each read was addressed with. Fumie's own store is keyed by
+	 * project, so a read that arrives without one finds nothing there — the
+	 * options bag is the assertion, not just the id.
+	 */
+	listSubagentsOptions: (ListSubagentsOptions | undefined)[] = [];
+	getSubagentMessagesOptions: (GetSubagentMessagesOptions | undefined)[] = [];
 
 	async listSessions(): Promise<readonly SDKSessionInfo[]> { return []; }
 	async canLoadWithoutDownload(): Promise<boolean> { return true; }
@@ -54,13 +61,15 @@ class FakeSdkService implements IClaudeAgentSdkService {
 		if (this.getSessionMessagesRejection) { throw this.getSessionMessagesRejection; }
 		return this.sessionMessages.get(sessionId) ?? [];
 	}
-	async listSubagents(sessionId: string, _options?: ListSubagentsOptions): Promise<readonly string[]> {
+	async listSubagents(sessionId: string, options?: ListSubagentsOptions): Promise<readonly string[]> {
 		this.listSubagentsCalls.push(sessionId);
+		this.listSubagentsOptions.push(options);
 		if (this.listSubagentsRejection) { throw this.listSubagentsRejection; }
 		return this.subagentIds.get(sessionId) ?? [];
 	}
-	async getSubagentMessages(sessionId: string, agentId: string, _options?: GetSubagentMessagesOptions): Promise<readonly SessionMessage[]> {
+	async getSubagentMessages(sessionId: string, agentId: string, options?: GetSubagentMessagesOptions): Promise<readonly SessionMessage[]> {
 		this.getSubagentMessagesCalls.push({ sessionId, agentId });
+		this.getSubagentMessagesOptions.push(options);
 		if (this.getSubagentMessagesRejection) { throw this.getSubagentMessagesRejection; }
 		return this.subagentMessages.get(`${sessionId}::${agentId}`) ?? [];
 	}
@@ -134,6 +143,7 @@ suite('claudeSubagentResolver — TextSuffixStrategy', () => {
 		const ctx: ISubagentLookupContext = {
 			parentUri,
 			parentSessionId: 'parent-sid',
+			routing: {},
 			parentTranscript: [
 				makeAgentToolCallTurn('toolu_hit', { suffixText: 'whatever\nagentId: a7b3c1d2\n(trailing)' }),
 				makeAgentToolCallTurn('toolu_no_suffix', { suffixText: 'just text, no marker' }),
@@ -168,6 +178,7 @@ suite('claudeSubagentResolver — PromptMatchStrategy', () => {
 		const ctx: ISubagentLookupContext = {
 			parentUri,
 			parentSessionId: 'parent-sid',
+			routing: {},
 			parentTranscript: [
 				makeAgentToolCallTurn('toolu_target', { prompt: 'do the thing' }),
 				makeAgentToolCallTurn('toolu_malformed', { prompt: undefined }), // missing toolInput
@@ -210,6 +221,7 @@ suite('claudeSubagentResolver — PromptMatchStrategy', () => {
 					matched: await strategy.lookup('toolu_target', {
 						parentUri: URI.parse('claude:/parent-sid'),
 						parentSessionId: 'parent-sid',
+						routing: {},
 						parentTranscript: transcript,
 						token: CancellationToken.None,
 					}),
@@ -234,6 +246,7 @@ suite('claudeSubagentResolver — PromptMatchStrategy', () => {
 				assert.strictEqual(await strategy.lookup('toolu_target', {
 					parentUri: URI.parse('claude:/parent-sid'),
 					parentSessionId: 'parent-sid',
+					routing: {},
 					parentTranscript: transcript,
 					token: CancellationToken.None,
 				}), undefined);
@@ -290,8 +303,8 @@ suite('claudeSubagentResolver — getSubagentTranscript', () => {
 
 		const subagentUriA = URI.parse(buildSubagentSessionUri(parentUri, 'toolu_a'));
 		const subagentUriB = URI.parse(buildSubagentSessionUri(parentUri, 'toolu_b'));
-		await getSubagentTranscript(subagentUriA, parentUri, 'parent-sid', 'toolu_a', registry, sdk, log, CancellationToken.None);
-		await getSubagentTranscript(subagentUriB, parentUri, 'parent-sid', 'toolu_b', registry, sdk, log, CancellationToken.None);
+		await getSubagentTranscript(subagentUriA, parentUri, 'parent-sid', {}, 'toolu_a', registry, sdk, log, CancellationToken.None);
+		await getSubagentTranscript(subagentUriB, parentUri, 'parent-sid', {}, 'toolu_b', registry, sdk, log, CancellationToken.None);
 
 		assert.deepStrictEqual({
 			fetchedAgentIds: sdk.getSubagentMessagesCalls.map(c => c.agentId),
@@ -313,7 +326,7 @@ suite('claudeSubagentResolver — getSubagentTranscript', () => {
 		// No prime, no spawn record — strategies all return undefined for an unknown id.
 		const noResolve = await getSubagentTranscript(
 			URI.parse(buildSubagentSessionUri(parentUri, 'toolu_unknown')),
-			parentUri, 'parent-sid', 'toolu_unknown', registry, sdk, log, CancellationToken.None,
+			parentUri, 'parent-sid', {}, 'toolu_unknown', registry, sdk, log, CancellationToken.None,
 		);
 
 		// Cached spawn but SDK rejects — returns [].
@@ -321,7 +334,7 @@ suite('claudeSubagentResolver — getSubagentTranscript', () => {
 		sdk.getSubagentMessagesRejection = new Error('boom');
 		const onError = await getSubagentTranscript(
 			URI.parse(buildSubagentSessionUri(parentUri, 'toolu_known')),
-			parentUri, 'parent-sid', 'toolu_known', registry, sdk, log, CancellationToken.None,
+			parentUri, 'parent-sid', {}, 'toolu_known', registry, sdk, log, CancellationToken.None,
 		);
 
 		assert.deepStrictEqual({
@@ -332,6 +345,46 @@ suite('claudeSubagentResolver — getSubagentTranscript', () => {
 			noResolve: [],
 			onError: [],
 			fetchAttempts: ['agent-x'], // only the cached-hit attempted
+		});
+	});
+
+	test('every subagent read is addressed by the parent receipt routing', async () => {
+		// Regression: the store split made routing load-bearing and this whole
+		// module ignored it. Fumie's store is keyed by project, so a read that
+		// omits the routing does not widen its search — it finds nothing, the
+		// subagent reads as having no transcript, and the restored chat that
+		// depends on it can never resolve.
+		const sdk = new FakeSdkService();
+		const log = new NullLogService();
+		const parentUri = URI.parse('claude:/parent-sid');
+		const registry = disposables.add(new SubagentRegistry());
+		const routing = { dir: '/repo-a', sessionStore: {} as unknown as SessionStore };
+
+		registry.recordSpawn('toolu_a', { agentId: 'agentcached' });
+		await getSubagentTranscript(
+			URI.parse(buildSubagentSessionUri(parentUri, 'toolu_a')),
+			parentUri, 'parent-sid', routing, 'toolu_a', registry, sdk, log, CancellationToken.None,
+		);
+
+		// The strategy chain's own reads carry it too, not just the final fetch.
+		sdk.subagentIds.set('parent-sid', ['agentone']);
+		await new PromptMatchStrategy(sdk, log).lookup('toolu_target', {
+			parentUri,
+			parentSessionId: 'parent-sid',
+			routing,
+			parentTranscript: [makeAgentToolCallTurn('toolu_target', { prompt: 'do the thing' })],
+			token: CancellationToken.None,
+		});
+		await fetchParentTurns(sdk, log, { parentUri, parentSessionId: 'parent-sid', routing, token: CancellationToken.None }, 'Routing');
+
+		assert.deepStrictEqual({
+			subagentMessages: sdk.getSubagentMessagesOptions,
+			listSubagents: sdk.listSubagentsOptions,
+			sessionMessages: sdk.getSessionMessagesCalls.map(call => call.options),
+		}, {
+			subagentMessages: [routing, routing],
+			listSubagents: [routing],
+			sessionMessages: [{ includeSystemMessages: true, ...routing }],
 		});
 	});
 });
@@ -352,6 +405,7 @@ suite('claudeSubagentResolver — resolveAgentIdViaChain (free function)', () =>
 	const ctx = (token = CancellationToken.None): ISubagentLookupContext => ({
 		parentUri: URI.parse('copilot:/p'),
 		parentSessionId: 'p',
+		routing: {},
 		token,
 	});
 
@@ -480,6 +534,7 @@ suite('claudeSubagentResolver — fetchParentTurns', () => {
 		const log = new NullLogService();
 		const baseCtx = (overrides: Partial<ISubagentLookupContext>): ISubagentLookupContext => ({
 			parentSessionId: 'sess-1',
+			routing: {},
 			parentUri: URI.parse('file:///parent'),
 			token: CancellationToken.None,
 			...overrides,

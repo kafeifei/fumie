@@ -7,7 +7,7 @@ import assert from 'assert';
 import { Event } from '../../../../../../base/common/event.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
 import { IRemoteAgentHostLocationPreferenceService } from '../../../../../../platform/agentHost/common/remoteAgentHostLocationPreference.js';
-import { type ITunnelConnectResult, type ITunnelGatewaySelection, type ITunnelGatewaySelectionSession, type ITunnelInfo } from '../../../../../../platform/agentHost/common/tunnelAgentHost.js';
+import { type ITunnelConnectResult, type ITunnelGatewaySelection, type ITunnelGatewaySelectionSession, type ITunnelInfo, type ITunnelUserLimit } from '../../../../../../platform/agentHost/common/tunnelAgentHost.js';
 import { resolveGatewaySelection, type IGatewaySelectionRequest } from '../../../../../../platform/agentHost/common/tunnelGatewaySelection.js';
 import type { ITunnelDuplexStream } from '../../../../../../platform/agentHost/common/tunnelMessageSocket.js';
 import type { IDialogService } from '../../../../../../platform/dialogs/common/dialogs.js';
@@ -110,6 +110,18 @@ suite('BrowserTunnelAgentHostService', () => {
 		}]);
 	});
 
+	test('an all-tunnels listing keeps the tunnels an agent host connection would drop', () => {
+		// Every tunnel counts towards 'TunnelsPerUserPerCluster', including the
+		// ones this app could never connect to, so the quota view asks for them.
+		const results = filterBrowserTunnelInfos([
+			{ tunnelId: 'v6', clusterId: 'cluster', labels: ['vscode-server-launcher', 'protocolv6'] },
+			{ tunnelId: 'mobile', clusterId: 'cluster', labels: ['fumie-mobile-web'] },
+			{ tunnelId: 'missing-cluster', labels: ['fumie-mobile-web'] },
+		], true);
+
+		assert.deepStrictEqual(results.map(tunnel => tunnel.tunnelId), ['v6', 'mobile']);
+	});
+
 	test('completes the version-six gateway selection returned by the browser picker', async () => {
 		const connector = new FakeConnector({
 			selectionId: 'selection-id',
@@ -192,6 +204,10 @@ suite('BrowserTunnelAgentHostService', () => {
 
 			deleteTunnel(): Promise<boolean> {
 				return Promise.resolve(true);
+			}
+
+			listUserLimits(): Promise<readonly ITunnelUserLimit[]> {
+				return Promise.resolve([]);
 			}
 		}
 

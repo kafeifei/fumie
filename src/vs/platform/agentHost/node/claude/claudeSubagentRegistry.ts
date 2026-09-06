@@ -52,7 +52,6 @@ export const SUBAGENT_ID_SUFFIX_REGEX = /^\s*agentId:\s+([a-z0-9]+)\b/im;
  *     `subagent_completed` signals.
  */
 export class SubagentSpawn {
-	background = false;
 	subagentType: string | undefined;
 	description: string | undefined;
 	prompt: string | undefined;
@@ -60,11 +59,17 @@ export class SubagentSpawn {
 	private _agentId: string | undefined;
 	private _announced = false;
 	private _completed = false;
+	background = false;
 
 	constructor(readonly toolUseId: string) { }
 
 	get agentId(): string | undefined {
 		return this._agentId;
+	}
+
+	/** Whether one of the completion routes has already closed this spawn out. */
+	get completed(): boolean {
+		return this._completed;
 	}
 
 	/**
@@ -114,8 +119,9 @@ export interface ISubagentSpawnInit {
 
 /**
  * Per-parent-session collection of {@link SubagentSpawn} entries plus
- * a reverse index from inner `tool_use_id` to its parent Task. Owned
- * by `ClaudeAgentSession` (the registry dies with the session).
+ * reverse indexes from SDK task ids and inner `tool_use_id`s to their
+ * parent Task. Owned by `ClaudeAgentSession` (the registry dies with
+ * the session).
  *
  * Replaces the singleton-keyed-by-URI `IClaudeSubagentResolver`
  * tracker surface from earlier Phase 12: lifecycle is implicit, no
@@ -125,10 +131,12 @@ export interface ISubagentSpawnInit {
  */
 export class SubagentRegistry extends Disposable {
 	private readonly _spawns = new Map<string, SubagentSpawn>();
+	private readonly _taskToSpawn = new Map<string, string>();
 	private readonly _innerToParent = new Map<string, string>();
 
 	override dispose(): void {
 		this._spawns.clear();
+		this._taskToSpawn.clear();
 		this._innerToParent.clear();
 		super.dispose();
 	}
@@ -168,7 +176,21 @@ export class SubagentRegistry extends Disposable {
 
 	removeSpawn(toolUseId: string): void {
 		this._spawns.delete(toolUseId);
+		this._evictTaskEdgesFor(toolUseId);
 		this._evictInnerEdgesFor(toolUseId);
+	}
+
+	/** Correlate a `task_started.task_id` with the Task tool call that spawned it. */
+	noteTask(taskId: string, toolUseId: string): void {
+		if (this._spawns.has(toolUseId)) {
+			this._taskToSpawn.set(taskId, toolUseId);
+		}
+	}
+
+	/** Resolve a later `task_updated` frame, which carries only the SDK task id. */
+	getSpawnForTask(taskId: string): SubagentSpawn | undefined {
+		const toolUseId = this._taskToSpawn.get(taskId);
+		return toolUseId !== undefined ? this._spawns.get(toolUseId) : undefined;
 	}
 
 	/** Mapper records the parent of an inner `tool_use` block when an inner subagent message arrives. */
@@ -180,6 +202,35 @@ export class SubagentRegistry extends Disposable {
 	getParentSpawn(innerToolUseId: string): SubagentSpawn | undefined {
 		const parentId = this._innerToParent.get(innerToolUseId);
 		return parentId !== undefined ? this._spawns.get(parentId) : undefined;
+	}
+
+	/**
+	 * Liveness query: is at least one *background* spawn still open — i.e.
+	 * recorded, flipped to background mode, and not yet closed by its deferred
+	 * `system.task_notification`?
+	 *
+	 * Purely non-destructive: unlike {@link drainForegroundSpawns} and
+	 * {@link drainAllSpawns} (which are orphan *cleanup* at the turn and
+	 * process-rebuild boundaries) this mutates nothing and may be polled
+	 * freely.
+	 *
+	 * Why it exists: a background subagent is an in-process task of the warm
+	 * CLI subprocess, so its life is bound to that subprocess. The lifecycle
+	 * rules that tear a subprocess down keyed only off "is a foreground turn in
+	 * flight" (the prompt queue), and therefore killed background work the
+	 * moment the user's turn finished. This is the missing half of that
+	 * liveness signal.
+	 *
+	 * Task age is not a completion signal. Keep unfinished work alive until
+	 * the SDK reports completion or the owning process is gone.
+	 */
+	hasOpenBackgroundSpawns(): boolean {
+		for (const spawn of this._spawns.values()) {
+			if (spawn.background && !spawn.completed) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -198,8 +249,29 @@ export class SubagentRegistry extends Disposable {
 		}
 		for (const spawn of drained) {
 			this._spawns.delete(spawn.toolUseId);
+			this._evictTaskEdgesFor(spawn.toolUseId);
 			this._evictInnerEdgesFor(spawn.toolUseId);
 		}
+		return drained;
+	}
+
+	/**
+	 * Process-rebuild cleanup: remove and return **every** spawn still open,
+	 * background ones included.
+	 *
+	 * Unlike {@link drainForegroundSpawns} — the per-turn boundary, which
+	 * deliberately preserves background spawns because their completion arrives
+	 * later via `system.task_notification` — this is the boundary at which the
+	 * CLI subprocess that owned those spawns is replaced. Both completion
+	 * routes (a foreground `tool_result` and a deferred background
+	 * `task_notification`) belong to the dead process, so neither can ever
+	 * arrive for these spawns and every one of them is definitively orphaned.
+	 */
+	drainAllSpawns(): readonly SubagentSpawn[] {
+		const drained = [...this._spawns.values()];
+		this._spawns.clear();
+		this._taskToSpawn.clear();
+		this._innerToParent.clear();
 		return drained;
 	}
 
@@ -218,6 +290,14 @@ export class SubagentRegistry extends Disposable {
 		for (const [innerId, parentId] of this._innerToParent) {
 			if (parentId === parentToolUseId) {
 				this._innerToParent.delete(innerId);
+			}
+		}
+	}
+
+	private _evictTaskEdgesFor(toolUseId: string): void {
+		for (const [taskId, spawnId] of this._taskToSpawn) {
+			if (spawnId === toolUseId) {
+				this._taskToSpawn.delete(taskId);
 			}
 		}
 	}

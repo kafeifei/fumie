@@ -169,9 +169,25 @@ suite('ChatContextUsageWidget', () => {
 	}
 
 	function createRequest(modelId: string, usage: IChatUsage | undefined, onDidChange: Event<void> = Event.None, sessionCost: () => number = () => 0): IChatRequestModel {
-		const session = { get sessionCost() { return sessionCost(); } } as IChatRequestModel['session'];
+		const requests: IChatRequestModel[] = [];
+		const session = { get sessionCost() { return sessionCost(); }, getRequests: () => requests } as unknown as IChatRequestModel['session'];
 		const response = { usage, onDidChange, session } as unknown as IChatResponseModel;
-		return { modelId, response, session } as unknown as IChatRequestModel;
+		const request = { modelId, response, session } as unknown as IChatRequestModel;
+		requests.push(request);
+		return request;
+	}
+
+	/** A session of several requests; returns the last one (as `update()` receives it). */
+	function createRequestChain(entries: { modelId?: string; usage?: IChatUsage; hasResponse?: boolean }[]): IChatRequestModel {
+		const requests: IChatRequestModel[] = [];
+		const session = { sessionCost: 0, getRequests: () => requests } as unknown as IChatRequestModel['session'];
+		for (const entry of entries) {
+			const response = entry.hasResponse === false
+				? undefined
+				: { usage: entry.usage, onDidChange: Event.None, session } as unknown as IChatResponseModel;
+			requests.push({ modelId: entry.modelId, response, session } as unknown as IChatRequestModel);
+		}
+		return requests[requests.length - 1];
 	}
 
 	function usage(actualModelId?: string): IChatUsage {
@@ -197,6 +213,78 @@ suite('ChatContextUsageWidget', () => {
 		widget.update(createRequest(AUTO_MODEL, usage(undefined)));
 
 		assert.strictEqual(widget.isVisible.get(), false);
+	});
+
+	test('falls back to the most recent usage-bearing request when the trailing turns have none', () => {
+		const widget = createWidget();
+		widget.setSelectedModel(CONCRETE_MODEL);
+		// Turn 1 reported usage; turn 2 was interrupted (response without
+		// usage); turn 3 is a reconnect stub without a response at all. The
+		// gauge must keep showing turn 1's occupancy.
+		const last = createRequestChain([
+			{ modelId: CONCRETE_MODEL, usage: { kind: 'usage', promptTokens: 50_000, completionTokens: 4_000 } },
+			{ modelId: CONCRETE_MODEL, usage: undefined },
+			{ modelId: CONCRETE_MODEL, hasResponse: false },
+		]);
+
+		widget.update(last);
+
+		assert.strictEqual(widget.isVisible.get(), true);
+		assert.strictEqual(widget.domNode.querySelector('.percentage-label')?.textContent, '50%');
+	});
+
+	test('a usage-bearing request without a modelId still renders via the selected model window', () => {
+		const widget = createWidget();
+		widget.setSelectedModel(CONCRETE_MODEL);
+		const last = createRequestChain([
+			{ modelId: undefined, usage: { kind: 'usage', promptTokens: 50_000, completionTokens: 4_000 } },
+		]);
+
+		widget.update(last);
+
+		assert.strictEqual(widget.isVisible.get(), true);
+		assert.strictEqual(widget.domNode.querySelector('.percentage-label')?.textContent, '50%');
+	});
+
+	test('always-visible mode shows a placeholder gauge before any usage is reported', () => {
+		const widget = createWidget();
+		widget.setSessionsWindowMode(true);
+
+		assert.strictEqual(widget.isVisible.get(), true);
+		assert.strictEqual(widget.domNode.querySelector('.percentage-label')?.textContent, '–');
+
+		// Real data replaces the placeholder.
+		widget.setSelectedModel(CONCRETE_MODEL);
+		widget.update(createRequest(CONCRETE_MODEL, usage()));
+		assert.strictEqual(widget.domNode.querySelector('.percentage-label')?.textContent, '50%');
+
+		// Clearing the session (no request) returns to the placeholder, not hidden.
+		widget.update(undefined);
+		assert.strictEqual(widget.isVisible.get(), true);
+		assert.strictEqual(widget.domNode.querySelector('.percentage-label')?.textContent, '–');
+	});
+
+	test('without always-visible mode the widget stays hidden until usage arrives', () => {
+		const widget = createWidget();
+		widget.update(undefined);
+		assert.strictEqual(widget.isVisible.get(), false);
+	});
+
+	test('falls back to the backend-reported window when the catalog has no window metadata', () => {
+		const widget = createWidget();
+		// A host-managed gateway model registers with neither `maxPromptTokens`
+		// nor `maxOutputTokens`, so the catalog denominator resolves to zero for
+		// the selected AND the serving model. The backend-reported window of the
+		// call that served the request is the only denominator left.
+		widget.setSelectedModel(AUTO_MODEL);
+		widget.update(createRequest(AUTO_MODEL, {
+			kind: 'usage', promptTokens: 96_000, completionTokens: 4_000,
+			modelContextWindow: { totalTokens: 200_000, maxOutputTokens: 8_000 },
+		}));
+
+		assert.strictEqual(widget.isVisible.get(), true);
+		// 100,000 used / 200,000 reported window === 50%.
+		assert.strictEqual(widget.domNode.querySelector('.percentage-label')?.textContent, '50%');
 	});
 
 	test('uses the selected concrete model window directly', () => {

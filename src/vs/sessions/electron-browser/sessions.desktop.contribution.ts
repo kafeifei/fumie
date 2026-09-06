@@ -6,9 +6,13 @@
 import { registerAction2 } from '../../platform/actions/common/actions.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../workbench/common/contributions.js';
 import { OpenSessionInVSCodeAction, OpenInVSCodeWidgetContribution, OpenVSCodeWindowAction, ReturnToVSCodeEditorAction, ShouldShowReturnToVSCodeEditorAction } from './actions/vscodeActions.js';
+import product from '../../platform/product/common/product.js';
 
 // Actions
 (function registerActions(): void {
+	if (product.sessionsMinimalShell) {
+		return;
+	}
 	registerAction2(OpenSessionInVSCodeAction);
 	registerAction2(OpenVSCodeWindowAction);
 	registerAction2(ReturnToVSCodeEditorAction);
@@ -16,5 +20,8 @@ import { OpenSessionInVSCodeAction, OpenInVSCodeWidgetContribution, OpenVSCodeWi
 })();
 
 (function registerWorkbenchContributions(): void {
+	if (product.sessionsMinimalShell) {
+		return;
+	}
 	registerWorkbenchContribution2(OpenInVSCodeWidgetContribution.ID, OpenInVSCodeWidgetContribution, WorkbenchPhase.BlockRestore);
 })();

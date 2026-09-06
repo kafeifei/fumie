@@ -160,6 +160,7 @@ export class AuxiliaryBarPart extends AbstractPaneCompositePart {
 
 	override create(parent: HTMLElement): void {
 		super.create(parent);
+		parent.classList.add('sessions-inspector');
 		parent.setAttribute('role', 'complementary');
 		parent.setAttribute('aria-label', localize('auxiliaryBarAriaLabel', "Session Details"));
 	}

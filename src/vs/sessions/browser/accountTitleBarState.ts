@@ -10,7 +10,7 @@ import { URI } from '../../base/common/uri.js';
 import { localize } from '../../nls.js';
 import { ChatEntitlement, IChatSentiment, IQuotaSnapshot } from '../../workbench/services/chat/common/chatEntitlementService.js';
 import { IDefaultAccountService } from '../../platform/defaultAccount/common/defaultAccount.js';
-import { IAuthenticationService } from '../../workbench/services/authentication/common/authentication.js';
+import { IAuthenticationService, INTERNAL_AUTH_PROVIDER_PREFIX } from '../../workbench/services/authentication/common/authentication.js';
 
 export interface IResolvedAccountInfo {
 	readonly accountName: string;
@@ -58,6 +58,80 @@ export async function resolveAccountInfo(
 	}
 
 	return undefined;
+}
+
+/**
+ * Resolves the account shown in the Agents sidebar footer from the OSS
+ * authentication stack: the default account first, then any registered
+ * non-internal provider session.
+ */
+export async function resolveSidebarAccountInfo(
+	defaultAccountService: IDefaultAccountService,
+	authenticationService: IAuthenticationService,
+): Promise<IResolvedAccountInfo | undefined> {
+	const defaultAccount = await resolveAccountInfo(defaultAccountService, authenticationService);
+	if (defaultAccount) {
+		return defaultAccount;
+	}
+
+	for (const providerId of authenticationService.getProviderIds()) {
+		if (providerId.startsWith(INTERNAL_AUTH_PROVIDER_PREFIX)) {
+			continue;
+		}
+
+		try {
+			const sessions = await authenticationService.getSessions(providerId);
+			if (sessions.length === 0) {
+				continue;
+			}
+
+			const provider = authenticationService.getProvider(providerId);
+			return {
+				accountName: sessions[0].account.label,
+				accountProviderId: providerId,
+				accountProviderLabel: provider.label,
+				accountIcon: sessions[0].account.icon,
+			};
+		} catch {
+			// Provider not available yet
+		}
+	}
+
+	return undefined;
+}
+
+export interface ISidebarAccountPresentation {
+	readonly label: string;
+	readonly ariaLabel: string;
+	readonly signedIn: boolean;
+}
+
+/**
+ * Presentation for the Agents sidebar footer account row.
+ * Uses the OSS default-account / authentication session, not Copilot or Codex status.
+ */
+export function getSidebarAccountPresentation(info: IResolvedAccountInfo | undefined, isLoading: boolean): ISidebarAccountPresentation {
+	if (isLoading) {
+		return {
+			label: localize('loadingAccount', "Loading Account..."),
+			ariaLabel: localize('loadingAccountAria', "Loading account"),
+			signedIn: false,
+		};
+	}
+
+	if (info) {
+		return {
+			label: `${info.accountName} (${info.accountProviderLabel})`,
+			ariaLabel: localize('accountSignedInAria', "Signed in as {0} with {1}", info.accountName, info.accountProviderLabel),
+			signedIn: true,
+		};
+	}
+
+	return {
+		label: localize('signInLabel', "Sign In"),
+		ariaLabel: localize('signInAria', "Sign in to your account"),
+		signedIn: false,
+	};
 }
 
 /**

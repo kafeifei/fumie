@@ -16,6 +16,7 @@ import { MobileLayoutController } from './mobileSessionLayoutController.js';
 import { DOCK_DETAIL_PANEL_SETTING } from '../../../common/sessionConfig.js';
 import { IAgentWorkbenchLayoutService } from '../../../browser/workbench.js';
 import { SinglePaneLayoutController } from './singlePaneLayoutController.js';
+import './sidebarStatusOverlay.js';
 
 class SessionsLayoutContribution extends Disposable implements IWorkbenchContribution {
 
@@ -56,7 +57,13 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 		[DOCK_DETAIL_PANEL_SETTING]: {
 			type: 'boolean',
 			markdownDescription: localize('sessions.layout.singlePaneDetailPanel', "Controls whether the Agents window docks the detail panel inside the editor so a single editor tab bar spans across the editor and the detail panel. Requires a window reload to take effect."),
-			default: true,
+			// Stage 1 of docs/architecture.md: panels move into
+			// the upstream editor grid, so the docked single-pane detail panel is no
+			// longer the default. Deliberately not keyed off `product.sessionsMinimalShell`
+			// anymore — that flag also gates credential forwarding, tunnel UI and the
+			// terminal/run-script affordances, and must not be flipped for layout.
+			// The setting stays user-toggleable until the single-pane code is removed.
+			default: false,
 			tags: ['experimental'],
 			experiment: { mode: 'startup' }
 		},

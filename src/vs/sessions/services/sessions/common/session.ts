@@ -38,6 +38,17 @@ export interface ISessionType {
 	 * credentials come and go).
 	 */
 	readonly authRequirement: SessionTypeAuthRequirement;
+	/**
+	 * Fumie-only: readiness of the agent's SDK when the agent host is still
+	 * preparing (installing) it or the install failed. Absent for agents whose
+	 * SDK is ready — which is every agent the host actually advertises.
+	 * Installing/failed types are shown in the picker but cannot start a
+	 * session; selecting a failed one requests a retry.
+	 */
+	readonly sdkReadiness?: {
+		readonly state: 'installing' | 'failed';
+		readonly error?: string;
+	};
 }
 
 /**
@@ -768,6 +779,22 @@ export function sessionHasChanges(session: ISession, reader: IReader | undefined
 		return changesSummary.files > 0;
 	}
 	return session.changes.read(reader).length > 0;
+}
+
+/**
+ * Returns the current Git working-tree dirt projection. `undefined` means the
+ * session has no repository projection or at least one repository has not
+ * reported its uncommitted count, so destructive UI must fail safe.
+ */
+export function sessionUncommittedChangesState(session: ISession, reader: IReader | undefined): boolean | undefined {
+	const repositories = session.workspace.read(reader)?.folders.flatMap(folder => folder.gitRepository ? [folder.gitRepository] : []) ?? [];
+	if (repositories.length === 0) {
+		return undefined;
+	}
+	if (repositories.some(repository => (repository.uncommittedChanges ?? 0) > 0)) {
+		return true;
+	}
+	return repositories.some(repository => repository.uncommittedChanges === undefined) ? undefined : false;
 }
 
 /**

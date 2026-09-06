@@ -61,7 +61,10 @@ export class SinglePaneWorkbench extends Workbench {
 		return this.isSidePaneVisible();
 	}
 
-	protected override readonly _defaultSidePaneState = { editor: true, auxiliaryBar: false };
+	// Chat is the primary surface. Opening the side pane without a prior explicit
+	// composition starts with docked details only; a real file or diff reveals
+	// editor content through the normal editor-open path.
+	protected override readonly _defaultSidePaneState = { editor: false, auxiliaryBar: true };
 
 	/**
 	 * A docked-detail editor (Changes/Files) renders its content in the docked

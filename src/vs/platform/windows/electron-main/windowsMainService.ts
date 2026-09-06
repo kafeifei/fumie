@@ -41,7 +41,7 @@ import { AgentsWindowOpenSource, IAddRemoveFoldersRequest, INativeOpenFileReques
 import { CodeWindow } from './windowImpl.js';
 import { IOpenConfiguration, IOpenEmptyConfiguration, IWindowsCountChangedEvent, IWindowsMainService, OpenContext, getLastFocused } from './windows.js';
 import { findWindowOnExtensionDevelopmentPath, findWindowOnFile, findWindowOnWorkspaceOrFolder } from './windowsFinder.js';
-import { IWindowState, WindowsStateHandler } from './windowsStateHandler.js';
+import { IWindowState, WindowsStateHandler, isAgentSessionsWindowState } from './windowsStateHandler.js';
 import { IRecent } from '../../workspaces/common/workspaces.js';
 import { hasWorkspaceFileExtension, IAnyWorkspaceIdentifier, ISingleFolderWorkspaceIdentifier, isSingleFolderWorkspaceIdentifier, isWorkspaceIdentifier, IWorkspaceIdentifier, toWorkspaceIdentifier } from '../../workspace/common/workspace.js';
 import { createEmptyWorkspaceIdentifier, getSingleFolderWorkspaceIdentifier, getWorkspaceIdentifier } from '../../workspaces/node/workspaces.js';
@@ -278,6 +278,19 @@ export class WindowsMainService extends Disposable implements IWindowsMainServic
 		const forceNewWindow = !forceReuseWindow;
 
 		return this.open({ ...openConfig, cli, forceEmpty, forceNewWindow, forceReuseWindow, remoteAuthority, forceTempProfile: options?.forceTempProfile, forceProfile: options?.forceProfile });
+	}
+
+	async openWindowOnActivate(openConfig: IOpenEmptyConfiguration): Promise<ICodeWindow[]> {
+		const lastWindow = this.windowsStateHandler.getLastClosedOrActiveWindow();
+		if (isAgentSessionsWindowState(lastWindow, this.environmentMainService.agentSessionsWorkspace)) {
+			this.logService.trace('windowsManager#openWindowOnActivate restoring Agents window');
+			try {
+				return await this.openAgentsWindow({ ...openConfig, cli: this.environmentMainService.args });
+			} catch (error) {
+				this.logService.error('windowsManager#openWindowOnActivate failed to restore Agents window', error);
+			}
+		}
+		return this.openEmptyWindow(openConfig);
 	}
 
 	openExistingWindow(window: ICodeWindow, openConfig: IOpenConfiguration): void {

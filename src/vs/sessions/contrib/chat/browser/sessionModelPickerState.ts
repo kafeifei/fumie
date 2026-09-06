@@ -30,6 +30,12 @@ export interface ISessionModelSelectionState {
 	readonly models: readonly ILanguageModelChatMetadataAndIdentifier[];
 	readonly options: INormalizedSessionModelPickerOptions;
 	readonly hasSelectableModel: boolean;
+	/**
+	 * Whether a session and its provider were resolved, so {@link models} is that
+	 * session's pool. While false the list is empty because there is nothing to
+	 * scope it by yet, which says nothing about what the pool would offer.
+	 */
+	readonly poolResolved: boolean;
 }
 
 export function normalizeModelPickerOptions(options: ISessionModelPickerOptions | undefined): INormalizedSessionModelPickerOptions {
@@ -53,6 +59,7 @@ export const EMPTY_MODEL_SELECTION_STATE: ISessionModelSelectionState = {
 	models: [],
 	options: normalizeModelPickerOptions(undefined),
 	hasSelectableModel: false,
+	poolResolved: false,
 };
 
 /**
@@ -72,6 +79,7 @@ export function createModelSelectionState(
 		models,
 		options,
 		hasSelectableModel: hasSelectableModel(models, options),
+		poolResolved: true,
 		// Nothing is shown while pending: the only correct answer is not available yet.
 		currentModel: pendingSelection ? undefined : displayedModel,
 		pendingSelection,

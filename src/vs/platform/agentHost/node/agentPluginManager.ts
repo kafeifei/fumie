@@ -65,8 +65,9 @@ export class AgentPluginManager implements IAgentPluginManager {
 		@IFileService private readonly _fileService: IFileService,
 		@ILogService private readonly _logService: ILogService,
 		maxPlugins: number = DEFAULT_MAX_PLUGINS,
+		basePath?: URI,
 	) {
-		this._basePath = URI.joinPath(userDataPath, 'agentPlugins');
+		this._basePath = basePath ?? URI.joinPath(userDataPath, 'agentPlugins');
 		this._cachePath = URI.joinPath(this._basePath, 'cache.json');
 		this._maxPlugins = maxPlugins;
 	}

@@ -6,12 +6,13 @@
 import * as assert from 'assert';
 import { Action, SubmenuAction } from '../../../../../base/common/actions.js';
 import { Event } from '../../../../../base/common/event.js';
+import Severity from '../../../../../base/common/severity.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { AgentHostCodexAgentEnabledSettingId, CodexPreferAgentHostEditorSettingId } from '../../../../../platform/agentHost/common/agentService.js';
 import { CODEX_AGENT_PROVIDER_ID } from '../../../../../platform/agentHost/common/agent.js';
 import { ChatAIDisabledSettingId } from '../../../../../platform/chat/common/chatSettings.js';
 import { OpenOptions } from '../../../../../platform/opener/common/opener.js';
-import { ICodexAccountService, createCodexAccountMenuActions, hasSignedInCodexChatGPTAccount, openCodexAuthUrl, shouldShowCodexAccount } from '../../browser/codexAccountService.js';
+import { ICodexAccountService, createCodexAccountMenuActions, createCodexModelProviderPresentation, hasSignedInCodexChatGPTAccount, openCodexAuthUrl, shouldShowCodexAccount } from '../../browser/codexAccountService.js';
 
 suite('CodexAccountService', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
@@ -83,6 +84,47 @@ suite('CodexAccountService', () => {
 	test('hides signed-in and sign-in actions when the account surface is unavailable', () => {
 		assert.deepStrictEqual(createCodexAccountMenuActions(service('signedIn'), false), []);
 		assert.deepStrictEqual(createCodexAccountMenuActions(service('signedOut'), false), []);
+	});
+
+	test('presents Codex Provider recovery from the existing ChatGPT account state', async () => {
+		const signedOut = service('signedOut');
+		const signedOutStatus = createCodexModelProviderPresentation(signedOut).provideStatus({ hasModelSnapshot: true, hasNativeModels: false });
+		assert.deepStrictEqual({
+			message: signedOutStatus?.message,
+			severity: signedOutStatus?.severity,
+			action: signedOutStatus?.action?.label,
+		}, {
+			message: 'Sign in to ChatGPT to load Codex models',
+			severity: Severity.Warning,
+			action: 'Sign in to ChatGPT',
+		});
+		await signedOutStatus?.action?.run();
+		assert.strictEqual(signedOut.signInCalls, 1);
+		assert.strictEqual(
+			createCodexModelProviderPresentation(service('unknown')).provideStatus({ hasModelSnapshot: false, hasNativeModels: false })?.action?.label,
+			'Sign in to ChatGPT'
+		);
+
+		const error = service('error');
+		const errorStatus = createCodexModelProviderPresentation(error).provideStatus({ hasModelSnapshot: true, hasNativeModels: false });
+		assert.deepStrictEqual({
+			message: errorStatus?.message,
+			severity: errorStatus?.severity,
+			action: errorStatus?.action?.label,
+		}, {
+			message: 'ChatGPT sign-in needs attention',
+			severity: Severity.Error,
+			action: 'Retry ChatGPT sign-in',
+		});
+		await errorStatus?.action?.run();
+		assert.strictEqual(error.signInCalls, 1);
+
+		assert.deepStrictEqual(
+			createCodexModelProviderPresentation(service('downloading')).provideStatus({ hasModelSnapshot: false, hasNativeModels: false }),
+			{ message: 'Downloading Codex agent…', severity: Severity.Info }
+		);
+		assert.strictEqual(createCodexModelProviderPresentation(service('signedIn')).provideStatus({ hasModelSnapshot: true, hasNativeModels: true }), undefined);
+		assert.strictEqual(createCodexModelProviderPresentation(service('unavailable')).provideStatus({ hasModelSnapshot: true, hasNativeModels: false }), undefined);
 	});
 
 	test('only shows ChatGPT accounts where the Codex agent host is available', () => {

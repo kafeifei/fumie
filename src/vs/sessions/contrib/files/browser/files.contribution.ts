@@ -22,6 +22,9 @@ import { SESSIONS_FILES_EMPTY_VIEW_ID, SESSIONS_FILES_VIEW_ID, SessionsExplorerE
 import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
 import { SessionHasGitRepositoryContext, SessionHasGitSyncActionRunningContext, IsNewChatSessionContext, IsPhoneLayoutContext, SessionHasWorkspaceContext } from '../../../common/contextkeys.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { Extensions as ConfigurationExtensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
+import { SESSIONS_FILES_SHOW_HIDDEN_SETTING } from '../common/hiddenFiles.js';
 
 export const SESSIONS_FILES_CONTAINER_ID = 'workbench.sessions.auxiliaryBar.filesContainer';
 
@@ -37,7 +40,7 @@ const filesViewContainer = viewContainerRegistry.registerViewContainer({
 	order: 11,
 	ctorDescriptor: new SyncDescriptor(ViewPaneContainer, [SESSIONS_FILES_CONTAINER_ID, { mergeViewWithContainerWhenSingleView: true }]),
 	storageId: SESSIONS_FILES_CONTAINER_ID,
-	hideIfEmpty: true,
+	hideIfEmpty: false,
 	openCommandActionDescriptor: {
 		id: SESSIONS_FILES_CONTAINER_ID,
 		title: localize2('explore', "Explorer"),
@@ -75,7 +78,7 @@ class RegisterFilesViewContribution implements IWorkbenchContribution {
 			ctorDescriptor: new SyncDescriptor(SessionsExplorerEmptyView),
 			canToggleVisibility: false,
 			canMoveView: false,
-			when: ContextKeyExpr.and(WorkspaceFolderCountContext.isEqualTo('0'), IsPhoneLayoutContext.negate(), SessionHasWorkspaceContext),
+			when: ContextKeyExpr.and(WorkspaceFolderCountContext.isEqualTo('0'), IsPhoneLayoutContext.negate()),
 			windowEnablement: WindowEnablement.Sessions,
 		}], filesViewContainer);
 	}
@@ -122,6 +125,40 @@ registerAction2(class extends Action2 {
 		} finally {
 			isSyncActionRunning.set(false);
 		}
+	}
+});
+
+Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).registerConfiguration({
+	id: 'sessions',
+	properties: {
+		[SESSIONS_FILES_SHOW_HIDDEN_SETTING]: {
+			type: 'boolean',
+			default: false,
+			description: localize('sessions.files.showHidden', "Controls whether hidden files (names starting with a dot) are shown in the Agents Files tree. Off by default, like Cursor."),
+		},
+	},
+});
+
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: 'sessions.files.action.toggleHiddenFiles',
+			title: localize2('showHiddenFiles', "Show Hidden Files"),
+			icon: Codicon.eye,
+			toggled: ContextKeyExpr.equals(`config.${SESSIONS_FILES_SHOW_HIDDEN_SETTING}`, true),
+			menu: {
+				id: MenuId.ViewTitle,
+				group: '1_files',
+				order: 11,
+				when: ContextKeyExpr.equals('view', SESSIONS_FILES_VIEW_ID),
+			},
+		});
+	}
+
+	async run(accessor: ServicesAccessor) {
+		const configurationService = accessor.get(IConfigurationService);
+		const showHidden = configurationService.getValue<boolean>(SESSIONS_FILES_SHOW_HIDDEN_SETTING) === true;
+		await configurationService.updateValue(SESSIONS_FILES_SHOW_HIDDEN_SETTING, !showHidden);
 	}
 });
 

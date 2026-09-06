@@ -249,7 +249,7 @@ suite('AgentHostPermissionPickerDelegate', () => {
 		]);
 	});
 
-	test('offers Manual permissions, Assisted permissions, and Allow all in order', () => {
+	test('offers Default Permissions, Auto-Review, and Full Access in order', () => {
 		const { delegate } = setup(store, makeActiveSession(), 'assisted');
 
 		assert.deepStrictEqual({
@@ -263,9 +263,9 @@ suite('AgentHostPermissionPickerDelegate', () => {
 		}, {
 			current: ChatPermissionLevel.Assisted,
 			metadata: [
-				{ label: 'Manual permissions', detail: 'Asks when approval settings don\'t apply', hover: undefined },
-				{ label: 'Assisted permissions', detail: 'Evaluates risk before running tools', hover: 'An LLM judge evaluates each tool call. Tools it doesn\'t approve require your approval.' },
-				{ label: 'Allow all', detail: 'Runs tool calls without asking', hover: undefined },
+				{ label: 'Default Permissions', detail: 'Ask when needed', hover: undefined },
+				{ label: 'Auto-Review', detail: 'Review tool calls automatically', hover: 'Reviews each tool call and asks when uncertain.' },
+				{ label: 'Full Access', detail: 'Run tools without asking', hover: undefined },
 			],
 			available: [
 				ChatPermissionLevel.Default,
@@ -286,7 +286,7 @@ suite('AgentHostPermissionPickerDelegate', () => {
 		]);
 	});
 
-	test('hides and rejects Assisted permissions when the setting is disabled', () => {
+	test('hides and rejects Auto-Review when the setting is disabled', () => {
 		const { delegate, provider, setAssistedPermissionsEnabled } = setup(store, makeActiveSession(), 'default');
 		setAssistedPermissionsEnabled(false);
 
@@ -327,16 +327,16 @@ suite('AgentHostPermissionPickerDelegate', () => {
 
 		assert.strictEqual(
 			delegate.getPermissionLevelHover(ChatPermissionLevel.AutoApprove, getPermissionLevelMeta(ChatPermissionLevel.AutoApprove)),
-			'Copilot runs all tools without asking for approval.'
+			'Runs tool calls without asking.'
 		);
 	});
 
-	test('provides agent-host-specific hover copy for Approve When Safe', () => {
+	test('provides agent-host-specific hover copy for Auto-Review', () => {
 		const { delegate } = setup(store, makeActiveSession(), 'assisted');
 
 		assert.strictEqual(
 			delegate.getPermissionLevelHover(ChatPermissionLevel.Assisted, getPermissionLevelMeta(ChatPermissionLevel.Assisted)),
-			'An LLM judge evaluates each tool call. Tools it doesn\'t approve require your approval.'
+			'Reviews each tool call and asks when uncertain.'
 		);
 	});
 

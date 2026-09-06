@@ -36,6 +36,12 @@ export type ChatPhoneInputPresenterRequest =
 	| {
 		readonly kind: 'session';
 		readonly getSessionContext: () => IChatPhoneInputSessionContext | undefined;
+		/**
+		 * The model the opening picker shows as selected. Sessions whose model was
+		 * resolved for them never write one back, so the session context alone
+		 * cannot say which row to check; omitted callers keep that fallback.
+		 */
+		readonly getSelectedModelId?: () => string | undefined;
 		readonly selectModel: (modelIdentifier: string) => boolean;
 	};
 

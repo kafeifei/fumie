@@ -7,7 +7,7 @@ import * as dom from '../../../../../../base/browser/dom.js';
 import { $, AnimationFrameScheduler, DisposableResizeObserver } from '../../../../../../base/browser/dom.js';
 import { Action } from '../../../../../../base/common/actions.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
-import { Event } from '../../../../../../base/common/event.js';
+import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { MarkdownString } from '../../../../../../base/common/htmlContent.js';
 import { Lazy } from '../../../../../../base/common/lazy.js';
 import { IRenderedMarkdown } from '../../../../../../base/browser/markdownRenderer.js';
@@ -98,6 +98,14 @@ export class ChatSubagentContentPart extends ChatCollapsibleContentPart implemen
 	private wrapper!: HTMLElement;
 	private isActive: boolean;
 	private isExternallyActive: boolean;
+
+	private readonly _onDidChangeActiveState = this._register(new Emitter<void>());
+	/**
+	 * Fires when this subagent starts or stops running. A background subagent
+	 * settles long after its turn was rendered, so the list renderer needs a
+	 * signal to fold the finished pill back into the turn's collapsed steps.
+	 */
+	readonly onDidChangeActiveState: Event<void> = this._onDidChangeActiveState.event;
 	private hasToolItems: boolean = false;
 	private readonly isInitiallyComplete: boolean;
 	private promptContainer: HTMLElement | undefined;
@@ -469,7 +477,12 @@ export class ChatSubagentContentPart extends ChatCollapsibleContentPart implemen
 		if (isResponseVM(context.element)) {
 			const response = context.element;
 			const finalizeOnTerminal = () => {
-				if (this.isActive && (response.isComplete || response.isCanceled)) {
+				if (!this.isActive) {
+					return;
+				}
+				// A cancelled turn stops its subagents, but a completed one does
+				// not: a background subagent keeps running, so it keeps its pill.
+				if (response.isCanceled || (response.isComplete && !this.shouldRemainActive())) {
 					this.markAsInactive(true);
 				}
 			};
@@ -715,8 +728,22 @@ export class ChatSubagentContentPart extends ChatCollapsibleContentPart implemen
 		return this.isActive;
 	}
 
+	/**
+	 * Whether this subagent must keep its running presentation even though the
+	 * turn that launched it is over. True while the host still reports it as
+	 * active, and while its own tool call is still streaming — a background
+	 * subagent outlives its parent turn, and this pill is the user's only handle
+	 * on it until it stops.
+	 */
 	public shouldRemainActive(): boolean {
-		return this.isExternallyActive;
+		if (this.isExternallyActive) {
+			return true;
+		}
+		const data = this._subagentToolInvocation.toolSpecificData;
+		if (data?.kind !== 'subagent' || data.isActive === false) {
+			return false;
+		}
+		return !IChatToolInvocation.isComplete(this._subagentToolInvocation);
 	}
 
 	public get hasToolsWaitingForConfirmation(): boolean {
@@ -777,6 +804,7 @@ export class ChatSubagentContentPart extends ChatCollapsibleContentPart implemen
 	}
 
 	public markAsInactive(force: boolean = false): void {
+		const wasActive = this.isActive;
 		if (force && this._subagentToolInvocation.toolSpecificData?.kind === 'subagent') {
 			const data = this._subagentToolInvocation.toolSpecificData;
 			data.isActive = false;
@@ -801,6 +829,9 @@ export class ChatSubagentContentPart extends ChatCollapsibleContentPart implemen
 		// Collapse when done
 		this.setExpanded(false);
 		this.setContentAnimationEnabled(true);
+		if (wasActive) {
+			this._onDidChangeActiveState.fire();
+		}
 	}
 
 	private markAsActive(): void {
@@ -818,6 +849,7 @@ export class ChatSubagentContentPart extends ChatCollapsibleContentPart implemen
 		}
 		this._updateOpenChatToolbarContext();
 		this.updateTitle();
+		this._onDidChangeActiveState.fire();
 	}
 
 	private refreshActiveStateFromToolData(toolInvocation: IChatToolInvocation | IChatToolInvocationSerialized): void {

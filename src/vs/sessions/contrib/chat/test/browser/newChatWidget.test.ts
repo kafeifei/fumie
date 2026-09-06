@@ -16,6 +16,7 @@ import { ISession } from '../../../../services/sessions/common/session.js';
 import { IOpenNewSessionOptions, IOpenNewSessionResult } from '../../../../services/sessions/browser/sessionsService.js';
 import { IPreferredSessionType } from '../../browser/sessionTypePicker.js';
 import { NewChatWidget } from '../../browser/newChatWidget.js';
+import { IsPhoneLayoutContext } from '../../../../common/contextkeys.js';
 
 /** The part of the active session `_recreateOnProviderChange` actually reads. */
 interface IActiveDraft {
@@ -83,6 +84,7 @@ const recreateOnProviderChange = Reflect.get(NewChatWidget.prototype, '_recreate
 ) => void;
 const handlePromptOptionsWorkspaceChange = Reflect.get(NewChatWidget.prototype, '_handlePromptOptionsWorkspaceChange') as (this: IPromptOptionsWorkspaceHarness, previousFolderUri: URI | undefined, folderUri: URI | undefined) => void;
 const hasEnoughSessionsForFirstRunNotices = Reflect.get(NewChatWidget.prototype, '_hasEnoughSessionsForFirstRunNotices') as (this: ISessionCountHarness) => boolean;
+const focusInputAfterAsyncPicker = Reflect.get(NewChatWidget.prototype, '_focusInputAfterAsyncPicker') as (this: IAsyncPickerFocusHarness) => void;
 
 interface IPromptOptionsWorkspaceHarness {
 	readonly uriIdentityService: { readonly extUri: typeof extUri };
@@ -92,6 +94,11 @@ interface IPromptOptionsWorkspaceHarness {
 
 interface ISessionCountHarness {
 	readonly storageService: { getNumber(key: string, scope: unknown, defaultValue: number): number };
+}
+
+interface IAsyncPickerFocusHarness {
+	readonly contextKeyService: { getContextKeyValue<T>(key: string): T | undefined };
+	readonly _newChatInput: { focus(): void };
 }
 
 function createHarness(
@@ -281,6 +288,21 @@ suite('NewChatWidget', () => {
 		}));
 
 		assert.deepStrictEqual(eligibility, [false, false, true, true]);
+	});
+
+	test('does not restore async picker focus into the phone composer', () => {
+		const focusCounts = [false, true].map(phoneLayout => {
+			let count = 0;
+			focusInputAfterAsyncPicker.call({
+				contextKeyService: {
+					getContextKeyValue: <T>(key: string) => (key === IsPhoneLayoutContext.key ? phoneLayout : undefined) as T | undefined,
+				},
+				_newChatInput: { focus: () => count++ },
+			});
+			return count;
+		});
+
+		assert.deepStrictEqual(focusCounts, [1, 0]);
 	});
 
 });

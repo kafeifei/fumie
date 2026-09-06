@@ -1740,24 +1740,6 @@
         "when": "false"
       },
       {
-        "vendor": "anthropic",
-        "displayName": "Anthropic",
-        "configuration": {
-          "type": "object",
-          "properties": {
-            "apiKey": {
-              "type": "string",
-              "secret": true,
-              "description": "API key for Anthropic",
-              "title": "API Key"
-            }
-          },
-          "required": [
-            "apiKey"
-          ]
-        }
-      },
-      {
         "vendor": "xai",
         "displayName": "xAI",
         "configuration": {
@@ -1958,6 +1940,10 @@
                     "items": {
                       "type": "string"
                     }
+                  },
+                  "defaultReasoningEffort": {
+                    "type": "string",
+                    "markdownDescription": "Default reasoning effort for this model. The value must also appear in `supportsReasoningEffort`."
                   },
                   "reasoningEffortFormat": {
                     "type": "string",
@@ -2161,6 +2147,10 @@
                       "type": "string"
                     }
                   },
+                  "defaultReasoningEffort": {
+                    "type": "string",
+                    "markdownDescription": "Default reasoning effort for this model. The value must also appear in `supportsReasoningEffort`."
+                  },
                   "reasoningEffortFormat": {
                     "type": "string",
                     "enum": [
@@ -2314,6 +2304,10 @@
                     "items": {
                       "type": "string"
                     }
+                  },
+                  "defaultReasoningEffort": {
+                    "type": "string",
+                    "markdownDescription": "Default reasoning effort for this model. The value must also appear in `supportsReasoningEffort`."
                   },
                   "reasoningEffortFormat": {
                     "type": "string",

@@ -22,6 +22,7 @@ import { isWellKnownClaudePermissionModeSchema } from './agentHostPermissionPick
 
 const CLAUDE_PERMISSION_MODE_LEARN_MORE_URL = 'https://code.claude.com/docs/en/permission-modes#available-modes';
 const LEARN_MORE_VALUE = '__agentHostClaudePermissionModePicker.learnMore__';
+const PRODUCT_PERMISSION_VALUES = ['default', 'auto', 'bypassPermissions'] as const;
 
 function getClaudePermissionModeIcon(value: string | undefined): ThemeIcon | undefined {
 	switch (value) {
@@ -53,6 +54,28 @@ export class AgentHostClaudePermissionModePicker extends AgentHostSessionEnumPic
 
 	protected _isWellKnownSchema(schema: SessionConfigPropertySchema): boolean {
 		return isWellKnownClaudePermissionModeSchema(schema);
+	}
+
+	protected override _getPickerItems(items: readonly IAgentHostSessionEnumPickerItem[], currentValue: string): readonly IAgentHostSessionEnumPickerItem[] {
+		const byValue = new Map(items.map(item => [item.value, item]));
+		const productItems = PRODUCT_PERMISSION_VALUES.flatMap(value => {
+			const item = byValue.get(value);
+			if (!item) {
+				return [];
+			}
+			switch (value) {
+				case 'default':
+					return [{ ...item, label: localize('agentHostPermissionPicker.default.label', "Default Permissions"), description: localize('agentHostPermissionPicker.default.detail', "Ask when needed") }];
+				case 'auto':
+					return [{ ...item, label: localize('agentHostPermissionPicker.autoReview.label', "Auto-Review"), description: localize('agentHostClaudePermissionModePicker.autoReview.detail', "Claude decides whether each tool operation needs approval") }];
+				case 'bypassPermissions':
+					return [{ ...item, label: localize('agentHostPermissionPicker.fullAccess.label', "Full Access"), description: localize('agentHostPermissionPicker.fullAccess.detail', "Run tools without asking") }];
+			}
+		});
+		const current = byValue.get(currentValue);
+		return current && !PRODUCT_PERMISSION_VALUES.includes(currentValue as typeof PRODUCT_PERMISSION_VALUES[number])
+			? [current, ...productItems]
+			: productItems;
 	}
 
 	protected _getTriggerIcon(value: string | undefined): ThemeIcon | undefined {

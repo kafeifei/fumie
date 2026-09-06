@@ -15,7 +15,8 @@ import type { AhpServerNotification, JsonRpcResponse, ProtocolMessage } from '..
 import type { IProtocolTransport } from '../../../../../platform/agentHost/common/state/sessionTransport.js';
 import {
 	TunnelAgentHostConnector,
-	parseTunnelInfo,
+	toTunnelInfos,
+	tunnelListRequestOptions,
 	type ITunnelRelayClient,
 	type ITunnelRelayClientFactory,
 	type ITunnelRelayClientSession,
@@ -25,13 +26,13 @@ import {
 	isTunnelGatewaySelectionRejectedError,
 	TUNNEL_ADDRESS_PREFIX,
 	TUNNEL_GATEWAY_MIN_PROTOCOL_VERSION,
-	TUNNEL_LAUNCHER_LABEL,
-	TUNNEL_MIN_PROTOCOL_VERSION,
 	type ICachedTunnel,
 	type ITunnelConnectResult,
+	type ITunnelDiscoveryOptions,
 	type ITunnelGatewaySelection,
 	type ITunnelGatewaySelectionSession,
 	type ITunnelInfo,
+	type ITunnelUserLimit,
 	ITunnelAgentHostService,
 	type TunnelAutoConnectMode,
 } from '../../../../../platform/agentHost/common/tunnelAgentHost.js';
@@ -172,7 +173,7 @@ export class BrowserTunnelAgentHostService extends Disposable implements ITunnel
 		this._resolveGatewaySelection = options.resolveGatewaySelection ?? resolveGatewaySelection;
 	}
 
-	async listTunnels(options?: { silent?: boolean }): Promise<ITunnelInfo[]> {
+	async listTunnels(options?: ITunnelDiscoveryOptions): Promise<ITunnelInfo[]> {
 		if (!this._configurationService.getValue<boolean>(RemoteAgentHostsEnabledSettingId)) {
 			return [];
 		}
@@ -182,21 +183,25 @@ export class BrowserTunnelAgentHostService extends Disposable implements ITunnel
 			return [];
 		}
 
-		try {
-			const managementClient = createManagementClient(await this._loadDevTunnelsWeb(), auth.token, auth.provider);
-			const tunnels = await managementClient.listTunnels(undefined, undefined, {
-				labels: [TUNNEL_LAUNCHER_LABEL],
-				requireAllLabels: true,
-				includePorts: true,
-				tokenScopes: ['connect'],
-			});
-			const results = filterBrowserTunnelInfos(tunnels);
-			this._logService.info(`${LOG_PREFIX} Found ${results.length} tunnel(s) with agent host support`);
-			return results;
-		} catch (error) {
-			this._logService.error(`${LOG_PREFIX} Failed to enumerate tunnels`, error);
-			return [];
+		// A failure is thrown, not turned into an empty account — see the same
+		// decision in `TunnelAgentHostMainService.listTunnels`.
+		const managementClient = createManagementClient(await this._loadDevTunnelsWeb(), auth.token, auth.provider);
+		const tunnels = await managementClient.listTunnels(undefined, undefined, tunnelListRequestOptions(options?.includeAllTunnels));
+		const results = filterBrowserTunnelInfos(tunnels, options?.includeAllTunnels);
+		this._logService.info(`${LOG_PREFIX} Found ${results.length} tunnel(s) with agent host support`);
+		return results;
+	}
+
+	async listUserLimits(options?: { silent?: boolean }): Promise<readonly ITunnelUserLimit[] | undefined> {
+		if (!this._configurationService.getValue<boolean>(RemoteAgentHostsEnabledSettingId)) {
+			return undefined;
 		}
+		const auth = await this._getToken(options?.silent ?? false);
+		if (!auth) {
+			return undefined;
+		}
+		const managementClient = createManagementClient(await this._loadDevTunnelsWeb(), auth.token, auth.provider);
+		return await managementClient.listUserLimits();
 	}
 
 	getAutoConnectMode(tunnel: ITunnelInfo): TunnelAutoConnectMode {
@@ -445,10 +450,9 @@ export async function connectThroughTunnelGateway(
 /** Maps Dev Tunnels SDK descriptors to supported agent-host tunnels. */
 export function filterBrowserTunnelInfos(
 	tunnels: readonly IDevTunnelsWebTunnel[],
+	includeAllTunnels?: boolean,
 ): ITunnelInfo[] {
-	return tunnels
-		.map(tunnel => parseTunnelInfo(tunnel))
-		.filter((tunnel): tunnel is ITunnelInfo => !!tunnel && tunnel.protocolVersion >= TUNNEL_MIN_PROTOCOL_VERSION);
+	return toTunnelInfos(tunnels, includeAllTunnels);
 }
 
 class BrowserTunnelConnectionTransport extends Disposable implements IProtocolTransport {

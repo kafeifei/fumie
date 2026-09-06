@@ -37,7 +37,7 @@ export class OpenFileAction extends Action2 {
 			category: Categories.File,
 			f1: true,
 			keybinding: {
-				when: IsMacNativeContext.toNegated(),
+				when: ContextKeyExpr.and(IsMacNativeContext.toNegated(), IsSessionsWindowContext.negate()),
 				weight: KeybindingWeight.WorkbenchContrib,
 				primary: KeyMod.CtrlCmd | KeyCode.KeyO
 			}
@@ -64,6 +64,7 @@ export class OpenFolderAction extends Action2 {
 			precondition: OpenFolderWorkspaceSupportContext,
 			keybinding: {
 				weight: KeybindingWeight.WorkbenchContrib,
+				when: IsSessionsWindowContext.negate(),
 				primary: undefined,
 				linux: {
 					primary: KeyChord(KeyMod.CtrlCmd | KeyCode.KeyK, KeyMod.CtrlCmd | KeyCode.KeyO)
@@ -100,6 +101,7 @@ export class OpenFolderViaWorkspaceAction extends Action2 {
 			precondition: ContextKeyExpr.and(OpenFolderWorkspaceSupportContext.toNegated(), WorkbenchStateContext.isEqualTo('workspace')),
 			keybinding: {
 				weight: KeybindingWeight.WorkbenchContrib,
+				when: IsSessionsWindowContext.negate(),
 				primary: KeyMod.CtrlCmd | KeyCode.KeyO
 			}
 		});
@@ -126,6 +128,7 @@ export class OpenFileFolderAction extends Action2 {
 			precondition: ContextKeyExpr.and(IsMacNativeContext, OpenFolderWorkspaceSupportContext),
 			keybinding: {
 				weight: KeybindingWeight.WorkbenchContrib,
+				when: IsSessionsWindowContext.negate(),
 				primary: KeyMod.CtrlCmd | KeyCode.KeyO
 			}
 		});
@@ -343,7 +346,7 @@ MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
 		title: localize({ key: 'miOpenFile', comment: ['&& denotes a mnemonic'] }, "&&Open File...")
 	},
 	order: 1,
-	when: IsMacNativeContext.toNegated()
+	when: ContextKeyExpr.and(IsMacNativeContext.toNegated(), IsSessionsWindowContext.negate())
 });
 
 MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
@@ -353,7 +356,7 @@ MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
 		title: localize({ key: 'miOpenFolder', comment: ['&& denotes a mnemonic'] }, "Open &&Folder...")
 	},
 	order: 2,
-	when: OpenFolderWorkspaceSupportContext
+	when: ContextKeyExpr.and(OpenFolderWorkspaceSupportContext, IsSessionsWindowContext.negate())
 });
 
 MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
@@ -363,7 +366,7 @@ MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
 		title: localize({ key: 'miOpenFolder', comment: ['&& denotes a mnemonic'] }, "Open &&Folder...")
 	},
 	order: 2,
-	when: ContextKeyExpr.and(OpenFolderWorkspaceSupportContext.toNegated(), WorkbenchStateContext.isEqualTo('workspace'))
+	when: ContextKeyExpr.and(OpenFolderWorkspaceSupportContext.toNegated(), WorkbenchStateContext.isEqualTo('workspace'), IsSessionsWindowContext.negate())
 });
 
 MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
@@ -373,7 +376,7 @@ MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
 		title: localize({ key: 'miOpen', comment: ['&& denotes a mnemonic'] }, "&&Open...")
 	},
 	order: 1,
-	when: ContextKeyExpr.and(IsMacNativeContext, OpenFolderWorkspaceSupportContext)
+	when: ContextKeyExpr.and(IsMacNativeContext, OpenFolderWorkspaceSupportContext, IsSessionsWindowContext.negate())
 });
 
 MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
@@ -383,7 +386,7 @@ MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
 		title: localize({ key: 'miOpenWorkspace', comment: ['&& denotes a mnemonic'] }, "Open Wor&&kspace from File...")
 	},
 	order: 3,
-	when: EnterMultiRootWorkspaceSupportContext
+	when: ContextKeyExpr.and(EnterMultiRootWorkspaceSupportContext, IsSessionsWindowContext.negate())
 });
 
 MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {

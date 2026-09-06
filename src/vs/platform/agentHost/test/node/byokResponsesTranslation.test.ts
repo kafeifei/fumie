@@ -11,8 +11,8 @@ import {
 	bridgeResultToResponsesSseFrames,
 	IResponsesRequest,
 	responsesRequestToBridge,
-	ResponsesTranslationError,
 } from '../../node/copilot/byokResponsesTranslation.js';
+import { ByokWireTranslationError } from '../../node/copilot/byokWireCommon.js';
 
 suite('byokResponsesTranslation', () => {
 
@@ -72,7 +72,7 @@ suite('byokResponsesTranslation', () => {
 	});
 
 	test('rejects missing models and unsupported input items', () => {
-		assert.throws(() => responsesRequestToBridge('acme', { input: [] }), ResponsesTranslationError);
+		assert.throws(() => responsesRequestToBridge('acme', { input: [] }), ByokWireTranslationError);
 		assert.throws(() => responsesRequestToBridge('acme', {
 			model: 'm',
 			input: [{ type: 'computer_call' }],

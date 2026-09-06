@@ -28,7 +28,7 @@ import { buildChatUri, buildDefaultChatUri, buildSubagentChatUri, createChatStat
 import { chatReducer, sessionReducer } from '../../../../../../platform/agentHost/common/state/sessionReducers.js';
 import { ActionType } from '../../../../../../platform/agentHost/common/state/protocol/actions.js';
 import { ContentEncoding } from '../../../../../../platform/agentHost/common/state/protocol/commands.js';
-import { ConfirmationOptionKind, McpAuthRequiredReason, SessionInputRequestKind, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
+import { ConfirmationOptionKind, McpAuthRequiredReason, ResponsePartKind, SessionInputRequestKind, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { IChatAgentService } from '../../../common/participants/chatAgents.js';
 import { IChatProgress, IChatService, IChatToolInvocation, ToolConfirmKind } from '../../../common/chatService/chatService.js';
 import { IChatEditingService } from '../../../common/editing/chatEditingService.js';
@@ -2391,6 +2391,105 @@ suite('AgentHostClientTools', () => {
 				renderedIsTheBegunInvocation: true,
 				begun: 1,
 				invoked: 1,
+			});
+		}));
+
+		test('keeps observing a background subagent after the turn that spawned it ends', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+			// A background subagent outlives its turn. The observation has to
+			// outlive it too, or the pill freezes the moment the user sends
+			// their next message and only thaws on some later reconnect.
+			const { handler, connection } = createHandlerWithMocks(disposables, [testSubagentTool]);
+			const sessionResource = URI.parse('agent-host-copilot:/session-1');
+			const backendSession = AgentSession.uri('copilot', 'session-1').toString();
+			const parentToolCallId = 'task-call-1';
+			const subagentChat = buildSubagentChatUri(backendSession, parentToolCallId);
+			const parentChat = URI.parse(buildDefaultChatUri(backendSession));
+
+			connection.applySessionAction(parentChat, {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
+				message: { text: 'delegate work', origin: { kind: MessageKind.User } },
+			});
+			connection.applySessionAction(parentChat, {
+				type: ActionType.ChatToolCallStart,
+				turnId: 'turn-1',
+				toolCallId: parentToolCallId,
+				toolName: 'task',
+				displayName: 'Delegated Task',
+				_meta: { toolKind: 'subagent', subagentChatUri: subagentChat },
+			});
+			const session = await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
+			await timeout(0);
+			connection.applySessionAction(parentChat, {
+				type: ActionType.ChatToolCallReady,
+				turnId: 'turn-1',
+				toolCallId: parentToolCallId,
+				invocationMessage: 'Delegating task',
+				toolInput: '{}',
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			});
+			connection.applySessionAction(URI.parse(subagentChat), {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'sub-turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
+				message: { text: '', origin: { kind: MessageKind.User } },
+			});
+			await timeout(0);
+
+			const progress = (session as unknown as { progressObs: { get(): IChatProgress[] } }).progressObs;
+			const parentInvocation = progress.get()
+				.find((part): part is ChatToolInvocation => part instanceof ChatToolInvocation && part.toolCallId === parentToolCallId);
+			const subagentData = () => parentInvocation?.toolSpecificData?.kind === 'subagent' ? parentInvocation.toolSpecificData : undefined;
+			// How many subagent chats the handler is observing: the observation
+			// has to outlive the turn, and then be released when it stops.
+			const observed = () => (handler as unknown as { _subagentObservations: { size: number } })._subagentObservations.size;
+			const whileTurnRunning = { isActive: subagentData()?.isActive, observed: observed() };
+
+			// The host reports the launch as done — a background subagent's tool
+			// call completes as soon as it is spawned — and the turn ends. The
+			// user then sends another one; the subagent keeps working.
+			connection.applySessionAction(parentChat, {
+				type: ActionType.ChatToolCallComplete,
+				turnId: 'turn-1',
+				toolCallId: parentToolCallId,
+				result: { success: true, pastTenseMessage: 'Launched delegated task' },
+			});
+			await timeout(0);
+			connection.applySessionAction(parentChat, { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 });
+			await timeout(0);
+			connection.applySessionAction(parentChat, {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-2',
+				startedAt: '2025-01-01T00:01:00.000Z',
+				message: { text: 'something else', origin: { kind: MessageKind.User } },
+			});
+			await timeout(0);
+			const afterNextTurnStarted = { isActive: subagentData()?.isActive, observed: observed() };
+
+			// A frame from the subagent's own channel still reaches the pill.
+			connection.applySessionAction(URI.parse(subagentChat), {
+				type: ActionType.ChatResponsePart,
+				turnId: 'sub-turn-1',
+				part: { kind: ResponsePartKind.Reasoning, id: 'reasoning-1', content: 'Considering the options' },
+			});
+			await timeout(0);
+			const stillReceivingFrames = subagentData()?.activity;
+
+			// The subagent finishes: the pill settles and the observation is released.
+			connection.applySessionAction(URI.parse(subagentChat), { type: ActionType.ChatTurnComplete, turnId: 'sub-turn-1', duration: 2000 });
+			await timeout(0);
+
+			assert.deepStrictEqual({
+				whileTurnRunning,
+				afterNextTurnStarted,
+				stillReceivingFrames,
+				afterSubagentFinished: { isActive: subagentData()?.isActive, observed: observed() },
+			}, {
+				whileTurnRunning: { isActive: true, observed: 1 },
+				afterNextTurnStarted: { isActive: true, observed: 1 },
+				stillReceivingFrames: 'reasoning',
+				afterSubagentFinished: { isActive: false, observed: 0 },
 			});
 		}));
 

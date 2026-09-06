@@ -5,17 +5,48 @@
 
 import { AiAgentEnvValue, AiAgentEnvVar } from '../../../chat/common/aiAgentEnv.js';
 import type { IAgentHostNativeOTelConfig } from '../../common/otel/agentHostOTelService.js';
+import type { CodexUsageSource } from '../../common/agentHostCustomizationConfig.js';
 import type { ThreadResumeParams } from './protocol/generated/v2/ThreadResumeParams.js';
 import type { JsonValue } from './protocol/generated/serde_json/JsonValue.js';
+import { withoutModelProviderEnvironment } from '../modelProviderEnvironment.js';
 
 export interface ICodexLaunchProxy {
 	readonly baseUrl: string;
 	readonly nonce: string;
 }
 
+/**
+ * The BYOK vendors to advertise to the app-server as additive model providers,
+ * alongside the Copilot `vscode-proxy` one. Each vendor becomes
+ * `model_providers.<vendor>` pointed at that vendor's route on the BYOK
+ * loopback proxy, so a session whose selected model is a BYOK id
+ * (`<vendor>/<model>`) resolves to `(model_provider: vendor, model)` with no
+ * gateway URL or credential anywhere in the harness.
+ *
+ * Providers are fixed for the life of the app-server process: `-c` overrides
+ * are spawn arguments. The set is read from the renderer bridge at spawn time,
+ * which is the first session materialize — by then a window is serving.
+ */
+export interface ICodexByokLaunchProviders {
+	/** `<nonce>.<id>` for the native provider proxy. */
+	readonly token: string;
+	/** Codex appends `/responses` to this provider base URL. */
+	readonly providers: readonly { readonly vendor: string; readonly baseUrl: string }[];
+}
+
+/**
+ * Env var the BYOK providers' `env_key` points at. Distinct from the Copilot
+ * proxy's `OPENAI_API_KEY` because the two binds mint separate nonces.
+ */
+const CODEX_BYOK_API_KEY_ENV_VAR = 'VSCODE_BYOK_API_KEY';
+
 export interface ICodexLaunchConfig {
 	readonly env: NodeJS.ProcessEnv;
 	readonly args: readonly string[];
+}
+
+export function isCodexThreadProviderCompatible(usageSource: CodexUsageSource, modelProvider: string): boolean {
+	return usageSource === 'copilot' ? modelProvider === 'vscode-proxy' : modelProvider !== 'vscode-proxy';
 }
 
 export function buildCodexResumeParams(
@@ -26,6 +57,7 @@ export function buildCodexResumeParams(
 	configOverrides: Readonly<Record<string, JsonValue>> = {},
 	developerInstructions?: string,
 	imageGenerationEnabled = false,
+	serviceTier?: string | null,
 ): ThreadResumeParams {
 	const config = {
 		...configOverrides,
@@ -35,6 +67,7 @@ export function buildCodexResumeParams(
 	return {
 		threadId,
 		modelProvider,
+		...(serviceTier !== undefined ? { serviceTier } : {}),
 		...(workingDirectories?.length ? {
 			cwd: workingDirectories[0],
 			runtimeWorkspaceRoots: [...workingDirectories],
@@ -49,8 +82,9 @@ export function buildCodexLaunchConfig(
 	proxy: ICodexLaunchProxy,
 	extraArgs: readonly string[],
 	telemetry?: IAgentHostNativeOTelConfig,
+	byok?: ICodexByokLaunchProviders,
 ): ICodexLaunchConfig {
-	const env: NodeJS.ProcessEnv = { ...inheritedEnv, [AiAgentEnvVar]: AiAgentEnvValue };
+	const env: NodeJS.ProcessEnv = { ...withoutModelProviderEnvironment(inheritedEnv), [AiAgentEnvVar]: AiAgentEnvValue };
 	if (telemetry) {
 		delete env.OTEL_SERVICE_NAME;
 		env.OTEL_RESOURCE_ATTRIBUTES = serializeResourceAttributes(telemetry.resourceAttributes);
@@ -72,6 +106,19 @@ export function buildCodexLaunchConfig(
 		// ChatGPT subscription threads opt in with a per-thread override.
 		`features.image_generation=false`,
 	];
+	if (byok?.providers.length) {
+		env[CODEX_BYOK_API_KEY_ENV_VAR] = byok.token;
+		for (const { vendor, baseUrl } of byok.providers) {
+			overrides.push(
+				`model_providers.${vendor}.name="${vendor}"`,
+				`model_providers.${vendor}.base_url="${baseUrl}"`,
+				`model_providers.${vendor}.wire_api="responses"`,
+				`model_providers.${vendor}.env_key="${CODEX_BYOK_API_KEY_ENV_VAR}"`,
+				`model_providers.${vendor}.requires_openai_auth=false`,
+				`model_providers.${vendor}.supports_websockets=false`,
+			);
+		}
+	}
 	const telemetryOverrides = codexTelemetryOverrides(telemetry);
 	return {
 		env,

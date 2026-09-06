@@ -17,6 +17,7 @@ import {
 	IByokLmInputItem,
 	IByokLmModelInfo,
 	IByokLmOutputItem,
+	IByokLmProviderConfiguration,
 	IByokLmReasoningItem,
 } from '../../../../../../platform/agentHost/common/agentHostByokLm.js';
 import { IContextKeyService } from '../../../../../../platform/contextkey/common/contextkey.js';
@@ -64,7 +65,7 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
 		// Re-emit (debounced) whenever the renderer's language models change, so the
 		// agent host can refresh its BYOK model list — extension-provided BYOK models
 		// often register shortly after the bridge connects.
-		this._register(Event.debounce(this._languageModelsService.onDidChangeLanguageModels, () => undefined, 500)(() => {
+		this._register(Event.debounce(this._languageModelsService.onDidChangeLanguageModels, () => undefined, 500, true)(() => {
 			this._onDidChangeModels.fire();
 		}));
 		this._register(this._languageModelsService.onDidChangeModelVisibility(() => {
@@ -157,10 +158,32 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
 		}
 	}
 
+	async resolveProviderConfiguration(modelIdentifier: string, _token: CancellationToken): Promise<IByokLmProviderConfiguration | undefined> {
+		const metadata = this._languageModelsService.lookupLanguageModel(modelIdentifier);
+		if (!metadata?.isBYOK) {
+			return undefined;
+		}
+		const group = await this._languageModelsService.resolveLanguageModelProviderGroup(modelIdentifier);
+		if (!group) {
+			return undefined;
+		}
+		return {
+			modelIdentifier,
+			vendor: metadata.vendor,
+			groupName: group.name,
+			modelId: metadata.id,
+			configuration: group.configuration,
+		};
+	}
+
 	async listModels(_token: CancellationToken): Promise<IByokLmModelInfo[]> {
 		if (!this._chatEntitlementService.clientByokEnabled) {
 			return [];
 		}
+		// The node side treats the first pushed snapshot as authoritative for
+		// publishing BYOK-only Agents. Never let an extension/config startup race
+		// turn that snapshot into a transient empty catalog.
+		await this._languageModelsService.whenReady;
 
 		const models: IByokLmModelInfo[] = [];
 		for (const identifier of this._languageModelsService.getLanguageModelIds()) {
@@ -171,23 +194,64 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
 				const reasoningEffortSchema = metadata.configurationSchema?.properties?.reasoningEffort;
 				const supportedReasoningEfforts = reasoningEffortSchema?.enum?.filter((value): value is string => typeof value === 'string');
 				const defaultReasoningEffort = typeof reasoningEffortSchema?.default === 'string' ? reasoningEffortSchema.default : undefined;
+				const supportedHarnesses = this._supportedHarnesses(identifier, metadata.vendor, metadata.id);
 				const model: IByokLmModelInfo = {
 					vendor: metadata.vendor,
 					id: metadata.id,
 					name: metadata.name,
 					modelIdentifier: identifier,
 					maxContextWindowTokens: metadata.maxInputTokens + metadata.maxOutputTokens,
+					maxOutputTokens: metadata.maxOutputTokens,
 					supportsVision: !!metadata.capabilities?.vision,
+					// An explicit empty list is significant: the renderer provider can
+					// still serve Copilot CLI through the LM API bridge, but none of the
+					// native Fumie harnesses can talk to its wire directly.
+					...(supportedHarnesses !== undefined ? { supportedHarnesses } : {}),
 					...(supportedReasoningEfforts?.length ? { supportedReasoningEfforts } : {}),
 					...(defaultReasoningEffort !== undefined ? { defaultReasoningEffort } : {}),
 				};
 				const agentHostModelIdentifier = `${SessionType.AgentHostCopilot}:${getByokLmAgentModelId(model)}`;
-				if (!this._languageModelsService.isModelHidden(identifier) && !this._languageModelsService.isModelHidden(agentHostModelIdentifier)) {
-					models.push(model);
-				}
+				// A hidden model is reported as hidden, not dropped. Dropping it made
+				// this window's visibility state indistinguishable from "no such model"
+				// for every other client of the host, so a browser could neither see nor
+				// un-hide a row this window had hidden. Consumers that offer models for
+				// selection filter on the flag; the catalog keeps the row.
+				const hidden = this._languageModelsService.isModelHidden(identifier)
+					|| this._languageModelsService.isModelHidden(agentHostModelIdentifier);
+				models.push(hidden ? { ...model, hidden: true } : model);
 			}
 		}
 		return models;
+	}
+
+	private _supportedHarnesses(modelIdentifier: string, vendor: string, modelId: string): readonly string[] | undefined {
+		// Ollama is a general model source rather than an official Agent. Pi is the
+		// conservative default; providers can opt a model into another Agent with
+		// explicit `fumieHarnesses` metadata below.
+		if (vendor === 'ollama') {
+			return ['pi'];
+		}
+		// Other BYOK providers do not expose a native transport through the shared
+		// proxy yet. Keep them out of Pi until that adapter exists.
+		if (vendor !== 'customendpoint') {
+			return [];
+		}
+		const group = this._languageModelsService.getLanguageModelGroups(vendor)
+			.find(candidate => candidate.modelIdentifiers.includes(modelIdentifier))?.group;
+		if (!group) {
+			return ['pi'];
+		}
+		const models = Array.isArray(group['models']) ? group['models'] : [];
+		const model = models.find(candidate => !!candidate && typeof candidate === 'object' && (candidate as { id?: unknown }).id === modelId) as {
+			apiType?: unknown;
+			url?: unknown;
+			fumieHarnesses?: unknown;
+		} | undefined;
+		if (Array.isArray(model?.fumieHarnesses)) {
+			return model.fumieHarnesses.filter((value): value is string => typeof value === 'string');
+		}
+
+		return ['pi'];
 	}
 
 	/**

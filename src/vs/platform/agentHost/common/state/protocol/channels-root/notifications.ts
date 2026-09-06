@@ -79,6 +79,26 @@ export interface SessionRemovedParams {
 // ─── root/sessionSummaryChanged ──────────────────────────────────────────────
 
 /**
+ * A summary diff, with JSON Merge Patch (RFC 7386) clear semantics:
+ *
+ * - field absent → unchanged,
+ * - field present with a value → set to that value,
+ * - optional field present as `null` → **cleared** (back to absent).
+ *
+ * `null` is what makes the third case expressible at all. `undefined` does
+ * not survive JSON serialization, so a sender that spells a clear as
+ * `{ activity: undefined }` puts `{}` on the wire — indistinguishable from
+ * "nothing changed", and the receiver keeps rendering a stale value forever.
+ * Required fields (`title`, `status`, `modifiedAt`, …) can never be cleared
+ * and are therefore not nullable.
+ *
+ * @category Protocol Notifications
+ */
+export type SessionSummaryChanges = {
+	[K in keyof SessionSummary]?: SessionSummary[K] | (undefined extends SessionSummary[K] ? null : never);
+};
+
+/**
  * Broadcast to all clients subscribed to the root channel when an existing
  * session's summary changes (title, status, `modifiedAt`, model, working
  * directory, read/done state, or diff statistics).
@@ -94,7 +114,8 @@ export interface SessionRemovedParams {
  * Semantics:
  *
  * - Only fields present in `changes` have new values; omitted fields are
- *   unchanged on the client's cached summary.
+ *   unchanged on the client's cached summary. An optional field carrying
+ *   `null` has been *cleared* — see {@link SessionSummaryChanges}.
  * - Identity fields (`resource`, `provider`, `createdAt`) never change and
  *   are not carried.
  * - Like all protocol notifications, this is ephemeral: it is **not**
@@ -136,12 +157,13 @@ export interface SessionSummaryChangedParams {
 	/** URI of the session whose summary changed */
 	session: URI;
 	/**
-	 * Mutable summary fields that changed; omitted fields are unchanged.
+	 * Mutable summary fields that changed; omitted fields are unchanged and an
+	 * optional field carrying `null` has been cleared.
 	 *
 	 * Identity fields (`resource`, `provider`, `createdAt`) never change and
 	 * MUST be omitted by senders; receivers SHOULD ignore them if present.
 	 */
-	changes: Partial<SessionSummary>;
+	changes: SessionSummaryChanges;
 }
 
 // ─── progress ────────────────────────────────────────────────────────────────

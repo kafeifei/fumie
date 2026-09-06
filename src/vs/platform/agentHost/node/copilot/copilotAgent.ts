@@ -172,6 +172,17 @@ function invokeWithProxyEnvironment<T>(proxy: string | undefined, invoke: () => 
 
 const RUNTIME_SLASH_COMMAND_COMPLETION_WAIT_MS = 300;
 const COPILOT_CAPI_URL = 'https://api.githubcopilot.com';
+/** A title is a handful of words; the naming request needs no more room than that. */
+const TITLE_MAX_TOKENS = 32;
+
+/**
+ * The naming request's only instruction. The naming context arrives already
+ * budgeted by `SessionTitleService`, the single owner of that budget, so it is
+ * passed through as-is.
+ */
+function copilotTitlePrompt(prompt: string): string {
+	return `Reply with only a concise 3-8 word title for this coding session, no quotes, no punctuation at the end: ${prompt}`;
+}
 
 interface ICopilotClosedConnectionRecoveryResult {
 	readonly failedTurnIds: ReadonlySet<string>;
@@ -1819,7 +1830,7 @@ export class CopilotAgent extends Disposable implements IAgent {
 			return;
 		}
 		this._byokModels = this._byokBridgeRegistry.getModels().map((m): IAgentModelInfo => {
-			const byokMeta = createAgentModelByokMeta(m.modelIdentifier);
+			const byokMeta = createAgentModelByokMeta(m.modelIdentifier, m.hidden);
 			const thinkingLevel = this._createThinkingLevelConfigSchemaProperty(m.supportedReasoningEfforts, m.defaultReasoningEffort, m.id);
 			return {
 				provider: this.id,
@@ -2836,7 +2847,8 @@ export class CopilotAgent extends Disposable implements IAgent {
 			this._noteHostCustomizations(context);
 			return this._createChat(chat, resolveAgentChatContext(context, chat), options);
 		},
-		disposeChat: (chatUri: URI, context: URI | IAgentChatContext): Promise<void> => this._disposeChat(chatUri, context),
+		deleteChat: (chatUri: URI, context?: URI | IAgentChatContext, providerData?: string): Promise<void> => this._deleteChat(chatUri, context, providerData),
+		disposeChat: (chatUri: URI, context: URI | IAgentChatContext): Promise<void> => this._deleteChat(chatUri, context),
 		canReleaseChat: (chatUri: URI, context: URI | IAgentChatContext): Promise<boolean> => this._canReleaseChat(chatUri, context),
 		releaseChat: (chatUri: URI, context: URI | IAgentChatContext): Promise<void> => this._releaseChat(chatUri, context),
 		sendMessage: (chatUri: URI, prompt: string, workingDirectoriesOrDirectory: readonly URI[] | URI | undefined, attachments?: readonly MessageAttachment[], turnId?: string, senderClientId?: string, clientTypeOrContext?: AgentHostClientType | URI | IAgentChatContext, context?: URI | IAgentChatContext): Promise<void> => {
@@ -3300,7 +3312,7 @@ export class CopilotAgent extends Disposable implements IAgent {
 				return { adopted: false, eligible: true, reason: 'markerUnavailable' };
 			}
 			// Seed VS Code-layer metadata only — the SDK event log on disk is
-			// untouched. Writing `agentSessionData/<sanitizedId>/session.db` here
+			// untouched. Writing the Agent Host's per-session `session.db` here
 			// is also what makes the legacy extension-host Copilot CLI list stop
 			// showing this session (it dedups against agent-host-owned session ids).
 			// `isolation: 'folder'` keeps the session in place in the reused cwd —
@@ -4119,8 +4131,19 @@ export class CopilotAgent extends Disposable implements IAgent {
 		return { sessionId: newSessionId, inheritedTurnId };
 	}
 
-	private async _disposeChat(chat: URI, operationContext: URI | IAgentChatContext): Promise<void> {
-		const initial = this._resolveChatContext(chat, operationContext);
+	private async _deleteChat(chat: URI, operationContext?: URI | IAgentChatContext, providerData?: string): Promise<void> {
+		const chatKey = chat.toString();
+		if (!this._chatBackings.has(chatKey) && providerData !== undefined) {
+			const recovered = decodeProviderData(providerData);
+			if (!recovered) {
+				throw new Error(`Cannot delete Copilot chat ${chatKey}: invalid provider backing receipt`);
+			}
+			// Cold delete does not resume the SDK session. Recover only the opaque
+			// routing receipt; keep it in memory if deletion fails so a retry still
+			// addresses the same backing.
+			this._chatBackings.set(chatKey, recovered);
+		}
+		const initial = this._resolveSendChatContext(chat, operationContext);
 		const lifetimeId = initial.sdkSessionId ?? initial.configurationId;
 		const lifetime = this._getOrCreateSessionLifetime(lifetimeId);
 		if (!lifetime) {
@@ -4129,19 +4152,19 @@ export class CopilotAgent extends Disposable implements IAgent {
 		// Scope finalization can dispose this same lifetime; defer it until `release()` settles to avoid self-deadlock.
 		let finalize: { scope: URI; scopeId: string; workspacelessHint: boolean } | undefined;
 		await lifetime.release(async () => {
-			finalize = await this._disposeChatCoordinated(chat, operationContext);
+			finalize = await this._deleteChatCoordinated(chat, operationContext);
 		});
 		if (finalize) {
 			await this._finalizeConfigurationScope(finalize.scope, finalize.scopeId, finalize.workspacelessHint);
 		}
 	}
 
-	private async _disposeChatCoordinated(chat: URI, operationContext: URI | IAgentChatContext): Promise<{ scope: URI; scopeId: string; workspacelessHint: boolean } | undefined> {
+	private async _deleteChatCoordinated(chat: URI, operationContext?: URI | IAgentChatContext): Promise<{ scope: URI; scopeId: string; workspacelessHint: boolean } | undefined> {
 		const chatKey = chat.toString();
-		const initial = this._resolveChatContext(chat, operationContext);
+		const initial = this._resolveSendChatContext(chat, operationContext);
 		const configurationId = initial.configurationId;
 		return this._queueChat(configurationId, initial.sequencerKey, async () => {
-			const current = this._resolveChatContext(chat, operationContext);
+			const current = this._resolveSendChatContext(chat, operationContext);
 			const target = current.target;
 			const backing = this._chatBackings.get(chatKey);
 			const provisional = this._provisionalSessions.get(configurationId);
@@ -4508,6 +4531,42 @@ export class CopilotAgent extends Disposable implements IAgent {
 				this._onDidChangeChatData.fire({ chat, providerData: encodeProviderData(updated) });
 			}
 		});
+	}
+
+	/**
+	 * Generate a short title for a session from the user's first prompt, using
+	 * the session's own model. Copilot has a title-only side channel — the CAPI
+	 * utility completion endpoint — so naming a session neither creates a
+	 * conversation nor touches the real session's transcript, turns, or
+	 * metadata. Returns `undefined` on any failure so the host keeps its
+	 * placeholder.
+	 */
+	async generateTitle(session: URI, request: { readonly prompt: string; readonly modelId?: string }, token: CancellationToken): Promise<string | undefined> {
+		const githubToken = this._githubToken;
+		if (!githubToken || token.isCancellationRequested) {
+			return undefined;
+		}
+		const abortController = new AbortController();
+		const cancellation = token.onCancellationRequested(() => abortController.abort());
+		try {
+			// The raw model reply; sanitizing and shortening titles belongs to the caller.
+			const reply = await this._copilotApiService.utilityChatCompletion(githubToken, {
+				messages: [{ role: 'user', content: copilotTitlePrompt(request.prompt) }],
+				maxTokens: TITLE_MAX_TOKENS,
+				// Names the session on the model the user picked; the CAPI utility
+				// default applies when the session has no model of its own yet.
+				...(request.modelId !== undefined ? { modelFamily: request.modelId } : {}),
+			}, { signal: abortController.signal });
+			this._logService.info(`[Copilot] session title reply for ${session.toString()}: ${reply?.length ?? 0} character(s)`);
+			return reply;
+		} catch (error) {
+			if (!token.isCancellationRequested) {
+				this._logService.warn(`[Copilot] Failed to generate a session title for ${session.toString()}`, error);
+			}
+			return undefined;
+		} finally {
+			cancellation.dispose();
+		}
 	}
 
 	async shutdown(): Promise<void> {

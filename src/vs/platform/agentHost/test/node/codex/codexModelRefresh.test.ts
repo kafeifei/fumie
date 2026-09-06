@@ -5,8 +5,8 @@
 
 import type { CCAModel } from '@vscode/copilot-api';
 import assert from 'assert';
-import { Event } from '../../../../../base/common/event.js';
-import type { DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { Emitter, Event } from '../../../../../base/common/event.js';
+import { Disposable, type DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { INativeEnvironmentService } from '../../../../../platform/environment/common/environment.js';
@@ -23,6 +23,10 @@ import { RecordingAgentSdkDownloader } from '../testAgentSdkDownloader.js';
 import { IAgentHostCheckpointService, NULL_CHECKPOINT_SERVICE } from '../../../common/agentHostCheckpointService.js';
 import { AGENT_SDK_SETUP_DOWNLOAD_REQUEST_KEY, AGENT_SDK_SETUP_RELOAD_REQUEST_KEY, readAgentSdkSetupInfos } from '../../../common/agentSdkSetup.js';
 import { CodexAgent, toCodexModelSelectionId } from '../../../node/codex/codexAgent.js';
+import { ByokLmBridgeRegistry, IByokLmBridgeRegistry } from '../../../node/byokLmBridgeRegistry.js';
+import { IChatGptSubscriptionService } from '../../../node/chatGptSubscription.js';
+import { createTestChatGptSubscriptionService } from '../testChatGptSubscriptionService.js';
+import type { IByokLmModelInfo } from '../../../common/agentHostByokLm.js';
 import { ICodexProxyService } from '../../../node/codex/codexProxyService.js';
 import { ICopilotApiService } from '../../../node/shared/copilotApiService.js';
 import { ISessionDataService } from '../../../common/sessionDataService.js';
@@ -45,7 +49,7 @@ interface ITestAgentContext {
  * running the suite has `@openai/codex` in `node_modules`. Tests wanting the
  * cold case override `_isSdkResolvableWithoutDownload` directly.
  */
-function createAgentContext(disposables: Pick<DisposableStore, 'add'>, models: () => Promise<CCAModel[]>, rootConfig: Record<string, boolean> = {}, sdkDownloader = new RecordingAgentSdkDownloader()): ITestAgentContext {
+function createAgentContext(disposables: Pick<DisposableStore, 'add'>, models: () => Promise<CCAModel[]>, rootConfig: Record<string, boolean> = {}, sdkDownloader = new RecordingAgentSdkDownloader(), userHome = '/tmp', byokModels: readonly IByokLmModelInfo[] = [], byokRegistry: IByokLmBridgeRegistry = byokRegistryWith(byokModels)): ITestAgentContext {
 	const instantiationService = new TestInstantiationService();
 	const logService = new NullLogService();
 	const stateManager = disposables.add(new AgentHostStateManager(logService));
@@ -62,14 +66,16 @@ function createAgentContext(disposables: Pick<DisposableStore, 'add'>, models: (
 	instantiationService.stub(IAgentHostOTelService, { _serviceBrand: undefined, getNativeSdkTelemetryConfig: async () => undefined });
 	instantiationService.stub(IAgentHostSessionTitleSignal, { _serviceBrand: undefined, onDidChangeSessionTitle: Event.None });
 	instantiationService.stub(IProductService, { _serviceBrand: undefined, version: '1.0.0-test' } as IProductService);
-	instantiationService.stub(INativeEnvironmentService, { userHome: URI.file('/tmp') });
+	instantiationService.stub(INativeEnvironmentService, { userHome: URI.file(userHome) });
 	instantiationService.stub(ILogService, logService);
+	instantiationService.stub(IByokLmBridgeRegistry, byokRegistry);
+	instantiationService.stub(IChatGptSubscriptionService, createTestChatGptSubscriptionService());
 	const agent = disposables.add(instantiationService.createInstance(CodexAgent));
 	return { agent, stateManager, configurationService, sdkDownloader };
 }
 
-function createAgent(disposables: Pick<DisposableStore, 'add'>, models: () => Promise<CCAModel[]>, rootConfig: Record<string, boolean> = {}, sdkDownloader = new RecordingAgentSdkDownloader()): CodexAgent {
-	return createAgentContext(disposables, models, rootConfig, sdkDownloader).agent;
+function createAgent(disposables: Pick<DisposableStore, 'add'>, models: () => Promise<CCAModel[]>, rootConfig: Record<string, boolean> = {}, sdkDownloader = new RecordingAgentSdkDownloader(), userHome = '/tmp', byokModels: readonly IByokLmModelInfo[] = [], byokRegistry: IByokLmBridgeRegistry = byokRegistryWith(byokModels)): CodexAgent {
+	return createAgentContext(disposables, models, rootConfig, sdkDownloader, userHome, byokModels, byokRegistry).agent;
 }
 
 const modelListResponse = {
@@ -129,6 +135,20 @@ function createChatGPTConnection(account: unknown = { type: 'chatgpt', email: 'p
 	};
 }
 
+/**
+ * An {@link IByokLmBridgeRegistry} whose serving window already published
+ * `models` — the source the picker's gateway rows come from.
+ */
+function byokRegistryWith(models: readonly IByokLmModelInfo[]): IByokLmBridgeRegistry {
+	return {
+		_serviceBrand: undefined,
+		register: () => Disposable.None,
+		getModels: () => models,
+		getServingConnection: () => undefined,
+		onDidChangeModels: () => Disposable.None,
+	};
+}
+
 suite('CodexAgent model refresh', () => {
 
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
@@ -163,6 +183,64 @@ suite('CodexAgent model refresh', () => {
 				meta: { modelSourceId: 'chatgptSubscription' },
 			}],
 		});
+	});
+
+	test('gateway rows arrive from the renderer BYOK bridge with ids and names untouched', async () => {
+		const agent = createAgent(disposables, async () => [], {}, new RecordingAgentSdkDownloader(), '/tmp', [
+			{ vendor: 'customendpoint', id: 'codex/gpt-5.6-sol', name: 'GPT-5.6-Sol (codex)', modelIdentifier: 'customendpoint/Example/codex/gpt-5.6-sol', supportedReasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high' },
+			{ vendor: 'customendpoint', id: 'gpt-5.6-sol', modelIdentifier: 'customendpoint/Example/gpt-5.6-sol' },
+			{ vendor: 'customendpoint', id: 'claude-opus-4-6', modelIdentifier: 'customendpoint/Example/claude-opus-4-6' },
+			{ vendor: 'customendpoint', id: 'gpt-image-2', modelIdentifier: 'customendpoint/Example/gpt-image-2' },
+		]);
+		await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+		assert.deepStrictEqual(agent.models.get().map(model => ({ id: model.id, name: model.name, efforts: model.configSchema?.properties['thinkingLevel']?.enum, meta: model._meta })), [
+			{
+				id: 'customendpoint/Example/codex/gpt-5.6-sol',
+				name: 'GPT-5.6-Sol (codex)',
+				efforts: ['low', 'high'],
+				meta: { byokModelIdentifier: 'customendpoint/Example/codex/gpt-5.6-sol' },
+			},
+			{
+				id: 'customendpoint/Example/gpt-5.6-sol',
+				name: 'gpt-5.6-sol',
+				efforts: undefined,
+				meta: { byokModelIdentifier: 'customendpoint/Example/gpt-5.6-sol' },
+			},
+			{
+				id: 'customendpoint/Example/claude-opus-4-6',
+				name: 'claude-opus-4-6',
+				efforts: undefined,
+				meta: { byokModelIdentifier: 'customendpoint/Example/claude-opus-4-6' },
+			},
+			{
+				id: 'customendpoint/Example/gpt-image-2',
+				name: 'gpt-image-2',
+				efforts: undefined,
+				meta: { byokModelIdentifier: 'customendpoint/Example/gpt-image-2' },
+			},
+		]);
+	});
+
+	test('a restored BYOK selection waits for the first provider catalog before falling back', async () => {
+		const registry = new ByokLmBridgeRegistry();
+		const models = disposables.add(new Emitter<IByokLmModelInfo[]>());
+		disposables.add(registry.register('renderer', {
+			chat: async () => ({ output: [] }),
+			onDidChangeModels: models.event,
+		}));
+		models.fire([]);
+		const agent = createAgent(disposables, async () => [], {}, new RecordingAgentSdkDownloader(), '/tmp', [], registry);
+		const resolution = agent['_resolveModel']({ model: { id: toCodexModelSelectionId('fumie-provider', 'customendpoint/Example/claude-opus-4-6') }, needsResume: true } as never);
+
+		models.fire([{
+			vendor: 'customendpoint',
+			id: 'gpt-5.6-sol',
+			modelIdentifier: 'customendpoint/Example/gpt-5.6-sol',
+			supportedHarnesses: ['codex'],
+		}]);
+
+		assert.deepStrictEqual(await resolution, { id: 'customendpoint/Example/gpt-5.6-sol' });
 	});
 
 	test('does not enumerate at startup while signed-out use is disabled', async () => {
@@ -388,6 +466,33 @@ suite('CodexAgent model refresh', () => {
 		assert.deepStrictEqual(appliedTokens, ['token-arriving-during-start']);
 	});
 
+	test('replaces a provider-less prewarm before a BYOK session uses it', async () => {
+		const agent = createAgent(disposables, async () => []);
+		let oldDisposed = false;
+		let oldKilled = false;
+		agent['_connection'] = {
+			kind: 'ready',
+			client: { dispose: () => { oldDisposed = true; } },
+			proxyHandle: { setToken() { }, dispose() { } },
+			child: { kill: () => { oldKilled = true; return true; } },
+		} as never;
+		const replacement = {
+			client: { dispose() { } },
+			proxyHandle: { setToken() { }, dispose() { } },
+			byokProxyHandle: { dispose() { } },
+			child: { kill: () => true },
+		};
+		agent['_startConnection'] = async () => replacement as never;
+
+		const connection = await agent['_ensureConnectionForModelProvider']('fumie-provider');
+
+		assert.deepStrictEqual({
+			oldDisposed,
+			oldKilled,
+			replaced: connection.byokProxyHandle === replacement.byokProxyHandle,
+		}, { oldDisposed: true, oldKilled: true, replaced: true });
+	});
+
 	test('surfaces current ChatGPT subscription models under the ChatGPT provider', async () => {
 		const agent = createAgent(disposables, async () => []);
 		agent['_connection'] = {
@@ -431,6 +536,73 @@ suite('CodexAgent model refresh', () => {
 			},
 			meta: { modelSourceId: 'chatgptSubscription' },
 		}]);
+	});
+
+	test('projects and validates only the service tiers advertised by each ChatGPT model', async () => {
+		const agent = createAgent(disposables, async () => []);
+		const fastModel = {
+			...modelListResponse.data[0],
+			serviceTiers: [{ id: 'priority', name: 'Fast', description: '1.5x speed, increased usage' }],
+		};
+		const standardModel = {
+			...modelListResponse.data[0],
+			id: 'gpt-standard',
+			model: 'gpt-standard',
+			displayName: 'GPT Standard',
+			isDefault: false,
+		};
+		agent['_connection'] = {
+			kind: 'ready',
+			client: {
+				request: async (method: string) => {
+					if (method === 'account/read') {
+						return { account: { type: 'chatgpt', email: 'person@example.com', planType: 'plus' }, requiresOpenaiAuth: true };
+					}
+					if (method === 'config/read') {
+						return { config: { model_provider: 'openai' } };
+					}
+					if (method === 'model/list') {
+						return { data: [fastModel, standardModel], nextCursor: null };
+					}
+					throw new Error(`Unexpected request: ${method}`);
+				},
+			},
+			proxyHandle: { dispose() { } },
+			child: { kill: () => true },
+		} as never;
+
+		await agent.refreshModels();
+
+		const [fast, standard] = agent.models.get();
+		assert.deepStrictEqual({
+			fast: fast.configSchema?.properties.serviceTier,
+			standard: standard.configSchema?.properties.serviceTier,
+			resolved: {
+				fast: agent['_getServiceTier']({ id: fast.id, config: { serviceTier: 'priority' } }),
+				implicitStandard: agent['_getServiceTier']({ id: fast.id }),
+				explicitStandard: agent['_getServiceTier']({ id: fast.id, config: { serviceTier: 'standard' } }),
+				unknownTier: agent['_getServiceTier']({ id: fast.id, config: { serviceTier: 'unknown' } }),
+				unsupportedModel: agent['_getServiceTier']({ id: standard.id, config: { serviceTier: 'priority' } }),
+			},
+		}, {
+			fast: {
+				type: 'string',
+				title: 'Speed',
+				description: 'Controls Codex response speed and usage.',
+				default: 'standard',
+				enum: ['standard', 'priority'],
+				enumLabels: ['Standard', 'Fast'],
+				enumDescriptions: ['Standard speed and usage.', '1.5x speed, increased usage'],
+			},
+			standard: undefined,
+			resolved: {
+				fast: 'priority',
+				implicitStandard: null,
+				explicitStandard: null,
+				unknownTier: null,
+				unsupportedModel: null,
+			},
+		});
 	});
 
 	test('omits the thinking level when a Codex model advertises no reasoning efforts', async () => {
@@ -507,11 +679,7 @@ suite('CodexAgent model refresh', () => {
 
 		await agent['_refreshCodexModels']();
 
-		assert.deepStrictEqual(agent['_codexModels'].map(model => ({ provider: model.provider, id: model.id, meta: model._meta })), [{
-			provider: 'custom-provider',
-			id: toCodexModelSelectionId('custom-provider', 'gpt-5.6-sol'),
-			meta: undefined,
-		}]);
+		assert.deepStrictEqual(agent['_codexModels'], []);
 	});
 
 	test('does not treat a custom provider named chatgpt as a ChatGPT subscription', async () => {
@@ -538,10 +706,7 @@ suite('CodexAgent model refresh', () => {
 
 		await agent['_refreshCodexModels']();
 
-		assert.deepStrictEqual(agent['_codexModels'].map(model => ({ provider: model.provider, meta: model._meta })), [{
-			provider: 'chatgpt',
-			meta: undefined,
-		}]);
+		assert.deepStrictEqual(agent['_codexModels'], []);
 	});
 
 	test('does not relabel a custom provider when ChatGPT authentication is available', async () => {
@@ -568,10 +733,7 @@ suite('CodexAgent model refresh', () => {
 
 		await agent['_refreshCodexModels']();
 
-		assert.deepStrictEqual(agent['_codexModels'].map(model => ({ provider: model.provider, meta: model._meta })), [{
-			provider: 'custom-provider',
-			meta: undefined,
-		}]);
+		assert.deepStrictEqual(agent['_codexModels'], []);
 	});
 
 	test('signs out through app-server and refreshes account state', async () => {

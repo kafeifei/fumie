@@ -18,7 +18,6 @@ import { IChatService } from '../../../../../workbench/contrib/chat/common/chatS
 import { IVoicePlaybackService } from '../../../../../workbench/contrib/chat/common/voicePlaybackService.js';
 import { workbenchInstantiationService } from '../../../../../workbench/test/browser/workbenchTestServices.js';
 import { IAgentHostFilterService } from '../../../../services/agentHostFilter/common/agentHostFilter.js';
-import { ISessionGroup, ISessionGroupsService } from '../../../../services/sessions/browser/sessionGroupsService.js';
 import { ISessionsListModelService, SessionSortMode } from '../../../../services/sessions/browser/sessionsListModelService.js';
 import { ISessionSectionOrderService } from '../../../../services/sessions/browser/sessionSectionOrderService.js';
 import { ISessionsProvidersService } from '../../../../services/sessions/browser/sessionsProvidersService.js';
@@ -139,8 +138,6 @@ export interface IListHarness {
 }
 
 export interface IListHarnessOptions {
-	readonly groups?: readonly ISessionGroup[];
-	readonly memberships?: ReadonlyMap<string, string>;
 	readonly pinnedSessionIds?: ReadonlySet<string>;
 }
 
@@ -153,8 +150,6 @@ export function createListHarness(disposables: Pick<DisposableStore, 'add'>, ses
 	const commandService = new TestCommandService();
 	const configure = typeof optionsOrConfigure === 'function' ? optionsOrConfigure : undefined;
 	const options: IListHarnessOptions = typeof optionsOrConfigure === 'function' ? {} : optionsOrConfigure;
-	const groups = options.groups ?? [];
-	const memberships = options.memberships ?? new Map();
 	const pinnedSessionIds = options.pinnedSessionIds ?? new Set();
 
 	instantiationService.stub(ISessionsManagementService, managementService);
@@ -172,15 +167,6 @@ export function createListHarness(disposables: Pick<DisposableStore, 'add'>, ses
 		}
 		override getStatusIcon() { return Codicon.circleSmallFilled; }
 	});
-	instantiationService.stub(ISessionGroupsService, new class extends mock<ISessionGroupsService>() {
-		override readonly onDidChange = Event.None;
-		override getGroups() { return [...groups]; }
-		override getGroup(groupId: string) { return groups.find(group => group.id === groupId); }
-		override getGroupOfSession(sessionId: string) { return memberships.get(sessionId); }
-		override getSessionIdsInGroup(groupId: string) {
-			return [...memberships].filter(([, memberGroupId]) => memberGroupId === groupId).map(([sessionId]) => sessionId);
-		}
-	});
 	instantiationService.stub(ISessionSectionOrderService, new class extends mock<ISessionSectionOrderService>() {
 		override readonly onDidChange = Event.None;
 		override resolveOrder(ids: readonly string[]) { return [...ids]; }
@@ -189,7 +175,9 @@ export function createListHarness(disposables: Pick<DisposableStore, 'add'>, ses
 	});
 	instantiationService.stub(IAgentHostFilterService, new class extends mock<IAgentHostFilterService>() {
 		override readonly onDidChange = Event.None;
+		override readonly scope = { kind: 'all' } as const;
 		override readonly selectedProviderId = undefined;
+		override readonly hosts = [];
 	});
 	instantiationService.stub(IWorkbenchAssignmentService, new class extends mock<IWorkbenchAssignmentService>() {
 		override readonly onDidRefetchAssignments = Event.None;

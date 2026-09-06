@@ -8,7 +8,7 @@ import { Event } from '../../../../../base/common/event.js';
 import { KeyCode, KeyMod } from '../../../../../base/common/keyCodes.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { IDisposable } from '../../../../../base/common/lifecycle.js';
-import { autorun, IReader, observableFromEvent } from '../../../../../base/common/observable.js';
+import { autorun, IReader, observableFromEvent, observableSignalFromEvent } from '../../../../../base/common/observable.js';
 import { isEqual } from '../../../../../base/common/resources.js';
 import { localize2 } from '../../../../../nls.js';
 import { Action2, registerAction2 } from '../../../../../platform/actions/common/actions.js';
@@ -26,6 +26,7 @@ import { HasDockedDetailsContext, SinglePaneLayoutEnabledContext } from '../../.
 import { ISessionsService } from '../../../../services/sessions/browser/sessionsService.js';
 import { IActiveSession } from '../../../../services/sessions/common/sessionsManagement.js';
 import { ISessionChangesService } from '../../../changes/browser/sessionChangesService.js';
+import { EmptyFileEditorInput } from '../../../editor/browser/emptyFileEditorInput.js';
 import { DetailPanelTarget, SinglePaneDetailPanelCoordinator } from './singlePaneDetailPanelCoordinator.js';
 import { SinglePaneDockedTabsCoordinator } from './singlePaneDockedTabsCoordinator.js';
 import { isChangesEditorInput, isEditorWithoutDockedDetails, isFileEditorInput, isMainPartEmpty } from './singlePaneSharedHelpers.js';
@@ -56,6 +57,7 @@ export class SinglePaneExistingSessionStrategy extends SinglePaneLayoutStrategy 
 	private _detailHiddenTransiently = false;
 	private _detailHiddenByEditor = false;
 	private _changingDetailTransiently = false;
+	private _collapsingRedundantEditor = false;
 
 	constructor(
 		ctx: ISinglePaneLayoutContext,
@@ -71,6 +73,7 @@ export class SinglePaneExistingSessionStrategy extends SinglePaneLayoutStrategy 
 
 		this._registerVisibility();
 		this._registerEmptyGroupClose();
+		this._registerRedundantEditorCollapse();
 		this._registerDetailPanel();
 		this._register(this._registerToggleDetailsAction());
 	}
@@ -103,6 +106,73 @@ export class SinglePaneExistingSessionStrategy extends SinglePaneLayoutStrategy 
 
 			this._layoutService.hideSidePane();
 		}));
+	}
+
+	/**
+	 * Keeps chat as the primary surface when the editor contains only managed
+	 * landing tabs. Empty Files has no editor content of its own, and an empty
+	 * Changes editor only repeats the detail panel's "no changes" state. Real
+	 * files and non-empty Changes remain visible and reveal the editor normally.
+	 */
+	private _registerRedundantEditorCollapse(): void {
+		const editorStateChanged = observableSignalFromEvent(this, Event.any(
+			this._editorService.onDidActiveEditorChange,
+			this._editorService.onDidEditorsChange,
+			this._editorService.onDidCloseEditor,
+			this._layoutService.onDidChangePartVisibility,
+			this._ctx.onDidEndSessionLayoutRestore,
+		));
+
+		this._register(autorun(reader => {
+			editorStateChanged.read(reader);
+			const session = this._sessionsService.activeSession.read(reader);
+			const hasChanges = (session?.changes.read(reader).length ?? 0) > 0;
+			this._collapseRedundantEditor(session, hasChanges);
+		}));
+	}
+
+	private _collapseRedundantEditor(session: IActiveSession | undefined, hasChanges: boolean): void {
+		const activeEditor = this._editorService.activeEditor;
+		const editors = this._editorGroupsService.mainPart.groups.flatMap(group => group.editors);
+		if (this._collapsingRedundantEditor
+			|| this._ctx.isRestoringSessionLayout
+			|| this._ctx.multipleSessionsVisibleObs.get()
+			|| !session
+			|| session.isQuickChat?.get()
+			|| !session.isCreated.get()
+			|| !session.workspace.get()
+			|| this._layoutService.isEditorMaximized()
+			|| this._layoutService.isVisible(Parts.CUSTOM_VIEW_GRID_PART)
+			|| !this._layoutService.isVisible(Parts.EDITOR_PART, mainWindow)) {
+			return;
+		}
+
+		const activeEditorIsRedundant = activeEditor instanceof EmptyFileEditorInput
+			|| (!!activeEditor && !hasChanges && isChangesEditorInput(activeEditor, this._sessionChangesService));
+		if (!activeEditorIsRedundant) {
+			return;
+		}
+
+		if (editors.length === 0 || !editors.every(editor =>
+			editor instanceof EmptyFileEditorInput || isChangesEditorInput(editor, this._sessionChangesService))) {
+			return;
+		}
+
+		this._collapsingRedundantEditor = true;
+		const suppression = this._layoutService.suppressEditorPartAutoVisibility();
+		try {
+			if (!this._layoutService.isVisible(Parts.AUXILIARYBAR_PART)) {
+				this._layoutService.setPartHidden(false, Parts.AUXILIARYBAR_PART);
+			}
+			this._layoutService.setPartHidden(true, Parts.EDITOR_PART);
+			this._visibilityStore.set(SessionVisibilityProfile.Existing, {
+				editorVisible: false,
+				auxiliaryBarVisible: true,
+			});
+		} finally {
+			suppression.dispose();
+			this._collapsingRedundantEditor = false;
+		}
 	}
 
 	/**
@@ -204,7 +274,7 @@ export class SinglePaneExistingSessionStrategy extends SinglePaneLayoutStrategy 
 	}
 
 	private _captureExistingProfileIfApplicable(): void {
-		if (this._ctx.isRestoringSessionLayout || this._ctx.multipleSessionsVisibleObs.get()) {
+		if (this._ctx.isRestoringSessionLayout || this._collapsingRedundantEditor || this._ctx.multipleSessionsVisibleObs.get()) {
 			return;
 		}
 		const activeSession = this._sessionsService.activeSession.get();

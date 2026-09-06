@@ -108,15 +108,15 @@ export function getPermissionLevelMeta(level: ChatPermissionLevel): IPermissionL
 	switch (level) {
 		case ChatPermissionLevel.Assisted:
 			return {
-				label: localize('permissions.assisted', "Assisted permissions"),
-				detail: localize('permissions.assisted.subtext', "Evaluates risk before running tools"),
+				label: localize('permissions.assisted', "Auto-Review"),
+				detail: localize('permissions.assisted.subtext', "Review tool calls automatically"),
 				icon: Codicon.sparkle,
-				hover: localize('permissions.assisted.description', "An LLM judge evaluates each tool call. Tools it doesn't approve require your approval."),
+				hover: localize('permissions.assisted.description', "Reviews each tool call and asks when uncertain."),
 			};
 		case ChatPermissionLevel.AutoApprove:
 			return {
-				label: localize('permissions.autoApprove', "Allow all"),
-				detail: localize('permissions.autoApprove.subtext', "Runs tool calls without asking"),
+				label: localize('permissions.autoApprove', "Full Access"),
+				detail: localize('permissions.autoApprove.subtext', "Run tools without asking"),
 				icon: Codicon.warning,
 			};
 		case ChatPermissionLevel.Autopilot:
@@ -129,8 +129,8 @@ export function getPermissionLevelMeta(level: ChatPermissionLevel): IPermissionL
 		case ChatPermissionLevel.Default:
 		default:
 			return {
-				label: localize('permissions.default', "Default permissions"),
-				detail: localize('permissions.default.subtext', "Asks when approval settings don't apply"),
+				label: localize('permissions.default', "Default Permissions"),
+				detail: localize('permissions.default.subtext', "Ask when needed"),
 				icon: Codicon.shield,
 			};
 	}

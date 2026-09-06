@@ -248,6 +248,81 @@
 		},
 		{
 			"type": "chrome",
+			"request": "attach",
+			"name": "Attach to Fumie Debug Renderer",
+			"browserAttachLocation": "workspace",
+			"port": 9333,
+			"outFiles": [
+				"/Applications/Fumie Debug.app/Contents/Resources/Fumie Debug Runtime.app/Contents/Resources/app/out/**/*.js"
+			],
+			"sourceMapPathOverrides": {
+				"*/src/*": "${workspaceFolder}/src/*"
+			},
+			"perScriptSourcemaps": "yes",
+			"presentation": {
+				"group": "fumie-debug",
+				"order": 1
+			}
+		},
+		{
+			"type": "node",
+			"request": "attach",
+			"name": "Attach to Fumie Debug Extension Host",
+			"port": 9334,
+			"restart": true,
+			"timeout": 0,
+			"outFiles": [
+				"/Applications/Fumie Debug.app/Contents/Resources/Fumie Debug Runtime.app/Contents/Resources/app/out/**/*.js",
+				"/Applications/Fumie Debug.app/Contents/Resources/Fumie Debug Runtime.app/Contents/Resources/app/extensions/copilot/dist/**/*.js"
+			],
+			"sourceMapPathOverrides": {
+				"*/src/*": "${workspaceFolder}/src/*",
+				"*/extensions/copilot/src/*": "${workspaceFolder}/extensions/copilot/src/*"
+			},
+			"presentation": {
+				"group": "fumie-debug",
+				"order": 2
+			}
+		},
+		{
+			"type": "node",
+			"request": "attach",
+			"name": "Attach to Fumie Debug Main",
+			"port": 9335,
+			"restart": true,
+			"timeout": 0,
+			"continueOnAttach": true,
+			"outFiles": [
+				"/Applications/Fumie Debug.app/Contents/Resources/Fumie Debug Runtime.app/Contents/Resources/app/out/**/*.js"
+			],
+			"sourceMapPathOverrides": {
+				"*/src/*": "${workspaceFolder}/src/*"
+			},
+			"presentation": {
+				"group": "fumie-debug",
+				"order": 3
+			}
+		},
+		{
+			"type": "node",
+			"request": "attach",
+			"name": "Attach to Fumie Debug Agent Host",
+			"port": 9336,
+			"restart": true,
+			"timeout": 0,
+			"outFiles": [
+				"/Applications/Fumie Debug.app/Contents/Resources/Fumie Debug Runtime.app/Contents/Resources/app/out/**/*.js"
+			],
+			"sourceMapPathOverrides": {
+				"*/src/*": "${workspaceFolder}/src/*"
+			},
+			"presentation": {
+				"group": "fumie-debug",
+				"order": 4
+			}
+		},
+		{
+			"type": "chrome",
 			"request": "launch",
 			"name": "Launch VS Code Internal",
 			"windows": {
@@ -276,7 +351,7 @@
 				"--disable-features=CalculateNativeWinOcclusion",
 				"--disable-extension=vscode.vscode-api-tests"
 			],
-			"userDataDir": "${userHome}/.vscode-oss-dev",
+			"userDataDir": "${userHome}/.vsfumie-dev",
 			"webRoot": "${workspaceFolder}",
 			"cascadeTerminateToConfigurations": [
 				"Attach to Extension Host"
@@ -322,7 +397,7 @@
 				"--disable-extension=vscode.vscode-api-tests",
 				"--agents"
 			],
-			"userDataDir": "${userHome}/.vscode-oss-dev",
+			"userDataDir": "${userHome}/.vsfumie-dev",
 			"webRoot": "${workspaceFolder}",
 			"cascadeTerminateToConfigurations": [
 				"Attach to Extension Host"
@@ -370,7 +445,7 @@
 				"--disable-features=CalculateNativeWinOcclusion",
 				"--disable-extension=vscode.vscode-api-tests"
 			],
-			"userDataDir": "${userHome}/.vscode-oss-dev",
+			"userDataDir": "${userHome}/.vsfumie-dev",
 			"webRoot": "${workspaceFolder}",
 			"cascadeTerminateToConfigurations": [
 				"Attach to Extension Host"
@@ -578,9 +653,9 @@
 			"request": "launch",
 			"name": "Run Unit Tests",
 			"program": "${workspaceFolder}/test/unit/electron/index.js",
-			"runtimeExecutable": "${workspaceFolder}/.build/electron/Code - OSS.app/Contents/MacOS/Code - OSS",
+			"runtimeExecutable": "${workspaceFolder}/.build/electron/Fumie.app/Contents/MacOS/Fumie",
 			"windows": {
-				"runtimeExecutable": "${workspaceFolder}/.build/electron/Code - OSS.exe"
+				"runtimeExecutable": "${workspaceFolder}/.build/electron/Fumie.exe"
 			},
 			"linux": {
 				"runtimeExecutable": "${workspaceFolder}/.build/electron/code-oss"
@@ -608,9 +683,9 @@
 			"request": "launch",
 			"name": "Run Unit Tests For Current File",
 			"program": "${workspaceFolder}/test/unit/electron/index.js",
-			"runtimeExecutable": "${workspaceFolder}/.build/electron/Code - OSS.app/Contents/MacOS/Code - OSS",
+			"runtimeExecutable": "${workspaceFolder}/.build/electron/Fumie.app/Contents/MacOS/Fumie",
 			"windows": {
-				"runtimeExecutable": "${workspaceFolder}/.build/electron/Code - OSS.exe"
+				"runtimeExecutable": "${workspaceFolder}/.build/electron/Fumie.exe"
 			},
 			"linux": {
 				"runtimeExecutable": "${workspaceFolder}/.build/electron/code-oss"
@@ -644,7 +719,7 @@
 			"timeout": 240000,
 			"args": [
 				"-l",
-				"${workspaceFolder}/.build/electron/Code - OSS.app/Contents/MacOS/Code - OSS"
+				"${workspaceFolder}/.build/electron/Fumie.app/Contents/MacOS/Fumie"
 			],
 			"outFiles": [
 				"${cwd}/out/**/*.js"
@@ -721,6 +796,20 @@
 		}
 	],
 	"compounds": [
+		{
+			"name": "Attach to Fumie Debug",
+			"stopAll": false,
+			"configurations": [
+				"Attach to Fumie Debug Renderer",
+				"Attach to Fumie Debug Extension Host",
+				"Attach to Fumie Debug Main",
+				"Attach to Fumie Debug Agent Host"
+			],
+			"presentation": {
+				"group": "fumie-debug",
+				"order": 1
+			}
+		},
 		{
 			"name": "VS Code",
 			"stopAll": true,

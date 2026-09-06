@@ -4,9 +4,13 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { localize } from '../../../nls.js';
+import product from '../../product/common/product.js';
 import { createSchema, schemaProperty } from './agentHostSchema.js';
 import { CustomizationType, type Customization, type PluginCustomization } from './state/protocol/state.js';
 import { customizationId } from './state/sessionState.js';
+
+export const codexUsageSources = ['copilot', 'openai'] as const;
+export type CodexUsageSource = typeof codexUsageSources[number];
 
 /**
  * Well-known root-config keys used by the platform to configure agent-host
@@ -28,6 +32,8 @@ export const enum AgentHostConfigKey {
 	 * feature is dark (today's always-proxy behavior).
 	 */
 	AllowSignedOutWhenUsable = 'allowSignedOutWhenUsable',
+	ClaudeUseCopilotProxy = 'claudeUseCopilotProxy',
+	CodexUsageSource = 'codexUsageSource',
 	/** Controls whether session-scoped file customizations come from local scan or SDK discovery. */
 	SessionCustomizationDiscoveryMode = 'sessionCustomizationDiscoveryMode',
 	/**
@@ -96,6 +102,19 @@ export const agentHostCustomizationConfigSchema = createSchema({
 		description: localize('agentHost.config.allowSignedOutWhenUsable.description', "Experimental. When enabled, Agent Host sessions remain available while signed out as long as the selected agent has a usable model and authentication (for example Codex with ChatGPT authentication or Claude in native mode with your own Anthropic credentials). When disabled (the default), GitHub sign-in is required."),
 		default: false,
 	}),
+	[AgentHostConfigKey.ClaudeUseCopilotProxy]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.claudeUseCopilotProxy.title', "Route Claude Through Copilot"),
+		description: localize('agentHost.config.claudeUseCopilotProxy.description', "When enabled (the default), the Claude agent routes all requests through GitHub Copilot. When disabled, Claude talks to Anthropic directly using your own credentials (API key or Claude subscription)."),
+		default: product.agentHostDefaultClaudeUseCopilotProxy ?? true,
+	}),
+	[AgentHostConfigKey.CodexUsageSource]: schemaProperty<CodexUsageSource>({
+		type: 'string',
+		title: localize('agentHost.config.codexUsageSource.title', "Codex Usage Source"),
+		description: localize('agentHost.config.codexUsageSource.description', "Choose whether Codex usage is routed through GitHub Copilot or your ChatGPT account. Manage ChatGPT sign-in from the Codex Agent settings page."),
+		default: product.agentHostDefaultCodexUsageSource ?? 'copilot',
+		enum: [...codexUsageSources],
+	}),
 	[AgentHostConfigKey.SessionCustomizationDiscoveryMode]: schemaProperty<SessionCustomizationDiscoveryMode>({
 		type: 'string',
 		enum: [...SESSION_CUSTOMIZATION_DISCOVERY_MODES],
@@ -112,6 +131,12 @@ export const agentHostCustomizationConfigSchema = createSchema({
 
 export const defaultAgentHostCustomizationConfigValues = {
 	[AgentHostConfigKey.Customizations]: [] as IPersistedCustomizationConfigEntry[],
+	// The Fumie shell is backed directly by the local Claude SDK and the
+	// configured Codex provider. These values are materialized into the
+	// agent-host root state on first launch, where protocol schema defaults are
+	// otherwise descriptive only.
+	[AgentHostConfigKey.ClaudeUseCopilotProxy]: product.agentHostDefaultClaudeUseCopilotProxy ?? false,
+	[AgentHostConfigKey.CodexUsageSource]: product.agentHostDefaultCodexUsageSource ?? 'openai',
 };
 
 /**

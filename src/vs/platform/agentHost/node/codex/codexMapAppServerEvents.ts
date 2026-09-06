@@ -9,7 +9,7 @@ import { localize } from '../../../../nls.js';
 import type { IAgentModelCallCompletedSignal } from '../../common/agent.js';
 import { toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import { ActionType, type SessionAction, type ChatAction } from '../../common/state/sessionActions.js';
-import { MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallContributorKind, ToolResultContentType, TurnState, type ErrorInfo } from '../../common/state/sessionState.js';
+import { MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallContributorKind, ToolResultContentType, TurnState, type ErrorInfo, type ToolResultTodoItem } from '../../common/state/sessionState.js';
 import { extractForwardedErrorInfo } from '../shared/proxyChatError.js';
 import { getServerToolDisplay } from '../shared/serverToolGroups.js';
 import { ActiveClientToolSet } from '../activeClientState.js';
@@ -29,6 +29,7 @@ import type { ReasoningSummaryPartAddedNotification } from './protocol/generated
 import type { ReasoningSummaryTextDeltaNotification } from './protocol/generated/v2/ReasoningSummaryTextDeltaNotification.js';
 import type { ReasoningTextDeltaNotification } from './protocol/generated/v2/ReasoningTextDeltaNotification.js';
 import type { ThreadTokenUsageUpdatedNotification } from './protocol/generated/v2/ThreadTokenUsageUpdatedNotification.js';
+import type { TokenUsageBreakdown } from './protocol/generated/v2/TokenUsageBreakdown.js';
 import type { TurnCompletedNotification } from './protocol/generated/v2/TurnCompletedNotification.js';
 import type { TurnError } from './protocol/generated/v2/TurnError.js';
 import type { TurnStartedNotification } from './protocol/generated/v2/TurnStartedNotification.js';
@@ -38,6 +39,8 @@ import type { DynamicToolCallOutputContentItem } from './protocol/generated/v2/D
 import type { JsonValue } from './protocol/generated/serde_json/JsonValue.js';
 import type { CollabAgentTool } from './protocol/generated/v2/CollabAgentTool.js';
 import type { CollabAgentState } from './protocol/generated/v2/CollabAgentState.js';
+import type { TurnPlanStep } from './protocol/generated/v2/TurnPlanStep.js';
+import type { TurnPlanUpdatedNotification } from './protocol/generated/v2/TurnPlanUpdatedNotification.js';
 
 /**
  * Per-session mutable state held by the mapper. Carries the bookkeeping
@@ -58,6 +61,8 @@ export interface ICodexSessionMapState {
 	readonly itemToToolCall: Map<string, ICodexToolCallEntry>;
 	/** Stable codex reasoning item/index → our reasoning response part id. */
 	readonly itemToReasoningPartId: Map<string, string>;
+	/** The current turn's stable, running `update_plan` item. */
+	runningPlan: ICodexRunningPlan | undefined;
 	/** Current turn id (per `turn/started`). */
 	currentTurnId: string | undefined;
 	/**
@@ -132,11 +137,25 @@ interface ICodexPendingPreflight {
 	readonly completion: (SessionAction | ChatAction)[];
 }
 
+interface ICodexRunningPlan {
+	readonly toolCallId: string;
+	readonly turnId: string;
+	output: string;
+}
+
 export interface ICodexToolCallEntry {
 	readonly toolCallId: string;
 	readonly turnId: string;
 	readonly toolName: string;
 	output: string;
+	/**
+	 * The invocation message the item's own `ChatToolCallReady` published (e.g.
+	 * the file list behind an `Apply file changes` card). A later approval
+	 * request has to re-send `invocationMessage`, so it reuses this instead of
+	 * echoing the confirmation title — which would both drop the detail the user
+	 * decides on and print the title twice in the confirmation card.
+	 */
+	readonly invocationMessage?: string;
 }
 
 export function createCodexSessionMapState(serverToolNames: ReadonlySet<string> = new Set(), clientToolSet: ActiveClientToolSet = new ActiveClientToolSet()): ICodexSessionMapState {
@@ -144,6 +163,7 @@ export function createCodexSessionMapState(serverToolNames: ReadonlySet<string> 
 		itemToPartId: new Map(),
 		itemToToolCall: new Map(),
 		itemToReasoningPartId: new Map(),
+		runningPlan: undefined,
 		currentTurnId: undefined,
 		clientToolSet,
 		serverToolNames,
@@ -166,6 +186,7 @@ export function resetCodexTurnMapState(state: ICodexSessionMapState): void {
 	state.itemToPartId.clear();
 	state.itemToToolCall.clear();
 	state.itemToReasoningPartId.clear();
+	state.runningPlan = undefined;
 	state.declinedToolCalls.clear();
 	state.deferredResponseActions.length = 0;
 	state.pendingPreflight = undefined;
@@ -173,11 +194,12 @@ export function resetCodexTurnMapState(state: ICodexSessionMapState): void {
 }
 
 export function finalizeCodexTurnMapState(state: ICodexSessionMapState, unresolvedToolMessage: string): (SessionAction | ChatAction)[] {
+	const planCompletion = completeRunningPlan(state);
 	const preflightFlush = flushPendingPreflight(state);
 	const orphanedToolCallActions = completeOrphanedToolCalls(state, unresolvedToolMessage);
 	const deferredResponseActions = flushDeferredResponseActions(state);
 	resetCodexTurnMapState(state);
-	return [...preflightFlush, ...orphanedToolCallActions, ...deferredResponseActions];
+	return [...planCompletion, ...preflightFlush, ...orphanedToolCallActions, ...deferredResponseActions];
 }
 
 /**
@@ -487,22 +509,186 @@ export function clearReasoningForItem(state: ICodexSessionMapState, itemId: stri
 	}
 }
 
+/**
+ * Splits a Codex `TokenUsageBreakdown` into the protocol's usage fields.
+ *
+ * TODO (docs/architecture.md): Codex's `inputTokens` is
+ * assumed here to be *inclusive* of `cachedInputTokens`, the way OpenAI's
+ * `prompt_tokens` includes `prompt_tokens_details.cached_tokens`. The generated
+ * app-server types carry no doc comments and no live response has been captured
+ * to settle it, so this subtracts rather than guesses the other way: the three
+ * fields then sum back to exactly the `inputTokens` this mapper reported before
+ * occupancy moved to the client, which is the one thing that can be asserted
+ * without evidence. `cacheWriteInputTokens` is deliberately left out for the
+ * same reason — folding it in would change the displayed number on an
+ * unverified premise. Capture a real response, then revisit both.
+ */
+export function codexUsageBreakdown(last: TokenUsageBreakdown): { readonly inputTokens: number; readonly cacheReadTokens: number } {
+	const cacheReadTokens = Math.max(0, last.cachedInputTokens);
+	return {
+		inputTokens: Math.max(0, last.inputTokens - cacheReadTokens),
+		cacheReadTokens,
+	};
+}
+
 export function mapTokenUsageUpdated(params: ThreadTokenUsageUpdatedNotification, modelId?: string): (SessionAction | ChatAction)[] {
 	const last = params.tokenUsage.last;
+	const breakdown = codexUsageBreakdown(last);
 	return [{
 		type: ActionType.ChatUsage,
 		turnId: params.turnId,
 		usage: {
-			inputTokens: last.inputTokens,
+			inputTokens: breakdown.inputTokens,
 			outputTokens: last.outputTokens,
 			...(modelId ? { model: modelId } : {}),
-			cacheReadTokens: last.cachedInputTokens,
+			cacheReadTokens: breakdown.cacheReadTokens,
 			_meta: {
 				reasoningOutputTokens: last.reasoningOutputTokens,
 				modelContextWindow: params.tokenUsage.modelContextWindow,
 			},
 		},
 	}];
+}
+
+function mapCodexPlanTodoStatus(status: string): ToolResultTodoItem['status'] {
+	switch (status) {
+		case 'inProgress': return 'in-progress';
+		case 'completed': return 'completed';
+		default: return 'not-started';
+	}
+}
+
+/**
+ * Maps a Codex `update_plan` plan snapshot to the protocol's todo items.
+ * Codex's steps carry `{ step, status: pending|inProgress|completed }` with no
+ * id, so we synthesize a stable index-based id and fold `pending` into the
+ * protocol's `not-started`.
+ */
+export function mapCodexPlanTodos(plan: readonly TurnPlanStep[]): ToolResultTodoItem[] {
+	const result: ToolResultTodoItem[] = [];
+	for (let i = 0; i < plan.length; i++) {
+		const title = plan[i].step;
+		if (!title) {
+			continue;
+		}
+		result.push({
+			id: `plan-${i}`,
+			title,
+			status: mapCodexPlanTodoStatus(plan[i].status),
+		});
+	}
+	return result;
+}
+
+export function codexUpdatePlanLabels(): { readonly displayName: string; readonly invocationMessage: string; readonly pastTenseMessage: string } {
+	return {
+		displayName: localize('codex.updatePlan.displayName', "Update todo list"),
+		invocationMessage: localize('codex.updatePlan.inProgress', "Updating todo list"),
+		pastTenseMessage: localize('codex.updatePlan.completed', "Updated todo list"),
+	};
+}
+
+function codexPlanInvocationMessage(todos: readonly ToolResultTodoItem[]): string {
+	const completed = todos.filter(todo => todo.status === 'completed').length;
+	const current = todos.find(todo => todo.status === 'in-progress')
+		?? todos.find(todo => todo.status === 'not-started');
+	if (!current || todos.length === 0) {
+		return todos.length > 0
+			? localize('codex.updatePlan.progress.complete', "Updating todo list ({0}/{1})", completed, todos.length)
+			: codexUpdatePlanLabels().invocationMessage;
+	}
+	return localize('codex.updatePlan.progress', "Updating todo list: {0} ({1}/{2})", current.title, Math.min(completed + 1, todos.length), todos.length);
+}
+
+function codexPlanOutput(explanation: string | null, todos: readonly ToolResultTodoItem[]): string {
+	const steps = todos.length > 0
+		? todos.map(todo => {
+			const marker = todo.status === 'completed' ? '[x]' : todo.status === 'in-progress' ? '[>]' : '[ ]';
+			return `${marker} ${todo.title}`;
+		}).join('\n')
+		: localize('codex.updatePlan.empty', "(no steps provided)");
+	const note = explanation?.trim();
+	return note ? `${note}\n\n${steps}` : steps;
+}
+
+function completeRunningPlan(state: ICodexSessionMapState): (SessionAction | ChatAction)[] {
+	const running = state.runningPlan;
+	if (!running) {
+		return [];
+	}
+	state.runningPlan = undefined;
+	return [{
+		type: ActionType.ChatToolCallComplete,
+		turnId: running.turnId,
+		toolCallId: running.toolCallId,
+		result: {
+			success: true,
+			pastTenseMessage: codexUpdatePlanLabels().pastTenseMessage,
+			content: [{ type: ToolResultContentType.Text, text: running.output }],
+		},
+	}];
+}
+
+/**
+ * `turn/plan/updated` carries Codex's `update_plan` todo/checklist snapshot
+ * out-of-band (it is not a normal `ThreadItem`). Mirror Codex's own event
+ * processor: the first snapshot starts one per-turn item, later snapshots
+ * update the same stable id, and turn completion finalizes it. The snapshot is
+ * plain tool output rather than `TodoList` content so it stays in the
+ * transcript and never enters the workbench's persistent todo widget.
+ */
+export function mapTurnPlanUpdated(state: ICodexSessionMapState, params: TurnPlanUpdatedNotification): (SessionAction | ChatAction)[] {
+	const todos = mapCodexPlanTodos(params.plan);
+	const output = codexPlanOutput(params.explanation, todos);
+	const invocationMessage = codexPlanInvocationMessage(todos);
+	const toolInput = JSON.stringify({ explanation: params.explanation, plan: params.plan });
+	const running = state.runningPlan;
+	if (running?.turnId === params.turnId) {
+		running.output = output;
+		return [
+			{
+				type: ActionType.ChatToolCallReady,
+				turnId: params.turnId,
+				toolCallId: running.toolCallId,
+				invocationMessage,
+				toolInput,
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			},
+			{
+				type: ActionType.ChatToolCallContentChanged,
+				turnId: params.turnId,
+				toolCallId: running.toolCallId,
+				content: [{ type: ToolResultContentType.Text, text: output }],
+			},
+		];
+	}
+
+	const toolCallId = generateUuid();
+	state.runningPlan = { toolCallId, turnId: params.turnId, output };
+	const labels = codexUpdatePlanLabels();
+	return [
+		{
+			type: ActionType.ChatToolCallStart,
+			turnId: params.turnId,
+			toolCallId,
+			toolName: 'update_plan',
+			displayName: labels.displayName,
+		},
+		{
+			type: ActionType.ChatToolCallReady,
+			turnId: params.turnId,
+			toolCallId,
+			invocationMessage,
+			toolInput,
+			confirmed: ToolCallConfirmationReason.NotNeeded,
+		},
+		{
+			type: ActionType.ChatToolCallContentChanged,
+			turnId: params.turnId,
+			toolCallId,
+			content: [{ type: ToolResultContentType.Text, text: output }],
+		},
+	];
 }
 
 /**
@@ -694,13 +880,14 @@ function mapItemStartedBody(
 	if (params.item.type === 'fileChange') {
 		const toolCallId = generateUuid();
 		const output = fileChangeOutput(params.item.changes);
+		const summary = describeFileChange(params.item.changes) || 'Apply file changes';
 		state.itemToToolCall.set(params.item.id, {
 			toolCallId,
 			turnId: params.turnId,
 			toolName: 'file_edit',
 			output,
+			invocationMessage: summary,
 		});
-		const summary = describeFileChange(params.item.changes) || 'Apply file changes';
 		return [
 			{
 				type: ActionType.ChatToolCallStart,
@@ -736,11 +923,13 @@ function mapItemStartedBody(
 		const toolName = `${params.item.server}.${params.item.tool}`;
 		const toolInput = toolInputText(params.item.arguments);
 		const customizationId = state.mcpCustomizationIds.get(params.item.server);
+		const invocationMessage = `Calling ${toolName}`;
 		state.itemToToolCall.set(params.item.id, {
 			toolCallId,
 			turnId: params.turnId,
 			toolName,
 			output: '',
+			invocationMessage,
 		});
 		return [
 			{
@@ -761,7 +950,7 @@ function mapItemStartedBody(
 				type: ActionType.ChatToolCallReady,
 				turnId: params.turnId,
 				toolCallId,
-				invocationMessage: `Calling ${toolName}`,
+				invocationMessage,
 				toolInput,
 				confirmed: ToolCallConfirmationReason.NotNeeded,
 			},
@@ -911,6 +1100,40 @@ function mapItemStartedBody(
 	return [];
 }
 
+/**
+ * How much of a still-running tool call's accumulated output we ship on each
+ * `chat/toolCallContentChanged`.
+ *
+ * `content` is replace-semantics (see `ChatToolCallContentChangedAction`), so
+ * every delta would otherwise re-send the WHOLE output built so far: a command
+ * whose output grows to S bytes over N deltas puts O(N·S) bytes on the wire.
+ * That is not theoretical — a single `grep` over a big log file produced 70
+ * updates averaging 1.1 MB each (78 MB) to convey 108 KB of new text, and the
+ * allocation churn exhausted the agent host's V8 heap ("OOM error in V8:
+ * CALL_AND_RETRY_LAST"), leaving the process spinning and the turn unanswerable.
+ *
+ * These frames are only a live preview: the tool call's `ChatToolCallComplete`
+ * carries the complete output (see `mapItemCompleted`), so previewing the tail
+ * loses nothing the user ends up seeing. Capping it makes each update O(1)
+ * instead of O(S) and the whole stream linear in the output size.
+ */
+const MAX_STREAMED_OUTPUT_PREVIEW = 16 * 1024;
+
+/**
+ * The tail of a running tool call's output, capped to
+ * {@link MAX_STREAMED_OUTPUT_PREVIEW}. The tail (not the head) is what a live
+ * preview wants — a capped head would simply stop updating and read as a hung
+ * command. Elision is marked inline so a truncated preview never looks like the
+ * command's real output.
+ */
+function streamedOutputPreview(output: string): string {
+	if (output.length <= MAX_STREAMED_OUTPUT_PREVIEW) {
+		return output;
+	}
+	const elided = output.length - MAX_STREAMED_OUTPUT_PREVIEW;
+	return `…[${elided} earlier chars elided; full output follows when the tool completes]\n${output.slice(-MAX_STREAMED_OUTPUT_PREVIEW)}`;
+}
+
 export function mapCommandExecutionOutputDelta(
 	state: ICodexSessionMapState,
 	params: CommandExecutionOutputDeltaNotification,
@@ -924,7 +1147,7 @@ export function mapCommandExecutionOutputDelta(
 		type: ActionType.ChatToolCallContentChanged,
 		turnId: entry.turnId,
 		toolCallId: entry.toolCallId,
-		content: [{ type: ToolResultContentType.Text, text: entry.output }],
+		content: [{ type: ToolResultContentType.Text, text: streamedOutputPreview(entry.output) }],
 	}];
 }
 
@@ -958,7 +1181,7 @@ export function mapFileChangeOutputDelta(
 		type: ActionType.ChatToolCallContentChanged,
 		turnId: entry.turnId,
 		toolCallId: entry.toolCallId,
-		content: [{ type: ToolResultContentType.Text, text: entry.output }],
+		content: [{ type: ToolResultContentType.Text, text: streamedOutputPreview(entry.output) }],
 	}];
 }
 
@@ -975,7 +1198,7 @@ export function mapMcpToolCallProgress(
 		type: ActionType.ChatToolCallContentChanged,
 		turnId: entry.turnId,
 		toolCallId: entry.toolCallId,
-		content: [{ type: ToolResultContentType.Text, text: entry.output }],
+		content: [{ type: ToolResultContentType.Text, text: streamedOutputPreview(entry.output) }],
 	}];
 }
 
@@ -1200,6 +1423,7 @@ export function mapTurnCompleted(
 	state.currentTurnId = undefined;
 	state.itemToPartId.clear();
 	state.itemToReasoningPartId.clear();
+	const planCompletion = completeRunningPlan(state);
 	// When a full turn item page is available (for example during replay), use
 	// it to reconcile tracked tools before handling genuinely unresolved calls.
 	// Live notifications normally use `itemsView: 'notLoaded'` and empty items.
@@ -1231,6 +1455,7 @@ export function mapTurnCompleted(
 	const deferredResponseActions = flushDeferredResponseActions(state);
 	if (status === 'failed' && params.turn.error) {
 		return [
+			...planCompletion,
 			...recoveredToolCallActions,
 			...preflightFlush,
 			...orphanedToolCallActions,
@@ -1249,9 +1474,9 @@ export function mapTurnCompleted(
 		];
 	}
 	if (status === 'interrupted') {
-		return [...recoveredToolCallActions, ...preflightFlush, ...orphanedToolCallActions, ...deferredResponseActions, { type: ActionType.ChatTurnCancelled, turnId, duration }];
+		return [...planCompletion, ...recoveredToolCallActions, ...preflightFlush, ...orphanedToolCallActions, ...deferredResponseActions, { type: ActionType.ChatTurnCancelled, turnId, duration }];
 	}
-	return [...recoveredToolCallActions, ...preflightFlush, ...orphanedToolCallActions, ...deferredResponseActions, { type: ActionType.ChatTurnComplete, turnId, duration }];
+	return [...planCompletion, ...recoveredToolCallActions, ...preflightFlush, ...orphanedToolCallActions, ...deferredResponseActions, { type: ActionType.ChatTurnComplete, turnId, duration }];
 }
 
 /** Maps Codex's persisted turn error into the same protocol shape used live. */

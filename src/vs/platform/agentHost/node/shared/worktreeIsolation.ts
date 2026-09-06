@@ -4,20 +4,21 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as fs from 'fs/promises';
-import { RunOnceScheduler, SequencerByKey } from '../../../../base/common/async.js';
+import { RunOnceScheduler, Sequencer, SequencerByKey } from '../../../../base/common/async.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { appendEscapedMarkdownInlineCode } from '../../../../base/common/htmlContent.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Schemas } from '../../../../base/common/network.js';
 import { basename } from '../../../../base/common/path.js';
-import { isEqual } from '../../../../base/common/resources.js';
+import { dirname, isEqual } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
 import { createDecorator } from '../../../instantiation/common/instantiation.js';
 import { ILogService } from '../../../log/common/log.js';
 import { AgentSession, IAgentSessionProjectInfo } from '../../common/agent.js';
-import { getBranchCompletions, IAgentHostGitService, IDefaultBranch, IWorktreeFileProgress, META_DIFF_BASE_BRANCH, tryResolvePrimaryWorktreeRoot } from '../../common/agentHostGitService.js';
+import { getBranchCompletions, IAgentHostGitService, IDefaultBranch, IWorktreeArchiveSnapshot, IWorktreeFileProgress, META_DIFF_BASE_BRANCH, tryResolvePrimaryWorktreeRoot } from '../../common/agentHostGitService.js';
+import { AgentHostFumieHomeEnvVar } from '../../common/agentHostProductEnv.js';
 import { AgentSystemNotificationKind, AgentSystemNotificationSeverity, toAgentSystemNotificationMeta } from '../../common/meta/agentSystemNotificationMeta.js';
 import { ISchemaProperty, schemaProperty } from '../../common/agentHostSchema.js';
 import { ISessionDataService } from '../../common/sessionDataService.js';
@@ -25,6 +26,8 @@ import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { AH_META_IS_ARCHIVED_DB_KEY, AH_META_IS_DONE_DB_KEY, ResponsePart, ResponsePartKind, Turn } from '../../common/state/sessionState.js';
 import { AGENT_BRANCH_PREFIX, AgentBranchNameGenerator, IAgentBranchNameGenerator } from './agentBranchNameGenerator.js';
 import { ICopilotApiService } from './copilotApiService.js';
+import { IWorktreeDiskBudgetCandidate, parseWorktreeDiskBudgetBytes, FUMIE_WORKTREE_DISK_BUDGET_BYTES_ENV_VAR, WorktreeDiskBudget } from '../worktree/worktreeDiskBudget.js';
+import { getManagedWorktreePath, getManagedWorktreeRepositoryRoot, getManagedWorktreesRoot, sanitizeWorktreeSessionId } from '../worktree/worktreePaths.js';
 
 export const IAgentHostWorktreeIsolation = createDecorator<IAgentHostWorktreeIsolation>('agentHostWorktreeIsolation');
 
@@ -46,10 +49,18 @@ export interface IAgentHostWorktreeIsolation {
 const WORKTREE_META_BRANCH = 'copilot.worktree.branchName';
 const WORKTREE_META_PATH = 'copilot.worktree.path';
 export const WORKTREE_META_REPOSITORY_ROOT = 'copilot.worktree.repositoryRoot';
+const WORKTREE_META_OWNERSHIP = 'copilot.worktree.ownership';
+const WORKTREE_META_BRANCH_OWNED = 'copilot.worktree.branchOwned';
+const WORKTREE_META_INCLUDE_SOURCE = 'copilot.worktree.includeSource';
+const WORKTREE_META_INCLUDE_FILES = 'copilot.worktree.includeFiles';
 const WORKTREE_META_CREATION_FAILURE = 'copilot.worktree.creationFailure';
 // TODO@roblourens: Remove after ~November 2026, when pre-July 2026 sessions no longer need their worktree path/root reconstructed from this legacy key.
 const LEGACY_WORKTREE_META_WORKING_DIRECTORY = 'copilot.workingDirectory';
 const MAX_WORKTREE_FAILURE_DIAGNOSTIC_LENGTH = 200;
+
+export function getWorktreeArchiveRef(sessionId: string): string {
+	return `refs/agents/${sanitizeWorktreeSessionId(sessionId)}/archive`;
+}
 
 /** Thrown when a persisted session working directory is missing and cannot be repaired. */
 export class SessionWorkingDirectoryMissingError extends Error {
@@ -61,26 +72,60 @@ export class SessionWorkingDirectoryMissingError extends Error {
 	}
 }
 
+/** Raised when archive cleanup hit a state only manual repair can clear, so retrying is pointless. */
+export class WorktreeArchiveUnrecoverableError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'WorktreeArchiveUnrecoverableError';
+	}
+}
+
+/** Raised when a legacy retained dirty checkout has not received the new archive confirmation. */
+export class WorktreeArchiveChangesConfirmationRequiredError extends Error {
+	constructor() {
+		super(localize('worktreeArchiveChangesConfirmationRequired', "This archived session still has local changes and must be confirmed again before its worktree can be reclaimed"));
+		this.name = 'WorktreeArchiveChangesConfirmationRequiredError';
+	}
+}
+
 /** Default upper bound on branch names returned for the branch picker. */
 const BRANCH_COMPLETION_LIMIT = 25;
 const WORKTREE_PROGRESS_DEBOUNCE_MS = 40;
 
-interface ISessionWorktree {
+type WorktreeOwnership = 'fumie' | 'external' | 'unknown';
+
+export interface IWorktreeHandle {
 	readonly repositoryRoot: URI;
 	readonly worktree: URI;
+	readonly branchName: string;
+	readonly ownership: WorktreeOwnership;
+	/** False when Fumie created the checkout for an existing user-owned branch. */
+	readonly branchOwned?: boolean;
+	readonly baseBranch?: string;
+	readonly includeSource?: URI;
+	readonly includeFiles?: readonly string[];
+	readonly bootstrapComplete?: boolean;
 }
 
 interface IWorktreeMetadata {
 	readonly branchName: string;
 	readonly worktreePath?: URI;
 	readonly repositoryRoot?: URI;
+	readonly ownership: WorktreeOwnership;
+	readonly branchOwned?: boolean;
+	readonly includeSource?: URI;
+	readonly includeFiles?: readonly string[];
 }
 
 /**
- * The `<repo>.worktrees` sibling directory where per-session isolated
- * worktrees are created, e.g. `/src/vscode` → `/src/vscode.worktrees`.
+ * The directory where per-session isolated worktrees are created. Fumie's
+ * configured home uses the Cursor-style `worktrees/<repo>` layout; callers
+ * without one retain the historical `<repo>.worktrees` sibling location.
  */
-export function getWorktreesRoot(repositoryRoot: URI): URI {
+export function getWorktreesRoot(repositoryRoot: URI, fumieHome?: URI): URI {
+	if (fumieHome) {
+		return URI.joinPath(fumieHome, 'worktrees', basename(repositoryRoot.fsPath));
+	}
 	return URI.joinPath(repositoryRoot, '..', `${basename(repositoryRoot.fsPath)}.worktrees`);
 }
 
@@ -123,12 +168,12 @@ export function buildWorktreeFailureNotification(diagnostic?: string): Extract<R
 	const content = normalizedDiagnostic
 		? localize(
 			'agentHost.worktreeCreationFailedWithDiagnostic',
-			"Couldn't create the isolated worktree. This session is continuing in the original folder.\n\n{0}",
+			"Couldn't create the isolated worktree. This session hasn't started; retry to try again.\n\n{0}",
 			appendEscapedMarkdownInlineCode(normalizedDiagnostic)
 		)
 		: localize(
 			'agentHost.worktreeCreationFailed',
-			"Couldn't create the isolated worktree. This session is continuing in the original folder."
+			"Couldn't create the isolated worktree. This session hasn't started; retry to try again."
 		);
 	return {
 		kind: ResponsePartKind.SystemNotification,
@@ -149,6 +194,18 @@ export function normalizeWorktreeFailureDiagnostic(diagnostic: string | undefine
 	return normalized.length > MAX_WORKTREE_FAILURE_DIAGNOSTIC_LENGTH
 		? `${normalized.slice(0, MAX_WORKTREE_FAILURE_DIAGNOSTIC_LENGTH - 3)}...`
 		: normalized;
+}
+
+/**
+ * Keeps legacy workspace settings from blocking session creation while still
+ * enforcing Fumie's dependency-isolation rule. A worktree may copy small
+ * ignored configuration files, but never a node_modules tree.
+ */
+export function sanitizeWorktreeIncludeFiles(value: unknown): readonly string[] | undefined {
+	if (!Array.isArray(value) || !value.every(pattern => typeof pattern === 'string')) {
+		return undefined;
+	}
+	return value.filter(pattern => !pattern.toLowerCase().includes('node_modules'));
 }
 
 /**
@@ -308,15 +365,31 @@ export interface IResolveWorkingDirectoryRequest {
 	readonly config: Record<string, unknown> | undefined;
 	readonly prompt?: string;
 	readonly githubToken?: string;
+	/** Session liveness supplied by the owner before enforcing the shared budget. */
+	readonly diskBudgetSessions?: readonly IWorktreeDiskBudgetSession[];
+	/** Stops/releases an idle session before its clean checkout is reclaimed. */
+	readonly onWillReclaimWorktree?: (sessionId: string) => Promise<void>;
 	/**
 	 * Receives localized activity labels while the worktree is being created,
 	 * so callers can surface live progress. Only called for sessions that
-	 * selected worktree isolation — though such a session can still fall back
-	 * to its folder after the first label (e.g. the directory turns out not to
-	 * be a git repository) — and the caller is responsible for clearing the
+	 * selected worktree isolation. The caller is responsible for clearing the
 	 * activity once resolution settles.
 	 */
 	readonly onProgress?: (activity: string) => void;
+}
+
+/** Session-level protection facts used by worktree disk reclamation. */
+export interface IWorktreeDiskBudgetSession {
+	readonly sessionId: string;
+	readonly sessionUri?: URI;
+	readonly running: boolean;
+	readonly pinned: boolean;
+}
+
+interface IManagedWorktreeDiskBudgetCandidate extends IWorktreeDiskBudgetCandidate {
+	readonly worktree: URI;
+	readonly repositoryRoot?: URI;
+	readonly registered: boolean;
 }
 
 /**
@@ -341,8 +414,7 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 	declare readonly _serviceBrand: undefined;
 
 	/** Worktrees materialized during this host process, keyed by sessionId. */
-	private readonly _materializedWorktrees = new Map<string, ISessionWorktree>();
-	private readonly _worktreeDeletionRetries = new Map<string, ISessionWorktree>();
+	private readonly _materializedWorktrees = new Map<string, IWorktreeHandle>();
 
 	/**
 	 * Per-session announcement (markdown) emitted as a synthetic streaming
@@ -378,6 +450,8 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 	 */
 	private readonly _sequencer = new SequencerByKey<string>();
 	private readonly _worktreeCreationSequencer = new SequencerByKey<string>();
+	private readonly _diskBudgetSequencer = new Sequencer();
+	private readonly _diskBudget = new WorktreeDiskBudget(parseWorktreeDiskBudgetBytes(process.env[FUMIE_WORKTREE_DISK_BUDGET_BYTES_ENV_VAR]));
 
 	/** Branch-name generator for worktree sessions; created from {@link ICopilotApiService} unless a test supplies an override. */
 	private readonly _branchNameGenerator: IAgentBranchNameGenerator;
@@ -429,18 +503,52 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 	/**
 	 * First-send worktree resolution: creates the worktree (when the session
 	 * selected `worktree` isolation on a git repo) and clears the pending marker
-	 * regardless of outcome, so a failed creation falls back to folder isolation
-	 * instead of leaving the session permanently "pending". Delegates to
+	 * only after the isolated checkout and its persistent metadata both exist.
+	 * A failed or inapplicable creation remains pending so the same first send can
+	 * be retried instead of silently running in the original folder. Delegates to
 	 * {@link resolveWorkingDirectory}, which is idempotent per session.
 	 */
 	async resolveOnFirstSend(request: IResolveWorkingDirectoryRequest): Promise<URI | undefined> {
 		return this._sequencer.queue(request.sessionId, async () => {
-			try {
-				return await this.resolveWorkingDirectory(request);
-			} finally {
+			const workingDirectory = await this.resolveWorkingDirectory(request);
+			if (this._materializedWorktrees.has(request.sessionId)) {
 				this.clearPending(request.sessionId);
 			}
+			return workingDirectory;
 		});
+	}
+
+	/** Public WorktreeService creation entry. */
+	async create(request: IResolveWorkingDirectoryRequest): Promise<URI | undefined> {
+		return this.resolveOnFirstSend(request);
+	}
+
+	/** Returns current Fumie-managed worktree usage under the configured home. */
+	async getUsage(): Promise<number> {
+		const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
+		if (!fumieHome) {
+			return 0;
+		}
+		return this._diskBudget.getUsage(await this._collectDiskBudgetCandidates(fumieHome, new Map(), false));
+	}
+
+	/** Reclaims clean cold checkouts in LRU order using owner-supplied liveness. */
+	async reclaim(
+		sessions: readonly IWorktreeDiskBudgetSession[],
+		onWillReclaimWorktree?: (sessionId: string) => Promise<void>,
+	): Promise<void> {
+		const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
+		if (fumieHome) {
+			await this._reclaimDiskBudget(fumieHome, undefined, sessions, onWillReclaimWorktree);
+		}
+	}
+
+	/** Startup reconciliation uses the same safe reclaim path. */
+	async reconcile(
+		sessions: readonly IWorktreeDiskBudgetSession[],
+		onWillReclaimWorktree?: (sessionId: string) => Promise<void>,
+	): Promise<void> {
+		return this.reclaim(sessions, onWillReclaimWorktree);
 	}
 
 	/**
@@ -479,9 +587,8 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 		let worktreeBranchTrackProperty: ISchemaProperty<boolean> | undefined;
 		let worktreeCreateNewBranchProperty: ISchemaProperty<boolean> | undefined;
 		if (gitInfo) {
-			const branchReadOnly = isolationValue === 'folder';
 			branchDefault = isolationValue === 'worktree' ? gitInfo.defaultBranch.name : gitInfo.currentBranch;
-			branchValue = isolationValue === 'worktree' && typeof request.config?.[SessionConfigKey.Branch] === 'string'
+			branchValue = typeof request.config?.[SessionConfigKey.Branch] === 'string'
 				? request.config[SessionConfigKey.Branch] as string
 				: branchDefault;
 			branchProperty = schemaProperty<string>({
@@ -491,8 +598,8 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 				enum: [branchDefault],
 				enumLabels: [branchDefault],
 				default: branchDefault,
-				enumDynamic: !branchReadOnly,
-				readOnly: branchReadOnly,
+				enumDynamic: true,
+				readOnly: false,
 				sessionMutable: false,
 			});
 
@@ -585,13 +692,35 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 		if (config?.[SessionConfigKey.Isolation] !== 'worktree' || !workingDirectory || typeof config[SessionConfigKey.Branch] !== 'string') {
 			return workingDirectory;
 		}
+		const requestedIncludeFiles = Array.isArray(config[SessionConfigKey.WorktreeIncludeFiles])
+			&& config[SessionConfigKey.WorktreeIncludeFiles].every(pattern => typeof pattern === 'string')
+			? config[SessionConfigKey.WorktreeIncludeFiles] as readonly string[]
+			: undefined;
+		const configuredIncludeFiles = sanitizeWorktreeIncludeFiles(requestedIncludeFiles);
+		const ignoredDependencyPatterns = requestedIncludeFiles?.filter(pattern => !configuredIncludeFiles?.includes(pattern)) ?? [];
+		if (ignoredDependencyPatterns.length > 0) {
+			this._logService.warn(`[${this._logLabel}:${sessionId}] Ignoring worktree include patterns that copy node_modules: ${ignoredDependencyPatterns.join(', ')}`);
+		}
 
 		// Idempotent: if a worktree was already created for this session in this
-		// process (e.g. the caller re-enters materialization after a thread
-		// restart or a post-creation failure) reuse it rather than creating a
-		// second branch + worktree.
+		// process, persist a completed checkout or finish compensating a failed
+		// bootstrap before attempting a fresh creation.
 		const already = this._materializedWorktrees.get(sessionId);
 		if (already) {
+			if (!already.bootstrapComplete) {
+				await this._rollbackFailedMaterialization(sessionId, already);
+				return this.resolveWorkingDirectory(request);
+			}
+			await this._writeWorktreeMetadata(sessionUri, {
+				branchName: already.branchName,
+				baseBranch: already.baseBranch,
+				worktreePath: already.worktree,
+				repositoryRoot: already.repositoryRoot,
+				ownership: 'fumie',
+				branchOwned: already.branchOwned,
+				includeSource: already.includeSource,
+				includeFiles: already.includeFiles,
+			});
 			return already.worktree;
 		}
 
@@ -603,21 +732,27 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 		}
 
 		const repositoryRoot = await this._resolvePrimaryWorktreeRoot(checkoutRoot, checkoutRoot);
-
 		const selectedBranch = config[SessionConfigKey.Branch] as string;
 		const worktreeBranchTrack = config[SessionConfigKey.WorktreeBranchTrack] === true;
 		const worktreeCreateNewBranch = config[SessionConfigKey.WorktreeCreateNewBranch] !== false;
-
+		const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
+		const worktreesRoot = fumieHome
+			? getManagedWorktreeRepositoryRoot(fumieHome, repositoryRoot)
+			: getWorktreesRoot(repositoryRoot);
+		if (fumieHome) {
+			await this._reclaimDiskBudget(fumieHome, sessionId, request.diskBudgetSessions, request.onWillReclaimWorktree);
+		}
+		const managedWorktree = fumieHome ? getManagedWorktreePath(fumieHome, repositoryRoot, sessionId) : undefined;
+		if (managedWorktree && await fileExists(managedWorktree.fsPath)) {
+			throw new Error(localize('worktreeManagedPathExists', "Cannot create the isolated worktree because its managed path already exists: {0}", managedWorktree.fsPath));
+		}
 		// Prefix (e.g. the user's `git.branchPrefix`) the client forwards for
 		// worktree-isolated sessions. Prepended ahead of the built-in `agents/`
 		// prefix when naming the branch and stripped from the worktree dir name.
 		const worktreeBranchPrefix = worktreeCreateNewBranch && typeof config[SessionConfigKey.WorktreeBranchPrefix] === 'string'
 			? config[SessionConfigKey.WorktreeBranchPrefix] as string
 			: undefined;
-
-		const { worktreePath, branchName, baseBranch } = await this._worktreeCreationSequencer.queue(repositoryRoot.toString(), async () => {
-			const worktreesRoot = getWorktreesRoot(repositoryRoot);
-
+		const { worktree, branchName, baseBranch } = await this._worktreeCreationSequencer.queue(repositoryRoot.toString(), async () => {
 			if (worktreeCreateNewBranch) {
 				onProgress?.(buildWorktreeProgressText(WorktreeCreationPhase.NamingBranch));
 			}
@@ -631,8 +766,9 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 						if (await this._gitService.branchExists(repositoryRoot, candidate).catch(() => true)) {
 							return true;
 						}
-						const candidateWorktree = URI.joinPath(worktreesRoot, getWorktreeName(candidate, worktreeBranchPrefix));
-						return fileExists(candidateWorktree.fsPath);
+						return managedWorktree
+							? false
+							: fileExists(URI.joinPath(worktreesRoot, getWorktreeName(candidate, worktreeBranchPrefix)).fsPath);
 					},
 				})
 				: undefined;
@@ -642,76 +778,252 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 			const baseBranch = worktreeCreateNewBranch
 				? branchStartPoint
 				: (await this._gitService.getDefaultBranch(repositoryRoot))?.startPoint;
+			const branchName = newBranchName ?? selectedBranch;
+			const worktree = managedWorktree ?? URI.joinPath(worktreesRoot, getWorktreeName(branchName, worktreeBranchPrefix));
+			await fs.mkdir(worktreesRoot.fsPath, { recursive: true });
 
 			// Git suppresses progress for the first couple of seconds, so name
 			// the phase up front rather than leaving the label stale until the
 			// first percentage arrives.
 			onProgress?.(buildWorktreeProgressText(WorktreeCreationPhase.CheckingOut));
 
-			await fs.mkdir(worktreesRoot.fsPath, { recursive: true });
-			const worktreePath = URI.joinPath(worktreesRoot, getWorktreeName(newBranchName ?? selectedBranch, worktreeBranchPrefix));
-
-			await withPercentProgress(WorktreeCreationPhase.CheckingOut, onProgress, progress =>
-				this._gitService.addWorktree(repositoryRoot, {
-					path: worktreePath,
-					commitish: worktreeCreateNewBranch
-						? branchStartPoint
-						: selectedBranch,
-					newBranchName,
-					preferRemoteBranch: worktreeCreateNewBranch,
-					track: worktreeBranchTrack,
-					onProgress: progress,
-				}));
-
-			return { branchName: newBranchName ?? selectedBranch, worktreePath, baseBranch };
+			try {
+				await withPercentProgress(WorktreeCreationPhase.CheckingOut, onProgress, progress =>
+					this._gitService.addWorktree(repositoryRoot, {
+						path: worktree,
+						commitish: worktreeCreateNewBranch ? branchStartPoint : selectedBranch,
+						newBranchName,
+						preferRemoteBranch: worktreeCreateNewBranch,
+						track: worktreeBranchTrack,
+						onProgress: progress,
+					}));
+			} catch (error) {
+				await this._pruneEmptyManagedWorktreeDirectories(repositoryRoot, worktree).catch(pruneError => {
+					this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to remove empty managed worktree directory after checkout failure: ${errorMessage(pruneError)}`);
+				});
+				throw error;
+			}
+			return { branchName, worktree, baseBranch };
 		});
-
-		const worktreeIncludeFiles = Array.isArray(config[SessionConfigKey.WorktreeIncludeFiles])
-			&& config[SessionConfigKey.WorktreeIncludeFiles].every(pattern => typeof pattern === 'string')
-			? config[SessionConfigKey.WorktreeIncludeFiles] as readonly string[]
-			: undefined;
-		if (worktreeIncludeFiles?.length) {
+		const materialized: IWorktreeHandle = {
+			repositoryRoot,
+			worktree,
+			branchName,
+			baseBranch,
+			ownership: 'fumie',
+			branchOwned: worktreeCreateNewBranch,
+			includeSource: checkoutRoot,
+			includeFiles: configuredIncludeFiles,
+			bootstrapComplete: !configuredIncludeFiles?.length,
+		};
+		this._materializedWorktrees.set(sessionId, materialized);
+		if (configuredIncludeFiles?.length) {
 			try {
 				onProgress?.(buildWorktreeProgressText(WorktreeCreationPhase.CopyingIncludeFiles));
 				await withPercentProgress(WorktreeCreationPhase.CopyingIncludeFiles, onProgress, progress =>
-					this._gitService.copyWorktreeIncludeFiles(checkoutRoot, worktreePath, worktreeIncludeFiles, progress));
-			} catch (error) {
-				this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to copy worktree include files: ${errorMessage(error)}`);
+					this._gitService.copyWorktreeIncludeFiles(checkoutRoot, worktree, configuredIncludeFiles, progress));
+				this._materializedWorktrees.set(sessionId, { ...materialized, bootstrapComplete: true });
+			} catch (bootstrapError) {
+				try {
+					await this._rollbackFailedMaterialization(sessionId, materialized);
+				} catch (rollbackError) {
+					throw new Error(`Worktree bootstrap failed: ${errorMessage(bootstrapError)}; cleanup also failed: ${errorMessage(rollbackError)}`, { cause: bootstrapError });
+				}
+				throw bootstrapError;
 			}
 		}
-
-		this._materializedWorktrees.set(sessionId, { repositoryRoot, worktree: worktreePath });
-
+		if (fumieHome) {
+			try {
+				await this._reclaimDiskBudget(fumieHome, sessionId, request.diskBudgetSessions, request.onWillReclaimWorktree);
+			} catch (budgetError) {
+				try {
+					await this._rollbackFailedMaterialization(sessionId, this._materializedWorktrees.get(sessionId) ?? materialized);
+				} catch (rollbackError) {
+					throw new Error(`Worktree disk budget enforcement failed: ${errorMessage(budgetError)}; cleanup also failed: ${errorMessage(rollbackError)}`, { cause: budgetError });
+				}
+				throw budgetError;
+			}
+		}
 		// Queue the worktree announcement so the first turn (live) and any
 		// subsequent restore (history) both surface the message in the chat.
 		this._pendingFirstTurnAnnouncements.set(sessionId, buildWorktreeAnnouncementText(branchName));
+		await this._writeWorktreeMetadata(sessionUri, { branchName, baseBranch, worktreePath: worktree, repositoryRoot, ownership: 'fumie', branchOwned: worktreeCreateNewBranch, includeSource: checkoutRoot, includeFiles: configuredIncludeFiles });
+		return worktree;
+	}
 
-		try {
-			await this._writeWorktreeMetadata(sessionUri, { repositoryRoot, worktreePath, baseBranch, branchName });
-		} catch (error) {
-			this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to persist worktree branch metadata: ${errorMessage(error)}`);
+	private async _removeManagedWorktree(repositoryRoot: URI, worktree: URI, options?: { readonly force?: boolean }): Promise<void> {
+		await this._gitService.removeWorktree(repositoryRoot, worktree, options);
+		await this._pruneEmptyManagedWorktreeDirectories(repositoryRoot, worktree);
+	}
+
+	private async _pruneEmptyManagedWorktreeDirectories(repositoryRoot: URI, worktree: URI): Promise<void> {
+		const fumieHomePath = process.env[AgentHostFumieHomeEnvVar];
+		if (!fumieHomePath) {
+			return;
 		}
+		const fumieHome = URI.file(fumieHomePath);
+		const repositoryDirectory = dirname(worktree);
+		const currentRepositoryDirectory = getManagedWorktreeRepositoryRoot(fumieHome, repositoryRoot);
+		const historicalRepositoryDirectory = getWorktreesRoot(repositoryRoot, fumieHome);
+		const versionedRepositoryDirectory = URI.joinPath(fumieHome, 'worktrees', 'v2', basename(currentRepositoryDirectory.fsPath));
+		if (!isEqual(repositoryDirectory, currentRepositoryDirectory)
+			&& !isEqual(repositoryDirectory, historicalRepositoryDirectory)
+			&& !isEqual(repositoryDirectory, versionedRepositoryDirectory)) {
+			return;
+		}
+		await removeEmptyDirectory(repositoryDirectory.fsPath);
+		if (isEqual(repositoryDirectory, versionedRepositoryDirectory)) {
+			await removeEmptyDirectory(dirname(repositoryDirectory).fsPath);
+		}
+	}
 
-		return worktreePath;
+	private async _rollbackFailedMaterialization(sessionId: string, worktree: IWorktreeHandle): Promise<void> {
+		await this._removeManagedWorktree(worktree.repositoryRoot, worktree.worktree, { force: true });
+		if (worktree.branchOwned !== false) {
+			const deleteBranch = this._gitService.deleteBranch;
+			if (!deleteBranch) {
+				throw new Error(`Cannot clean up failed worktree branch '${worktree.branchName}' because branch deletion is unavailable`);
+			}
+			if (await this._gitService.branchExists(worktree.repositoryRoot, worktree.branchName)) {
+				await deleteBranch.call(this._gitService, worktree.repositoryRoot, worktree.branchName, { force: true });
+			}
+		}
+		this._materializedWorktrees.delete(sessionId);
+		this._pendingFirstTurnAnnouncements.delete(sessionId);
+	}
+
+	private async _reclaimDiskBudget(
+		fumieHome: URI,
+		currentSessionId: string | undefined,
+		sessions: readonly IWorktreeDiskBudgetSession[] | undefined,
+		onWillReclaim: ((sessionId: string) => Promise<void>) | undefined,
+	): Promise<void> {
+		if (!this._diskBudget.isEnabled) {
+			return;
+		}
+		return this._diskBudgetSequencer.queue(() => this._reclaimDiskBudgetNow(fumieHome, currentSessionId, sessions, onWillReclaim));
+	}
+
+	private async _reclaimDiskBudgetNow(
+		fumieHome: URI,
+		currentSessionId: string | undefined,
+		sessions: readonly IWorktreeDiskBudgetSession[] | undefined,
+		onWillReclaim: ((sessionId: string) => Promise<void>) | undefined,
+	): Promise<void> {
+		const protections = new Map((sessions ?? []).map(session => [sanitizeWorktreeSessionId(session.sessionId), session]));
+		if (currentSessionId !== undefined) {
+			protections.set(sanitizeWorktreeSessionId(currentSessionId), { sessionId: currentSessionId, running: true, pinned: false });
+		}
+		const candidates = await this._collectDiskBudgetCandidates(fumieHome, protections, sessions !== undefined);
+		await this._diskBudget.reclaim(candidates, async candidate => {
+			if (!candidate.repositoryRoot) {
+				throw new Error(`Cannot reclaim worktree '${candidate.worktree.fsPath}' because its repository root is unavailable`);
+			}
+			if (candidate.registered) {
+				await onWillReclaim?.(candidate.sessionId);
+			}
+			await this._removeManagedWorktree(candidate.repositoryRoot, candidate.worktree);
+			for (const [sessionId, materialized] of this._materializedWorktrees) {
+				if (isEqual(materialized.worktree, candidate.worktree)) {
+					this._materializedWorktrees.delete(sessionId);
+				}
+			}
+		});
+	}
+
+	private async _collectDiskBudgetCandidates(
+		fumieHome: URI,
+		protections: ReadonlyMap<string, IWorktreeDiskBudgetSession>,
+		allowReclaim: boolean,
+	): Promise<IManagedWorktreeDiskBudgetCandidate[]> {
+		const candidates: IManagedWorktreeDiskBudgetCandidate[] = [];
+		const managedRoot = getManagedWorktreesRoot(fumieHome);
+		for (const repositoryEntry of await readDirectoryEntries(managedRoot.fsPath)) {
+			if (!repositoryEntry.isDirectory()) {
+				continue;
+			}
+			const repositoryDirectory = URI.joinPath(managedRoot, repositoryEntry.name);
+			for (const sessionEntry of await readDirectoryEntries(repositoryDirectory.fsPath)) {
+				if (!sessionEntry.isDirectory()) {
+					continue;
+				}
+				const worktree = URI.joinPath(repositoryDirectory, sessionEntry.name);
+				const protection = protections.get(sessionEntry.name);
+				const persisted = protection?.sessionUri ? await this._readWorktreeMetadata(protection.sessionUri).catch(() => undefined) : undefined;
+				const materializedInThisProcess = [...this._materializedWorktrees.values()].some(value => isEqual(value.worktree, worktree));
+				let repositoryRoot: URI | undefined;
+				let dirty = true;
+				try {
+					repositoryRoot = await tryResolvePrimaryWorktreeRoot(this._gitService, worktree);
+					const currentBranch = await this._gitService.getCurrentBranchName?.(worktree);
+					dirty = !repositoryRoot
+						|| await this._gitService.hasUncommittedChanges(worktree)
+						|| (protection !== undefined && (!persisted?.worktreePath
+							|| persisted.ownership !== 'fumie'
+							|| !isEqual(persisted.worktreePath, worktree)
+							|| !currentBranch
+							|| currentBranch !== persisted.branchName));
+				} catch {
+					// Fail closed: a checkout whose Git state cannot be proven clean is protected.
+				}
+				const stat = await fs.lstat(worktree.fsPath);
+				candidates.push({
+					sessionId: protection?.sessionId ?? sessionEntry.name,
+					worktreePath: worktree.fsPath,
+					worktree,
+					repositoryRoot,
+					lastUsedAt: stat.mtimeMs,
+					running: materializedInThisProcess || protection?.running === true,
+					// Registered sessions stay protected until a cross-process lease can
+					// prove no other Agent Host is using them. LRU currently reclaims only
+					// clean orphaned managed checkouts.
+					pinned: !allowReclaim || protection !== undefined,
+					dirty,
+					registered: protection !== undefined,
+				});
+			}
+		}
+		return candidates;
 	}
 
 	/** Resolves a persisted working directory, repairing a removed worktree when possible. */
-	async resolveWorkingDirectoryForResume(sessionUri: URI, sessionId: string, workingDirectory: URI): Promise<URI> {
-		return this._sequencer.queue(sessionId, () => this._resolveWorkingDirectoryForResume(sessionUri, sessionId, workingDirectory));
+	async resolveWorkingDirectoryForResume(
+		sessionUri: URI,
+		sessionId: string,
+		workingDirectory: URI,
+		diskBudgetSessions?: readonly IWorktreeDiskBudgetSession[],
+		onWillReclaimWorktree?: (sessionId: string) => Promise<void>,
+	): Promise<URI> {
+		return this._sequencer.queue(sessionId, () => this._resolveWorkingDirectoryForResume(sessionUri, sessionId, workingDirectory, diskBudgetSessions, onWillReclaimWorktree));
 	}
 
-	private async _resolveWorkingDirectoryForResume(sessionUri: URI, sessionId: string, workingDirectory: URI): Promise<URI> {
+	private async _resolveWorkingDirectoryForResume(
+		sessionUri: URI,
+		sessionId: string,
+		workingDirectory: URI,
+		diskBudgetSessions: readonly IWorktreeDiskBudgetSession[] | undefined,
+		onWillReclaimWorktree: ((sessionId: string) => Promise<void>) | undefined,
+	): Promise<URI> {
 		if (workingDirectory.scheme !== Schemas.file) {
 			return workingDirectory;
 		}
-		try {
-			await fs.access(workingDirectory.fsPath);
+		const meta = await this._readWorktreeMetadata(sessionUri).catch(() => undefined);
+		if (await pathExistsStrict(workingDirectory.fsPath)) {
+			if (meta?.ownership === 'fumie' && meta.worktreePath && meta.repositoryRoot && isEqual(meta.worktreePath, workingDirectory)) {
+				await this._assertManagedWorktree({ branchName: meta.branchName, worktreePath: meta.worktreePath, repositoryRoot: meta.repositoryRoot });
+				// A live checkout is authoritative after a crash that captured the
+				// archive ref but did not remove the worktree or commit Archived.
+				if (!await this._isSessionArchived(sessionUri)) {
+					await this._gitService.deleteRefs(meta.repositoryRoot, [getWorktreeArchiveRef(sessionId)]);
+				}
+			}
+			const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
+			if (fumieHome) {
+				await this._reclaimDiskBudget(fumieHome, sessionId, diskBudgetSessions, onWillReclaimWorktree);
+			}
 			return workingDirectory;
-		} catch {
-			// Repair or fall back below.
 		}
 
-		const meta = await this._readWorktreeMetadata(sessionUri).catch(() => undefined);
 		const archived = await this._isSessionArchived(sessionUri);
 		if (archived) {
 			if (meta?.repositoryRoot) {
@@ -728,10 +1040,28 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 		}
 
 		let recreateFailureReason: string | undefined;
-		if (meta?.worktreePath && meta.repositoryRoot) {
+		if (meta?.worktreePath && meta.repositoryRoot && meta.ownership === 'fumie') {
 			const { branchName, worktreePath, repositoryRoot } = meta;
-			const recreated = await this._recreateWorktree(sessionId, { branchName, worktreePath, repositoryRoot });
+			const recreated = await this._recreateWorktree(sessionId, { ...meta, branchName, worktreePath, repositoryRoot });
 			if (recreated.ok) {
+				try {
+					const archiveRef = getWorktreeArchiveRef(sessionId);
+					const archiveCommit = await this._gitService.revParse(repositoryRoot, archiveRef);
+					if (archiveCommit) {
+						await this._restoreArchivedDelta({ ...meta, branchName, worktreePath, repositoryRoot }, archiveRef);
+					}
+					const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
+					if (fumieHome) {
+						await this._reclaimDiskBudget(fumieHome, sessionId, diskBudgetSessions, onWillReclaimWorktree);
+					}
+					if (archiveCommit) {
+						await this._gitService.deleteRefs(repositoryRoot, [archiveRef]);
+					}
+				} catch (error) {
+					await this._removeManagedWorktree(repositoryRoot, worktreePath, { force: true });
+					this._materializedWorktrees.delete(sessionId);
+					throw error;
+				}
 				this._logService.info(`[${this._logLabel}:${sessionId}] Recreated missing worktree '${worktreePath.fsPath}' for a live session on resume`);
 				return worktreePath;
 			}
@@ -787,12 +1117,8 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 	}
 
 	/** Resolves the worktree to remove before the session database is deleted. */
-	async prepareSessionDeletion(sessionUri: URI, sessionId: string): Promise<ISessionWorktree | undefined> {
+	async prepareSessionDeletion(sessionUri: URI, sessionId: string): Promise<IWorktreeHandle | undefined> {
 		return this._sequencer.queue(sessionId, async () => {
-			const deletionRetry = this._worktreeDeletionRetries.get(sessionId);
-			if (deletionRetry) {
-				return deletionRetry;
-			}
 			const materializedWorktree = this._materializedWorktrees.get(sessionId);
 			if (materializedWorktree) {
 				return materializedWorktree;
@@ -800,7 +1126,13 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 			try {
 				const meta = await this._readWorktreeMetadata(sessionUri);
 				return meta?.worktreePath && meta.repositoryRoot
-					? { repositoryRoot: meta.repositoryRoot, worktree: meta.worktreePath }
+					? {
+						repositoryRoot: meta.repositoryRoot,
+						worktree: meta.worktreePath,
+						branchName: meta.branchName,
+						ownership: meta.ownership,
+						branchOwned: meta.branchOwned,
+					}
 					: undefined;
 			} catch (error) {
 				this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to read worktree metadata before session deletion: ${errorMessage(error)}`);
@@ -810,120 +1142,356 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 	}
 
 	/** Force-removes the resolved worktree after the user confirms session deletion. */
-	async removeSessionWorktree(sessionId: string, worktree: ISessionWorktree | undefined): Promise<void> {
+	async removeSessionWorktree(sessionId: string, worktree: IWorktreeHandle | undefined): Promise<void> {
 		return this._sequencer.queue(sessionId, () => this._removeSessionWorktree(sessionId, worktree));
 	}
 
-	private async _removeSessionWorktree(sessionId: string, worktree: ISessionWorktree | undefined): Promise<void> {
+	/** Resolves the durable deletion target before the harness is stopped. */
+	async prepareDelete(sessionUri: URI, sessionId: string): Promise<IWorktreeHandle | undefined> {
+		return this.prepareSessionDeletion(sessionUri, sessionId);
+	}
+
+	/** Public WorktreeService destructive deletion entry. */
+	async delete(sessionId: string, worktree: IWorktreeHandle | undefined): Promise<void> {
+		return this.removeSessionWorktree(sessionId, worktree);
+	}
+
+	private async _removeSessionWorktree(sessionId: string, worktree: IWorktreeHandle | undefined): Promise<void> {
 		this.clearPending(sessionId);
-		if (!worktree) {
+		if (!worktree || worktree.ownership !== 'fumie') {
 			return;
 		}
+		const shouldDeleteBranch = worktree.branchOwned !== false;
+		const deleteBranch = shouldDeleteBranch ? this._gitService.deleteBranch : undefined;
+		if (shouldDeleteBranch && !deleteBranch) {
+			throw new Error(localize('worktreeDeleteBranchUnavailable', "Cannot delete Fumie worktree branch '{0}' because branch deletion is unavailable", worktree.branchName));
+		}
 		try {
-			await this._gitService.removeWorktree(worktree.repositoryRoot, worktree.worktree, { force: true });
+			await this._removeManagedWorktree(worktree.repositoryRoot, worktree.worktree, { force: true });
+			await this._gitService.deleteRefs(worktree.repositoryRoot, [getWorktreeArchiveRef(sessionId)]);
+			// Fail closed: if upstream state cannot be determined, preserve the branch.
+			if (deleteBranch) {
+				const published = await this._gitService.hasUpstream(worktree.repositoryRoot, worktree.branchName).catch(() => true);
+				if (!published && await this._gitService.branchExists(worktree.repositoryRoot, worktree.branchName)) {
+					await deleteBranch.call(this._gitService, worktree.repositoryRoot, worktree.branchName, { force: true });
+				}
+			}
 			this._materializedWorktrees.delete(sessionId);
-			this._worktreeDeletionRetries.delete(sessionId);
 		} catch (error) {
-			this._worktreeDeletionRetries.set(sessionId, worktree);
-			this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to remove worktree '${worktree.worktree.fsPath}': ${errorMessage(error)}`);
+			this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to delete worktree '${worktree.worktree.fsPath}'${shouldDeleteBranch ? ` and its Fumie branch '${worktree.branchName}'` : ''}: ${errorMessage(error)}`);
 			throw error;
 		}
 	}
 
 	/**
-	 * On archive, removes the worktree directory when its branch is preserved
-	 * and the working tree is clean, so the worktree can be recreated on
-	 * unarchive without losing work. Skips the removal when the branch is
-	 * missing or the tree is dirty.
+	 * On archive, captures Git-visible dirt in a session-private Git ref and
+	 * force-removes the checkout. The visible branch is never changed. Ignored
+	 * files remain outside the delta and are recreated only through explicit
+	 * include/setup inputs. Every Git failure is propagated to the session
+	 * lifecycle transaction so Archived is never committed early.
 	 */
-	async cleanupWorktreeOnArchive(sessionUri: URI, sessionId: string): Promise<void> {
-		return this._sequencer.queue(sessionId, () => this._cleanupWorktreeOnArchive(sessionUri, sessionId));
+	async cleanupWorktreeOnArchive(sessionUri: URI, sessionId: string, options?: { readonly preserveChanges?: boolean }): Promise<void> {
+		return this._sequencer.queue(sessionId, () => this._cleanupWorktreeOnArchive(sessionUri, sessionId, options));
 	}
 
-	private async _cleanupWorktreeOnArchive(sessionUri: URI, sessionId: string): Promise<void> {
-		const meta = await this._readWorktreeMetadata(sessionUri).catch(() => undefined);
-		if (!meta?.worktreePath || !meta.repositoryRoot) {
+	/** Public WorktreeService archive entry. */
+	async archive(sessionUri: URI, sessionId: string, options?: { readonly preserveChanges?: boolean }): Promise<void> {
+		return this.cleanupWorktreeOnArchive(sessionUri, sessionId, options);
+	}
+
+	private async _cleanupWorktreeOnArchive(sessionUri: URI, sessionId: string, options: { readonly preserveChanges?: boolean } | undefined): Promise<void> {
+		const meta = await this._readWorktreeMetadata(sessionUri);
+		if (!meta?.worktreePath || !meta.repositoryRoot || meta.ownership !== 'fumie') {
 			return;
 		}
 		const { branchName, worktreePath, repositoryRoot } = meta;
 
-		// Skip if the worktree directory is already gone — nothing to clean.
-		try {
-			await fs.access(worktreePath.fsPath);
-		} catch {
-			this._materializedWorktrees.delete(sessionId);
-			return;
-		}
-
-		// Skip if the branch is missing — without it we can't safely recreate
-		// the worktree on unarchive, so leave the working tree intact.
-		const branchPresent = await this._gitService.branchExists(repositoryRoot, branchName).catch(() => false);
+		const branchPresent = await this._gitService.branchExists(repositoryRoot, branchName);
 		if (!branchPresent) {
-			this._logService.info(`[${this._logLabel}:${sessionId}] Skipping worktree cleanup: branch '${branchName}' is missing`);
+			throw new WorktreeArchiveUnrecoverableError(localize('worktreeArchiveBranchMissing', "Cannot archive this session because its preserved branch '{0}' is missing", branchName));
+		}
+
+		// Idempotent retry after a completed archive: the persisted branch is the
+		// restore source, so an already-absent checkout is the desired state.
+		if (!await pathExistsStrict(worktreePath.fsPath)) {
+			this._materializedWorktrees.delete(sessionId);
 			return;
 		}
+		const currentBranch = await this._gitService.getCurrentBranchName?.(worktreePath);
+		if (currentBranch && currentBranch !== branchName) {
+			throw new WorktreeArchiveUnrecoverableError(localize('worktreeArchiveBranchChanged', "Cannot archive this session because its worktree switched from the Fumie branch '{0}' to '{1}'", branchName, currentBranch));
+		}
+		const captureArchiveSnapshot = this._gitService.captureWorktreeArchiveSnapshot;
+		if (!captureArchiveSnapshot) {
+			throw new Error(localize('worktreeArchiveSnapshotUnavailable', "Cannot archive this session because Git delta snapshots are unavailable"));
+		}
+		const snapshot = await captureArchiveSnapshot.call(this._gitService, worktreePath);
+		if (!snapshot) {
+			throw new Error(localize('worktreeArchiveSnapshotFailed', "Cannot archive this session because its working-tree delta could not be captured"));
+		}
+		const branchHead = await this._gitService.revParse(repositoryRoot, `refs/heads/${branchName}`);
+		if (!branchHead || branchHead !== snapshot.baseCommit) {
+			throw new Error(localize('worktreeArchiveBranchMoved', "Cannot archive this session because its preserved branch changed while the working-tree delta was captured"));
+		}
+		const hasArchiveDelta = this._hasArchiveDelta(snapshot);
+		if (hasArchiveDelta && options?.preserveChanges === false) {
+			throw new WorktreeArchiveChangesConfirmationRequiredError();
+		}
 
-		// Commit any uncommitted changes before archiving the session
-		const hasUncommittedChanges = await this._gitService.hasUncommittedChanges(worktreePath).catch(() => true);
-		if (hasUncommittedChanges) {
-			try {
-				await this._gitService.commitAll(worktreePath, localize('worktreeIsolation.commitMessage', 'Saving uncommitted changes before archiving session'));
-			} catch (error) {
-				this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to commit uncommitted changes in '${worktreePath.fsPath}': ${errorMessage(error)}`);
-				return;
+		const archiveRef = getWorktreeArchiveRef(sessionId);
+		if (hasArchiveDelta) {
+			const indexCommitOid = await this._gitService.commitTree(
+				repositoryRoot,
+				snapshot.indexTreeOid,
+				snapshot.baseCommit,
+				localize('worktreeIsolation.archiveIndexCommitMessage', 'Fumie session {0} archived index', sessionId),
+				{ syntheticIdentity: true },
+			);
+			if (!indexCommitOid) {
+				throw new Error(localize('worktreeArchiveIndexCommitFailed', "Cannot archive this session because its index commit could not be created"));
 			}
+			let untrackedCommitOid: string | undefined;
+			if (snapshot.untrackedTreeOid) {
+				untrackedCommitOid = await this._gitService.commitTree(
+					repositoryRoot,
+					snapshot.untrackedTreeOid,
+					undefined,
+					localize('worktreeIsolation.archiveUntrackedCommitMessage', 'Fumie session {0} archived untracked files', sessionId),
+					{ syntheticIdentity: true },
+				);
+				if (!untrackedCommitOid) {
+					throw new Error(localize('worktreeArchiveUntrackedCommitFailed', "Cannot archive this session because its untracked-files commit could not be created"));
+				}
+			}
+			const commitTreeWithParents = this._gitService.commitTreeWithParents;
+			if (!commitTreeWithParents) {
+				throw new Error(localize('worktreeArchiveStashUnavailable', "Cannot archive this session because stash commit creation is unavailable"));
+			}
+			const stashCommitOid = await commitTreeWithParents.call(
+				this._gitService,
+				repositoryRoot,
+				snapshot.workingTreeOid,
+				[snapshot.baseCommit, indexCommitOid, ...(untrackedCommitOid ? [untrackedCommitOid] : [])],
+				localize('worktreeIsolation.archiveCommitMessage', 'Fumie session {0} archived working-tree delta', sessionId),
+				{ syntheticIdentity: true },
+			);
+			if (!stashCommitOid) {
+				throw new Error(localize('worktreeArchiveCommitFailed', "Cannot archive this session because its stash commit could not be created"));
+			}
+			await this._gitService.updateRef(repositoryRoot, archiveRef, stashCommitOid);
+		} else {
+			await this._gitService.deleteRefs(repositoryRoot, [archiveRef]);
 		}
 
-		try {
-			await this._gitService.removeWorktree(repositoryRoot, worktreePath);
-			this._logService.info(`[${this._logLabel}:${sessionId}] Removed worktree '${worktreePath.fsPath}' on archive`);
-			this._materializedWorktrees.delete(sessionId);
-		} catch (error) {
-			this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to remove worktree '${worktreePath.fsPath}' on archive: ${errorMessage(error)}`);
+		const finalSnapshot = await captureArchiveSnapshot.call(this._gitService, worktreePath);
+		if (!finalSnapshot || !this._archiveSnapshotsEqual(snapshot, finalSnapshot)) {
+			throw new Error(localize('worktreeArchiveChangedDuringCapture', "Cannot archive this session because its index or working tree changed while the archive snapshot was being finalized"));
 		}
+
+		// Semantic cleanliness/delta durability is established above. Force is
+		// intentional: generated ignored output must not retain the checkout.
+		await this._removeManagedWorktree(repositoryRoot, worktreePath, { force: true });
+		this._logService.info(`[${this._logLabel}:${sessionId}] Removed worktree '${worktreePath.fsPath}' on archive`);
+		this._materializedWorktrees.delete(sessionId);
 	}
 
 	/**
-	 * On unarchive, recreates a previously cleaned-up worktree against its
-	 * preserved branch. No-op when the directory still exists or the branch is
-	 * missing.
+	 * On unarchive, recreates the preserved branch and reapplies the optional
+	 * session-private delta before consuming its ref.
 	 */
-	async recreateWorktreeOnUnarchive(sessionUri: URI, sessionId: string): Promise<void> {
-		return this._sequencer.queue(sessionId, () => this._recreateWorktreeOnUnarchive(sessionUri, sessionId));
+	async recreateWorktreeOnUnarchive(
+		sessionUri: URI,
+		sessionId: string,
+		diskBudgetSessions?: readonly IWorktreeDiskBudgetSession[],
+		onWillReclaimWorktree?: (sessionId: string) => Promise<void>,
+	): Promise<void> {
+		return this._sequencer.queue(sessionId, () => this._recreateWorktreeOnUnarchive(sessionUri, sessionId, diskBudgetSessions, onWillReclaimWorktree));
 	}
 
-	private async _recreateWorktreeOnUnarchive(sessionUri: URI, sessionId: string): Promise<void> {
-		const meta = await this._readWorktreeMetadata(sessionUri).catch(() => undefined);
-		if (!meta?.worktreePath || !meta.repositoryRoot) {
+	/** Public WorktreeService restore entry. */
+	async restore(
+		sessionUri: URI,
+		sessionId: string,
+		diskBudgetSessions?: readonly IWorktreeDiskBudgetSession[],
+		onWillReclaimWorktree?: (sessionId: string) => Promise<void>,
+	): Promise<void> {
+		return this.recreateWorktreeOnUnarchive(sessionUri, sessionId, diskBudgetSessions, onWillReclaimWorktree);
+	}
+
+	private async _recreateWorktreeOnUnarchive(
+		sessionUri: URI,
+		sessionId: string,
+		diskBudgetSessions: readonly IWorktreeDiskBudgetSession[] | undefined,
+		onWillReclaimWorktree: ((sessionId: string) => Promise<void>) | undefined,
+	): Promise<void> {
+		const meta = await this._readWorktreeMetadata(sessionUri);
+		if (!meta?.worktreePath || !meta.repositoryRoot || meta.ownership !== 'fumie') {
 			return;
 		}
-		// Skip if the worktree directory already exists — nothing to do.
+		const restorableMeta = { ...meta, worktreePath: meta.worktreePath, repositoryRoot: meta.repositoryRoot };
+		let recreatedForRestore = false;
+		if (await pathExistsStrict(restorableMeta.worktreePath.fsPath)) {
+			await this._assertManagedWorktree(restorableMeta);
+		} else {
+			const recreated = await this._recreateWorktree(sessionId, restorableMeta);
+			if (!recreated.ok) {
+				throw new Error(recreated.reason);
+			}
+			recreatedForRestore = true;
+		}
+
+		const { worktreePath, repositoryRoot } = restorableMeta;
+		const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
 		try {
-			await fs.access(meta.worktreePath.fsPath);
-			return;
-		} catch {
-			// expected when the worktree was cleaned up on archive
+			const archiveRef = getWorktreeArchiveRef(sessionId);
+			const archiveCommit = await this._gitService.revParse(repositoryRoot, archiveRef);
+			if (archiveCommit) {
+				await this._restoreArchivedDelta(restorableMeta, archiveRef);
+			}
+			if (recreatedForRestore && fumieHome) {
+				await this._reclaimDiskBudget(fumieHome, sessionId, diskBudgetSessions, onWillReclaimWorktree);
+			}
+			if (archiveCommit) {
+				await this._gitService.deleteRefs(repositoryRoot, [archiveRef]);
+			}
+		} catch (error) {
+			if (recreatedForRestore) {
+				await this._removeManagedWorktree(repositoryRoot, worktreePath, { force: true });
+				this._materializedWorktrees.delete(sessionId);
+			}
+			throw error;
 		}
-
-		const { branchName, worktreePath, repositoryRoot } = meta;
-		await this._recreateWorktree(sessionId, { branchName, worktreePath, repositoryRoot });
 	}
 
-	private async _recreateWorktree(sessionId: string, meta: { readonly branchName: string; readonly worktreePath: URI; readonly repositoryRoot: URI }): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
+	private async _restoreArchivedDelta(meta: IWorktreeMetadata & { readonly worktreePath: URI; readonly repositoryRoot: URI }, archiveRef: string): Promise<void> {
+		const expected = await this._readArchiveSnapshot(meta.repositoryRoot, archiveRef);
+		if (!expected) {
+			throw new Error(localize('worktreeArchiveRestoreBaseMismatch', "Cannot restore this session's archived changes because its preserved branch no longer matches the archived base"));
+		}
+		const captureArchiveSnapshot = this._gitService.captureWorktreeArchiveSnapshot;
+		if (!captureArchiveSnapshot) {
+			throw new Error(localize('worktreeArchiveSnapshotUnavailable', "Cannot archive this session because Git delta snapshots are unavailable"));
+		}
+		const live = await captureArchiveSnapshot.call(this._gitService, meta.worktreePath);
+		if (!live || live.baseCommit !== expected.baseCommit) {
+			throw new Error(localize('worktreeArchiveRestoreBaseMismatch', "Cannot restore this session's archived changes because its preserved branch no longer matches the archived base"));
+		}
+		if (this._archiveSnapshotsEqual(live, expected)) {
+			// A crash may leave both the checkout and its already-applied archive ref.
+			// The live four-state snapshot is authoritative, so consuming the ref is
+			// sufficient and avoids applying the same stash a second time.
+			return;
+		}
+		if (this._hasArchiveDelta(live)) {
+			throw new Error(localize('worktreeArchiveRestoreConflict', "Cannot restore this session because its retained checkout differs from both the archived changes and the clean archived base"));
+		}
+		const applyArchiveStash = this._gitService.applyWorktreeArchiveStash;
+		if (!applyArchiveStash) {
+			throw new Error(localize('worktreeArchiveApplyUnavailable', "Cannot restore this session because Git stash restoration is unavailable"));
+		}
+		await applyArchiveStash.call(this._gitService, meta.worktreePath, archiveRef);
+
+		const restored = await captureArchiveSnapshot.call(this._gitService, meta.worktreePath);
+		if (!restored || !this._archiveSnapshotsEqual(restored, expected)) {
+			throw new Error(localize('worktreeArchiveRestoreVerificationFailed', "Cannot restore this session because its archived working-tree delta could not be verified"));
+		}
+	}
+
+	private _hasArchiveDelta(snapshot: IWorktreeArchiveSnapshot): boolean {
+		return snapshot.indexTreeOid !== snapshot.baseTreeOid
+			|| snapshot.workingTreeOid !== snapshot.baseTreeOid
+			|| snapshot.untrackedTreeOid !== undefined;
+	}
+
+	private _archiveSnapshotsEqual(left: IWorktreeArchiveSnapshot, right: IWorktreeArchiveSnapshot): boolean {
+		return left.baseCommit === right.baseCommit
+			&& left.baseTreeOid === right.baseTreeOid
+			&& left.indexTreeOid === right.indexTreeOid
+			&& left.workingTreeOid === right.workingTreeOid
+			&& left.untrackedTreeOid === right.untrackedTreeOid;
+	}
+
+	private async _readArchiveSnapshot(repositoryRoot: URI, archiveRef: string): Promise<IWorktreeArchiveSnapshot | undefined> {
+		const [baseCommit, baseTreeOid, indexTreeOid, workingTreeOid, untrackedTreeOid] = await Promise.all([
+			this._gitService.revParse(repositoryRoot, `${archiveRef}^1`),
+			this._gitService.revParse(repositoryRoot, `${archiveRef}^1^{tree}`),
+			this._gitService.revParse(repositoryRoot, `${archiveRef}^2^{tree}`),
+			this._gitService.revParse(repositoryRoot, `${archiveRef}^{tree}`),
+			this._gitService.revParse(repositoryRoot, `${archiveRef}^3^{tree}`),
+		]);
+		if (!baseCommit || !baseTreeOid || !indexTreeOid || !workingTreeOid) {
+			return undefined;
+		}
+		return {
+			baseCommit,
+			baseTreeOid,
+			indexTreeOid,
+			workingTreeOid,
+			...(untrackedTreeOid ? { untrackedTreeOid } : {}),
+		};
+	}
+
+	private async _assertManagedWorktree(meta: { readonly branchName: string; readonly worktreePath: URI; readonly repositoryRoot: URI }): Promise<void> {
+		const stat = await fs.lstat(meta.worktreePath.fsPath);
+		if (stat.isSymbolicLink() || !stat.isDirectory()) {
+			throw new Error(localize('worktreeRestoreInvalidPath', "Cannot restore this session because its managed worktree path is not a real directory: {0}", meta.worktreePath.fsPath));
+		}
+		const roots = await this._gitService.getWorktreeRoots(meta.repositoryRoot);
+		const managedRealPath = URI.file(await fs.realpath(meta.worktreePath.fsPath));
+		const registeredRealPaths = await Promise.all(roots.map(async root => {
+			try {
+				return URI.file(await fs.realpath(root.fsPath));
+			} catch {
+				return root;
+			}
+		}));
+		if (!registeredRealPaths.some(root => isEqual(root, managedRealPath))) {
+			throw new Error(localize('worktreeRestoreUnregistered', "Cannot restore this session because Git does not register its managed worktree: {0}", meta.worktreePath.fsPath));
+		}
+		const currentBranch = await this._gitService.getCurrentBranchName?.(meta.worktreePath);
+		if (!currentBranch || currentBranch !== meta.branchName) {
+			throw new Error(localize('worktreeRestoreBranchMismatch', "Cannot restore this session because its managed worktree is not on the preserved branch '{0}'", meta.branchName));
+		}
+	}
+
+	private async _recreateWorktree(sessionId: string, meta: { readonly branchName: string; readonly worktreePath: URI; readonly repositoryRoot: URI; readonly branchOwned?: boolean; readonly includeSource?: URI; readonly includeFiles?: readonly string[] }): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
 		const { branchName, worktreePath, repositoryRoot } = meta;
-		const branchPresent = await this._gitService.branchExists(repositoryRoot, branchName).catch(() => false);
+		const branchPresent = await this._gitService.branchExists(repositoryRoot, branchName);
 		if (!branchPresent) {
 			const reason = localize('worktreeRecreateBranchMissing', "the branch '{0}' no longer exists", branchName);
 			this._logService.info(`[${this._logLabel}:${sessionId}] Cannot recreate worktree: branch '${branchName}' is missing`);
 			return { ok: false, reason };
 		}
+		let added = false;
 		try {
 			await fs.mkdir(URI.joinPath(worktreePath, '..').fsPath, { recursive: true });
 			await this._gitService.addExistingWorktree(repositoryRoot, worktreePath, branchName);
-			this._materializedWorktrees.set(sessionId, { repositoryRoot, worktree: worktreePath });
+			added = true;
+			if (meta.includeSource && meta.includeFiles?.length) {
+				try {
+					await this._gitService.copyWorktreeIncludeFiles(meta.includeSource, worktreePath, meta.includeFiles);
+				} catch (error) {
+					await this._removeManagedWorktree(repositoryRoot, worktreePath, { force: true });
+					throw error;
+				}
+			}
+			await this._assertManagedWorktree({ branchName, worktreePath, repositoryRoot });
+			this._materializedWorktrees.set(sessionId, {
+				repositoryRoot,
+				worktree: worktreePath,
+				branchName,
+				ownership: 'fumie',
+				branchOwned: meta.branchOwned,
+				includeSource: meta.includeSource,
+				includeFiles: meta.includeFiles,
+				bootstrapComplete: true,
+			});
 			this._logService.info(`[${this._logLabel}:${sessionId}] Recreated worktree '${worktreePath.fsPath}'`);
 			return { ok: true };
 		} catch (error) {
+			if (added) {
+				await this._removeManagedWorktree(repositoryRoot, worktreePath, { force: true }).catch(() => { });
+			}
 			const reason = errorMessage(error);
 			this._logService.warn(`[${this._logLabel}:${sessionId}] Failed to recreate worktree '${worktreePath.fsPath}': ${reason}`);
 			return { ok: false, reason };
@@ -953,7 +1521,7 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 		}
 		const { worktreeRoot, primaryRoot, baseBranch } = linkedWorktree;
 		const branchName = await this._gitService.getCurrentBranch(worktreeRoot).catch(() => undefined) ?? 'HEAD';
-		await this._writeWorktreeMetadata(sessionUri, { branchName, baseBranch, worktreePath: worktreeRoot, repositoryRoot: primaryRoot });
+		await this._writeWorktreeMetadata(sessionUri, { branchName, baseBranch, worktreePath: worktreeRoot, repositoryRoot: primaryRoot, ownership: 'external' });
 		return true;
 	}
 
@@ -965,7 +1533,7 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 	 */
 	async recordAdoptedWorktreeMetadata(sessionUri: URI, metadata: { readonly branchName: string; readonly baseBranch: string | undefined; readonly worktreePath: URI; readonly repositoryRoot: URI }): Promise<void> {
 		this._logService.info(`[${this._logLabel}:${AgentSession.id(sessionUri)}] Recorded adopted worktree metadata: worktree='${metadata.worktreePath.fsPath}' branch='${metadata.branchName}' base='${metadata.baseBranch ?? '(none)'}' repo='${metadata.repositoryRoot.fsPath}'`);
-		await this._writeWorktreeMetadata(sessionUri, metadata);
+		await this._writeWorktreeMetadata(sessionUri, { ...metadata, ownership: 'external', branchOwned: false });
 	}
 
 	/**
@@ -1007,8 +1575,8 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 
 	/**
 	 * Resolves the repository "project" for a worktree-isolated session from its
-	 * persisted worktree metadata. Worktree sessions run out of a
-	 * `<repo>.worktrees/<name>` directory, but in the sessions UI they must group
+	 * persisted worktree metadata. Worktree sessions run out of a dedicated
+	 * worktree directory, but in the sessions UI they must group
 	 * under the *repository* (e.g. `vscode`) — not the worktree folder — exactly
 	 * like Copilot. Returns the repository root as the project so agents can merge
 	 * it into the `project` field of the `IAgentSessionMetadata` reported from
@@ -1068,9 +1636,13 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 			: selectedBranch;
 	}
 
-	private async _writeWorktreeMetadata(sessionUri: URI, metadata: { branchName: string; baseBranch: string | undefined; worktreePath: URI; repositoryRoot: URI }): Promise<void> {
+	private async _writeWorktreeMetadata(sessionUri: URI, metadata: { branchName: string; baseBranch: string | undefined; worktreePath: URI; repositoryRoot: URI; ownership: Exclude<WorktreeOwnership, 'unknown'>; branchOwned?: boolean; includeSource?: URI; includeFiles?: readonly string[] }): Promise<void> {
 		const dbRef = this._sessionDataService.openDatabase(sessionUri);
 		try {
+			// Ownership is the destructive-lifecycle gate. Persist it first so a
+			// partial write can never leave an externally adopted checkout looking
+			// like unowned legacy metadata eligible for managed-root migration.
+			await dbRef.object.setMetadata(WORKTREE_META_OWNERSHIP, metadata.ownership);
 			const work: Promise<void>[] = [
 				dbRef.object.setMetadata(WORKTREE_META_BRANCH, metadata.branchName),
 				dbRef.object.setMetadata(WORKTREE_META_PATH, metadata.worktreePath.toString()),
@@ -1078,6 +1650,15 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 			];
 			if (metadata.baseBranch) {
 				work.push(dbRef.object.setMetadata(META_DIFF_BASE_BRANCH, metadata.baseBranch));
+			}
+			if (metadata.branchOwned !== undefined) {
+				work.push(dbRef.object.setMetadata(WORKTREE_META_BRANCH_OWNED, String(metadata.branchOwned)));
+			}
+			if (metadata.includeSource && metadata.includeFiles?.length) {
+				work.push(
+					dbRef.object.setMetadata(WORKTREE_META_INCLUDE_SOURCE, metadata.includeSource.toString()),
+					dbRef.object.setMetadata(WORKTREE_META_INCLUDE_FILES, JSON.stringify(metadata.includeFiles)),
+				);
 			}
 			await Promise.all(work);
 		} finally {
@@ -1098,11 +1679,15 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 		}
 
 		try {
-			const [branchName, worktreePathRaw, repositoryRootRaw, legacyWorkingDirectoryRaw] = await Promise.all([
+			const [branchName, worktreePathRaw, repositoryRootRaw, legacyWorkingDirectoryRaw, ownershipRaw, branchOwnedRaw, includeSourceRaw, includeFilesRaw] = await Promise.all([
 				ref.object.getMetadata(WORKTREE_META_BRANCH),
 				ref.object.getMetadata(WORKTREE_META_PATH),
 				ref.object.getMetadata(WORKTREE_META_REPOSITORY_ROOT),
 				ref.object.getMetadata(LEGACY_WORKTREE_META_WORKING_DIRECTORY),
+				ref.object.getMetadata(WORKTREE_META_OWNERSHIP),
+				ref.object.getMetadata(WORKTREE_META_BRANCH_OWNED),
+				ref.object.getMetadata(WORKTREE_META_INCLUDE_SOURCE),
+				ref.object.getMetadata(WORKTREE_META_INCLUDE_FILES),
 			]);
 			if (!branchName) {
 				return undefined;
@@ -1129,10 +1714,57 @@ export class WorktreeIsolation extends Disposable implements IAgentHostWorktreeI
 					}
 				}
 			}
-			return { branchName, worktreePath, repositoryRoot };
+			let ownership: WorktreeOwnership = ownershipRaw === 'fumie' || ownershipRaw === 'external'
+				? ownershipRaw
+				: 'unknown';
+			if (ownership === 'unknown' && worktreePath && repositoryRoot && this._isLegacyManagedWorktreePath(repositoryRoot, worktreePath)) {
+				try {
+					await ref.object.setMetadata(WORKTREE_META_OWNERSHIP, 'fumie');
+					ownership = 'fumie';
+				} catch (error) {
+					// Fail closed: without a durable ownership marker a later process
+					// cannot distinguish this checkout from an adopted user worktree.
+					this._logService.warn(`[${this._logLabel}] Failed to migrate Fumie ownership metadata for '${sessionUri.toString()}': ${errorMessage(error)}`);
+				}
+			}
+			const branchOwned = branchOwnedRaw === 'false'
+				? false
+				: branchOwnedRaw === 'true'
+					? true
+					: ownership === 'fumie' ? true : undefined;
+			let includeFiles: readonly string[] | undefined;
+			if (includeFilesRaw) {
+				try {
+					const parsed: unknown = JSON.parse(includeFilesRaw);
+					if (Array.isArray(parsed) && parsed.every(value => typeof value === 'string')) {
+						includeFiles = parsed;
+					}
+				} catch {
+					// Optional bootstrap metadata is ignored when malformed; branch restore remains usable.
+				}
+			}
+			return {
+				branchName,
+				worktreePath,
+				repositoryRoot,
+				ownership,
+				branchOwned,
+				includeSource: includeSourceRaw ? URI.parse(includeSourceRaw) : undefined,
+				includeFiles,
+			};
 		} finally {
 			ref.dispose();
 		}
+	}
+
+	private _isLegacyManagedWorktreePath(repositoryRoot: URI, worktreePath: URI): boolean {
+		const parent = URI.joinPath(worktreePath, '..');
+		const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
+		const managedRoots = [
+			getWorktreesRoot(repositoryRoot),
+			...(fumieHome ? [getWorktreesRoot(repositoryRoot, fumieHome), getManagedWorktreeRepositoryRoot(fumieHome, repositoryRoot)] : []),
+		];
+		return managedRoots.some(root => isEqual(root, parent));
 	}
 
 	private async _readWorktreeNotice(sessionUri: URI): Promise<{ kind: 'success'; branchName: string } | { kind: 'failure'; diagnostic?: string } | undefined> {
@@ -1230,5 +1862,41 @@ async function fileExists(path: string): Promise<boolean> {
 		return true;
 	} catch {
 		return false;
+	}
+}
+
+async function readDirectoryEntries(path: string) {
+	try {
+		return await fs.readdir(path, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			return [];
+		}
+		throw error;
+	}
+}
+
+async function removeEmptyDirectory(path: string): Promise<void> {
+	try {
+		await fs.rmdir(path);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === 'ENOENT' || code === 'ENOTEMPTY' || code === 'EEXIST') {
+			return;
+		}
+		throw error;
+	}
+}
+
+/** Returns false only for a missing path; permission and I/O failures remain lifecycle failures. */
+async function pathExistsStrict(path: string): Promise<boolean> {
+	try {
+		await fs.access(path);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			return false;
+		}
+		throw error;
 	}
 }

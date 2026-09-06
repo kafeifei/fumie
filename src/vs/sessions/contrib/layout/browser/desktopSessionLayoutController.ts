@@ -25,6 +25,8 @@ import { BaseLayoutController } from './baseSessionLayoutController.js';
  */
 interface INewSessionViewState {
 	readonly auxiliaryBarVisible: boolean;
+	/** Last Files/Changes tab the user chose on the shared new-session pane. */
+	readonly auxiliaryBarActiveViewContainerId?: string;
 }
 
 /** Shared layout state for the new-session (untitled) view. */
@@ -114,10 +116,19 @@ export class LayoutController extends BaseLayoutController {
 				return;
 			}
 
-			// [D1] Save auxiliary bar state for the session we're switching away from
+			// [D1] Save auxiliary bar state for the session we're switching away from.
+			// Uncreated drafts share `_newSessionViewState`; writing only the
+			// per-resource map would lose a Files/Changes click on the next draft.
 			const isSessionSwitch = previousSessionResource !== undefined && !isEqual(previousSessionResource, activeSessionResource);
 			if (isSessionSwitch) {
-				this._captureViewState(previousSessionResource!);
+				if (!previousIsCreated) {
+					this._setNewSessionViewState({
+						auxiliaryBarVisible: this._layoutService.isVisible(Parts.AUXILIARYBAR_PART),
+						auxiliaryBarActiveViewContainerId: this._paneCompositePartService.getActivePaneComposite(ViewContainerLocation.AuxiliaryBar)?.getId(),
+					});
+				} else {
+					this._captureViewState(previousSessionResource!);
+				}
 			}
 
 			// [D4] Submit: the same session transitions from new (uncreated) to real.
@@ -179,7 +190,10 @@ export class LayoutController extends BaseLayoutController {
 				return;
 			}
 			if (!activeSession.isCreated.get()) {
-				this._setNewSessionViewState({ auxiliaryBarVisible: e.visible });
+				this._setNewSessionViewState({
+					auxiliaryBarVisible: e.visible,
+					auxiliaryBarActiveViewContainerId: this._newSessionViewState?.auxiliaryBarActiveViewContainerId,
+				});
 			} else {
 				if (e.visible && this._restoreSavedAuxiliaryBarContainerOnReveal(activeSession.resource)) {
 					return;
@@ -189,6 +203,8 @@ export class LayoutController extends BaseLayoutController {
 		}));
 
 		this._registerChangesAutoReveal();
+		this._registerAuxiliaryBarContainerCapture();
+		this._registerDirtyChangesJump();
 
 		this._registerResponsiveSidebar();
 		this._registerAuxiliaryBarPartVisibility();
@@ -208,6 +224,88 @@ export class LayoutController extends BaseLayoutController {
 		this._register(this._layoutService.onDidChangePartVisibility(e => {
 			if (e.partId === Parts.EDITOR_PART && e.visible) {
 				this._revealChangesViewOnFirstOpen();
+			}
+		}));
+	}
+
+	/**
+	 * Remember the Files/Changes tab as soon as the user clicks it, not only on
+	 * session switch or pane hide. Without this, a later D3 sync (workspace
+	 * arrival, created flip) re-applies D3d and yanks a dirty session back to
+	 * Changes — the "fighting the controller" trap.
+	 */
+	private _registerAuxiliaryBarContainerCapture(): void {
+		this._register(this._viewsService.onDidChangeViewContainerVisibility(e => {
+			if (e.location !== ViewContainerLocation.AuxiliaryBar || !e.visible) {
+				return;
+			}
+			if (this._isRestoringSessionLayout || this._hidingAuxiliaryBarForRestore || this._togglingSidePane) {
+				return;
+			}
+			if (this.multipleSessionsVisibleObs.get() || this._layoutService.isEditorMaximized()) {
+				return;
+			}
+			if (!this._layoutService.isVisible(Parts.AUXILIARYBAR_PART)) {
+				return;
+			}
+			if (e.id !== SESSIONS_FILES_CONTAINER_ID && e.id !== CHANGES_VIEW_CONTAINER_ID) {
+				return;
+			}
+			const session = this._sessionsService.activeSession.get();
+			if (!session) {
+				return;
+			}
+			if (!session.isCreated.get()) {
+				this._setNewSessionViewState({
+					auxiliaryBarVisible: true,
+					auxiliaryBarActiveViewContainerId: e.id,
+				});
+				return;
+			}
+			this._captureViewState(session.resource);
+		}));
+	}
+
+	/**
+	 * [D6b] Cursor-like jump: when the session first becomes dirty while the
+	 * side pane is already showing Files, switch to Changes once. A hidden pane
+	 * stays hidden (D6). After the user clicks Files, later edits do not jump
+	 * again — the rising-edge guard plus immediate tab capture keep Files sticky.
+	 */
+	private _registerDirtyChangesJump(): void {
+		let previousHadChanges = false;
+		let previousResource: URI | undefined;
+		this._register(autorun(reader => {
+			const session = this._sessionsService.activeSession.read(reader);
+			const resource = session?.resource;
+			const hasChanges = session ? sessionHasChanges(session, reader) : false;
+
+			const sessionChanged = !isEqual(previousResource, resource);
+			const becameDirty = !!session && hasChanges && !previousHadChanges && !sessionChanged;
+			previousHadChanges = hasChanges;
+			previousResource = resource;
+
+			if (!becameDirty || !session) {
+				return;
+			}
+			if (this.multipleSessionsVisibleObs.read(reader) || this._layoutService.isEditorMaximized()) {
+				return;
+			}
+			if (!this._layoutService.isVisible(Parts.AUXILIARYBAR_PART)) {
+				return;
+			}
+			const activeId = this._paneCompositePartService.getActivePaneComposite(ViewContainerLocation.AuxiliaryBar)?.getId();
+			if (activeId !== SESSIONS_FILES_CONTAINER_ID) {
+				return;
+			}
+			void this._openDefaultAuxiliaryBarContainer(CHANGES_VIEW_CONTAINER_ID);
+			if (!session.isCreated.read(reader)) {
+				this._setNewSessionViewState({
+					auxiliaryBarVisible: true,
+					auxiliaryBarActiveViewContainerId: CHANGES_VIEW_CONTAINER_ID,
+				});
+			} else {
+				this._captureViewState(session.resource);
 			}
 		}));
 	}
@@ -482,7 +580,11 @@ export class LayoutController extends BaseLayoutController {
 			return;
 		}
 		if (!activeSession.isCreated.get()) {
-			this._setNewSessionViewState({ auxiliaryBarVisible });
+			this._setNewSessionViewState({
+				auxiliaryBarVisible,
+				auxiliaryBarActiveViewContainerId: this._newSessionViewState?.auxiliaryBarActiveViewContainerId
+					?? this._paneCompositePartService.getActivePaneComposite(ViewContainerLocation.AuxiliaryBar)?.getId(),
+			});
 			return;
 		}
 		if (collapsed && previousAuxiliaryBarVisible) {
@@ -545,6 +647,14 @@ export class LayoutController extends BaseLayoutController {
 	// This allows D2 to capture user actions that happen after the sync restore but before
 	// working-set apply, while still skipping single-pane detail-panel reveals during working-set apply.
 	private _syncAuxiliaryBarVisibility(sessionResource: URI | undefined, hasWorkspace: boolean, isCreated: boolean): void {
+		// Fumie ships `sessionsMinimalShell`, so this path is the production
+		// restore. Still honor an explicit Files/Changes pin (and a hidden pane)
+		// so a later D3 sync cannot yank the user back to the D3d default.
+		if (product.sessionsMinimalShell && sessionResource) {
+			this._restoreRememberedAuxiliaryBarContainer(isCreated, sessionResource);
+			return;
+		}
+
 		// [D3a] No resource / no workspace → do nothing.
 		if (!sessionResource || !hasWorkspace) {
 			return;
@@ -554,6 +664,11 @@ export class LayoutController extends BaseLayoutController {
 		if (!isCreated) {
 			if (this._newSessionViewState && !this._newSessionViewState.auxiliaryBarVisible) {
 				this._hideAuxiliaryBarForRestore();
+				return;
+			}
+			const savedContainerId = this._newSessionViewState?.auxiliaryBarActiveViewContainerId;
+			if (savedContainerId && this._isAuxiliaryBarContainerPinned(savedContainerId)) {
+				void this._viewsService.openViewContainer(savedContainerId, false);
 				return;
 			}
 			void this._openDefaultAuxiliaryBarContainer();
@@ -575,6 +690,40 @@ export class LayoutController extends BaseLayoutController {
 			return;
 		}
 
+		void this._openDefaultAuxiliaryBarContainer();
+	}
+
+	/**
+	 * Production (`sessionsMinimalShell`) restore: keep a hidden new-session pane
+	 * hidden, reopen a remembered Files/Changes tab when it is still pinned, and
+	 * otherwise fall back to the D3d default. Created sessions without a
+	 * remembered visible tab keep the historical "always show something" default.
+	 */
+	private _restoreRememberedAuxiliaryBarContainer(isCreated: boolean, sessionResource: URI): void {
+		if (!isCreated) {
+			if (this._newSessionViewState && !this._newSessionViewState.auxiliaryBarVisible) {
+				this._hideAuxiliaryBarForRestore();
+				return;
+			}
+			const savedContainerId = this._newSessionViewState?.auxiliaryBarActiveViewContainerId;
+			if (savedContainerId && this._isAuxiliaryBarContainerPinned(savedContainerId)) {
+				void this._viewsService.openViewContainer(savedContainerId, false);
+				return;
+			}
+			void this._openDefaultAuxiliaryBarContainer();
+			return;
+		}
+
+		const savedState = this._viewStateBySession.get(sessionResource);
+		if (savedState && !savedState.auxiliaryBarVisible) {
+			this._hideAuxiliaryBarForRestore();
+			return;
+		}
+		const savedContainerId = savedState?.auxiliaryBarActiveViewContainerId;
+		if (savedState?.auxiliaryBarVisible && savedContainerId && this._isAuxiliaryBarContainerPinned(savedContainerId)) {
+			void this._viewsService.openViewContainer(savedContainerId, false);
+			return;
+		}
 		void this._openDefaultAuxiliaryBarContainer();
 	}
 
@@ -658,7 +807,12 @@ export class LayoutController extends BaseLayoutController {
 		try {
 			const parsed = JSON.parse(newSessionRaw);
 			if (parsed && typeof parsed.auxiliaryBarVisible === 'boolean') {
-				this._newSessionViewState = { auxiliaryBarVisible: parsed.auxiliaryBarVisible };
+				this._newSessionViewState = {
+					auxiliaryBarVisible: parsed.auxiliaryBarVisible,
+					auxiliaryBarActiveViewContainerId: typeof parsed.auxiliaryBarActiveViewContainerId === 'string'
+						? parsed.auxiliaryBarActiveViewContainerId
+						: undefined,
+				};
 			} else {
 				this._storageService.remove(NEW_SESSION_VIEW_STATE_KEY, StorageScope.WORKSPACE);
 			}

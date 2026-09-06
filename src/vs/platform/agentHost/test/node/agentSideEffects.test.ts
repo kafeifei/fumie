@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { CancellationError } from '../../../../base/common/errors.js';
+import { AgentMessageNotSubmittedError } from '../../common/agentMessageNotSubmittedError.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { Event } from '../../../../base/common/event.js';
@@ -32,7 +34,7 @@ import { buildSubagentChatUri, buildChatUri, buildDefaultChatUri, ChatInteractiv
 import { IProductService } from '../../../product/common/productService.js';
 import { ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
 import { NullTelemetryService } from '../../../telemetry/common/telemetryUtils.js';
-import { AgentHostActiveAgentTitleGenerationConfigKey, AgentHostGlobalAutoApproveEnabledConfigKey, AgentHostMarkdownPlanRichLinksEnabledConfigKey, AgentHostTelemetryLevelConfigKey, platformSessionSchema, telemetryLevelToAgentHostConfigValue } from '../../common/agentHostSchema.js';
+import { AgentHostGlobalAutoApproveEnabledConfigKey, AgentHostMarkdownPlanRichLinksEnabledConfigKey, AgentHostTelemetryLevelConfigKey, platformSessionSchema, telemetryLevelToAgentHostConfigValue } from '../../common/agentHostSchema.js';
 import { AgentConfigurationService, IAgentConfigurationService } from '../../node/agentConfigurationService.js';
 import { AgentHostTelemetryService } from '../../node/agentHostTelemetryService.js';
 import { AgentHostClientConnectionService, IAgentHostClientConnectionService } from '../../node/agentHostClientConnectionService.js';
@@ -52,7 +54,6 @@ import { ChatInputRequestPurpose, withChatInputRequestPurpose } from '../../comm
 import { AgentHostCustomizationEnablementService, IAgentHostCustomizationEnablementService } from '../../node/agentHostCustomizationEnablementService.js';
 import { AgentHostStorageService } from '../../node/agentHostStorageService.js';
 import { applyMcpServerEnablement } from '../../node/shared/mcpCustomizationController.js';
-import { customChatTitleMetadataKey, customChatTitleSourceMetadataKey, SESSION_CUSTOM_TITLE_KEY, SESSION_CUSTOM_TITLE_SOURCE_KEY } from '../../node/shared/persistSessionMetadata.js';
 import { createNoopGitService, createNullSessionDataService, createSessionDataService, TestSessionDatabase } from '../common/sessionTestHelpers.js';
 import { MockAgent } from './mockAgent.js';
 import { TestAgentHostTerminalManager } from './testAgentHostTerminalManager.js';
@@ -616,8 +617,10 @@ suite('AgentSideEffects', () => {
 			await waitForSendMessageCalls(1);
 
 			assert.deepStrictEqual(agent.sendMessageCalls, [{ session: URI.parse(sessionUri.toString()), prompt: 'hello world', attachments: undefined, chat: URI.parse(defaultChatUri) }]);
+			// The session-constant host briefing walks each provider's system-prompt
+			// channel, never the per-operation context — a plain send carries none.
 			const sendContext = agent.chatContexts.find(call => call.boundary === 'sendMessage')?.context;
-			assert.strictEqual(!URI.isUri(sendContext) ? sendContext?.hostInstructions : undefined, undefined);
+			assert.strictEqual(!URI.isUri(sendContext) ? hasKey(sendContext as object, { hostInstructions: true }) : undefined, false);
 		});
 
 		test('stamps the exhaustive host chat context on the send boundary', async () => {
@@ -653,6 +656,7 @@ suite('AgentSideEffects', () => {
 					resource: context.resource.toString(),
 					origin: context.origin,
 					customizations: context.customizations?.map(c => c.id),
+					hostInstructions: context.hostInstructions,
 				};
 			}), [{
 				chat: peerChatUri,
@@ -660,6 +664,7 @@ suite('AgentSideEffects', () => {
 				resource: peerChatUri,
 				origin: { kind: ChatOriginKind.Fork, chat: defaultChatUri, turnId: 'turn-0' },
 				customizations: [hostCustomization.id],
+				hostInstructions: undefined,
 			}]);
 		});
 
@@ -1624,65 +1629,6 @@ suite('AgentSideEffects', () => {
 			assert.strictEqual(stateManager.getActiveTurnId(sessionUri.toString()), undefined);
 		});
 
-		test('peer /rename synchronously suppresses the automatic rename reminder', async () => {
-			setupSession();
-			stateManager.dispatchServerAction(ROOT_STATE_URI, {
-				type: ActionType.RootConfigChanged,
-				config: { [AgentHostActiveAgentTitleGenerationConfigKey]: true },
-			});
-			const renameSideEffects = createRenameSideEffects();
-			const peerChat = buildChatUri(sessionUri.toString(), 'peer-rename');
-			stateManager.addChat(sessionUri.toString(), peerChat, { title: 'Automatic peer title' });
-			renameSideEffects.markTitleAuto(sessionUri.toString(), peerChat, 'Automatic peer title');
-			const renameAction: ChatAction = {
-				type: ActionType.ChatTurnStarted,
-				turnId: 'turn-rename',
-				startedAt: '2025-01-01T00:00:00.000Z',
-				message: { text: '/rename User Peer Title', origin: { kind: MessageKind.User } },
-			};
-			stateManager.dispatchClientAction(peerChat, renameAction, { clientId: 'test', clientSeq: 1 });
-			renameSideEffects.handleAction(peerChat, renameAction);
-			await waitForState(stateManager, () => (
-				stateManager.getChatState(peerChat)?.title === 'User Peer Title'
-				&& stateManager.getActiveTurnId(peerChat) === undefined
-			) || undefined);
-
-			const followUpAction: ChatAction = {
-				type: ActionType.ChatTurnStarted,
-				turnId: 'turn-follow-up',
-				startedAt: '2025-01-01T00:00:01.000Z',
-				message: { text: 'Continue', origin: { kind: MessageKind.User } },
-			};
-			stateManager.dispatchClientAction(peerChat, followUpAction, { clientId: 'test', clientSeq: 2 });
-			renameSideEffects.handleAction(peerChat, followUpAction);
-			await waitForSendMessageCalls(1);
-
-			assert.strictEqual(agent.sendMessageCalls[0].prompt, 'Continue');
-		});
-
-		test('automatic rename guidance is transient context and never changes the user prompt', async () => {
-			setupSession();
-			stateManager.dispatchServerAction(ROOT_STATE_URI, {
-				type: ActionType.RootConfigChanged,
-				config: { [AgentHostActiveAgentTitleGenerationConfigKey]: true },
-			});
-			const renameSideEffects = createRenameSideEffects();
-			renameSideEffects.markTitleAuto(sessionUri.toString(), undefined, 'Automatic title');
-			const action: ChatAction = {
-				type: ActionType.ChatTurnStarted,
-				turnId: 'turn-guidance',
-				startedAt: '2025-01-01T00:00:00.000Z',
-				message: { text: 'Keep GitHub casing', origin: { kind: MessageKind.User } },
-			};
-			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: 1 });
-			renameSideEffects.handleAction(defaultChatUri, action);
-			await waitForSendMessageCalls(1);
-
-			const sendContext = agent.chatContexts.find(call => call.boundary === 'sendMessage')?.context;
-			assert.strictEqual(agent.sendMessageCalls[0].prompt, 'Keep GitHub casing');
-			assert.ok(!URI.isUri(sendContext) && sendContext?.hostInstructions?.[0].includes('`rename_chat`'));
-		});
-
 		test('a message that merely starts with /rename text (no separator) is sent to the agent', async () => {
 			setupSession();
 			const renameSideEffects = createRenameSideEffects();
@@ -1804,47 +1750,6 @@ suite('AgentSideEffects', () => {
 			assert.ok(toolCallPart?.toolCall?.content?.every(c => c.type !== ToolResultContentType.Terminal));
 			assert.ok(toolCallPart?.toolCall?.content?.some(c => c.type === ToolResultContentType.Text));
 		});
-
-		test('seeds the session title from the ! command when the session is untitled', async () => {
-			// A brand-new, untitled session: the bang command is the only thing
-			// we can title it with until a real request arrives.
-			stateManager.createSession({
-				resource: sessionUri.toString(),
-				provider: 'mock',
-				title: '',
-				status: SessionStatus.Idle,
-				createdAt: new Date().toISOString(),
-				modifiedAt: new Date().toISOString(),
-			});
-			stateManager.dispatchServerAction(sessionUri.toString(), { type: ActionType.SessionReady });
-			const db = new TestSessionDatabase();
-			const terminalManager = disposables.add(new TestAgentHostTerminalManager());
-			const bangSideEffects = createTestSideEffects(disposables, stateManager, {
-				getAgent: () => agent,
-				agents: agentList,
-				sessionDataService: createSessionDataService(db),
-				onTurnComplete: () => { },
-			}, undefined, undefined, undefined, terminalManager);
-			const action: ChatAction = {
-				type: ActionType.ChatTurnStarted,
-				turnId: 'turn-1',
-				startedAt: '2025-01-01T00:00:00.000Z',
-				message: { text: '!echo hi', origin: { kind: MessageKind.User } },
-			};
-			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: 1 });
-			bangSideEffects.handleAction(defaultChatUri, action);
-
-			// The provisional title is applied synchronously, before the command runs.
-			assert.strictEqual(stateManager.getSessionState(sessionUri.toString())?.title, 'echo hi');
-
-			// Let the command finish so the turn closes cleanly.
-			await terminalManager.commandFinishedListenerRegistered.p;
-			terminalManager.fireCommandFinished({ commandId: '1', command: 'echo hi', exitCode: 0, output: 'hi\n' });
-			await waitForState(stateManager, () => stateManager.getActiveTurnId(sessionUri.toString()) === undefined ? true : undefined);
-
-			// The provisional title is persisted so it survives reload.
-			assert.strictEqual(await db.getMetadata('customTitle'), 'echo hi');
-		});
 	});
 
 	// ---- local turn persistence: anchoring + truncate resolution ---------
@@ -1888,6 +1793,44 @@ suite('AgentSideEffects', () => {
 				localTurns,
 				onTurnComplete: () => { },
 			}, undefined, undefined, undefined, terminalManager);
+		}
+
+		for (const notSubmitted of [true, false]) {
+			test(`a cancelled provider send ${notSubmitted ? 'reported not submitted survives' : 'without submission evidence stays out of'} local history reload`, async () => {
+				setupSession('file:///work');
+				const db = new TestSessionDatabase();
+				const terminalManager = disposables.add(new TestAgentHostTerminalManager());
+				const se = createLocalTurnSideEffects(db, terminalManager);
+				const entered = new DeferredPromise<void>();
+				const release = new DeferredPromise<void>();
+				agent.sendMessage = async () => {
+					entered.complete();
+					await release.p;
+					throw notSubmitted ? new AgentMessageNotSubmittedError() : new CancellationError();
+				};
+				const started = {
+					type: ActionType.ChatTurnStarted as const, turnId: 'cancelled-first', startedAt: '2025-01-01T00:00:00.000Z',
+					message: { text: 'keep my first message', origin: { kind: MessageKind.User as const } },
+				};
+				stateManager.dispatchClientAction(defaultChatUri, started, { clientId: 'test', clientSeq: ++clientSeq });
+				se.handleAction(defaultChatUri, started);
+				await entered.p;
+				const cancel = { type: ActionType.ChatTurnCancelled as const, turnId: 'cancelled-first', duration: 1 };
+				stateManager.dispatchClientAction(defaultChatUri, cancel, { clientId: 'test', clientSeq: ++clientSeq });
+				se.handleAction(defaultChatUri, cancel);
+				release.complete();
+				await timeout(0);
+				const state = stateManager.getSessionState(defaultChatUri)!;
+				assert.deepStrictEqual(state.turns.map(turn => ({ id: turn.id, text: turn.message.text, state: turn.state })), [
+					{ id: 'cancelled-first', text: 'keep my first message', state: TurnState.Cancelled },
+				]);
+				const reloaded = new AgentHostLocalTurns(createSessionDataService(db), new NullLogService());
+				const records = await reloaded.loadForChat(sessionUri.toString(), defaultChatUri);
+				assert.deepStrictEqual(records.map(record => {
+					const turn = JSON.parse(record.payload);
+					return { id: turn.id, text: turn.message.text, state: turn.state };
+				}), notSubmitted ? [{ id: 'cancelled-first', text: 'keep my first message', state: TurnState.Cancelled }] : []);
+			});
 		}
 
 		test('anchors a bang turn to the preceding concrete turn', async () => {
@@ -2073,9 +2016,14 @@ suite('AgentSideEffects', () => {
 
 		test('does not dispatch titleChanged on second turn', () => {
 			setupDefaultSession();
-			startTurn('turn-1');
-
-			// Complete the first turn so turns.length becomes 1.
+			// The first turn names the session, which is what makes every later
+			// turn a no-op: only a still-untitled session is named.
+			sideEffects.handleAction(defaultChatUri, {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
+				message: { text: 'first message', origin: { kind: MessageKind.User } },
+			});
 			stateManager.dispatchServerAction(defaultChatUri, {
 				type: ActionType.ChatTurnComplete,
 				turnId: 'turn-1',
@@ -2092,8 +2040,13 @@ suite('AgentSideEffects', () => {
 				message: { text: 'second message', origin: { kind: MessageKind.User } },
 			});
 
-			const titleAction = envelopes.find(e => e.action.type === ActionType.SessionTitleChanged);
-			assert.strictEqual(titleAction, undefined, 'should not dispatch titleChanged on second turn');
+			assert.deepStrictEqual({
+				title: stateManager.getSessionState(sessionUri.toString())?.title,
+				titleActions: envelopes.filter(e => e.action.type === ActionType.SessionTitleChanged).length,
+			}, {
+				title: 'first message',
+				titleActions: 0,
+			});
 		});
 
 		test('does not dispatch titleChanged when title is already set', () => {
@@ -2121,6 +2074,37 @@ suite('AgentSideEffects', () => {
 
 			const titleAction = envelopes.find(e => e.action.type === ActionType.SessionTitleChanged);
 			assert.strictEqual(titleAction, undefined, 'should not clobber existing title');
+		});
+
+		test('drops a title pushed by the agent instead of applying or persisting it', async () => {
+			const db = new TestSessionDatabase();
+			const persisting = createTestSideEffects(disposables, stateManager, {
+				getAgent: () => agent,
+				agents: agentList,
+				sessionDataService: createSessionDataService(db),
+				onTurnComplete: () => { },
+			});
+			setupDefaultSession();
+			disposables.add(persisting.registerProgressListener(agent));
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			agent.fireProgress({
+				kind: 'action', resource: sessionUri,
+				action: { type: ActionType.SessionTitleChanged, title: 'Harness-chosen title' },
+			});
+			await timeout(0);
+
+			assert.deepStrictEqual({
+				titleActions: envelopes.filter(e => e.action.type === ActionType.SessionTitleChanged).length,
+				liveTitle: stateManager.getSessionState(sessionUri.toString())?.title,
+				titleWrites: db.setMetadataCalls.filter(c => c.key.startsWith('customTitle')),
+			}, {
+				titleActions: 0,
+				liveTitle: '',
+				titleWrites: [],
+			});
 		});
 	});
 
@@ -2844,6 +2828,9 @@ suite('AgentSideEffects', () => {
 				supportsVision: false,
 				policyState: undefined,
 				configSchema: undefined,
+				// Published for every model; absent here because this one names no
+				// separate id for its runtime to report.
+				underlyingModelId: undefined,
 				_meta: undefined,
 			}]);
 		});
@@ -2891,6 +2878,9 @@ suite('AgentSideEffects', () => {
 
 		test('syncs steering message to agent on ChatPendingMessageSet', () => {
 			setupSession();
+			// Steering only stays in the pending slot while a turn is live;
+			// on an idle chat it is requeued as an ordinary queued message.
+			startTurn('turn-steer-1');
 
 			const action = {
 				type: ActionType.ChatPendingMessageSet as const,
@@ -2912,6 +2902,7 @@ suite('AgentSideEffects', () => {
 			setupSession();
 			const peerChatUri = URI.parse(buildChatUri(sessionUri.toString(), 'peer-steer'));
 			stateManager.addChat(sessionUri.toString(), peerChatUri.toString());
+			startTurn('turn-steer-peer', peerChatUri.toString());
 
 			const action = {
 				type: ActionType.ChatPendingMessageSet as const,
@@ -2930,6 +2921,113 @@ suite('AgentSideEffects', () => {
 				chat: peerChatUri.toString(),
 				steeringId: 'steer-peer',
 			});
+		});
+
+		test('requeues a stranded steering message and consumes it when the turn completes', async () => {
+			setupSession();
+			disposables.add(sideEffects.registerProgressListener(agent));
+			startTurn('turn-1');
+
+			const set = {
+				type: ActionType.ChatPendingMessageSet as const,
+				kind: PendingMessageKind.Steering,
+				id: 'steer-stranded',
+				message: { text: 'follow-up', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, set, { clientId: 'test', clientSeq: 2 });
+			sideEffects.handleAction(defaultChatUri, set);
+
+			// The agent never folded the steering into the turn (no promotion);
+			// the turn completes with the pending slot still occupied.
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1 },
+			});
+			await waitForSendMessageCalls(1);
+
+			const state = stateManager.getSessionState(defaultChatUri);
+			assert.strictEqual(state?.steeringMessage, undefined);
+			assert.deepStrictEqual(state?.queuedMessages ?? [], [], 'requeued message was consumed into its own turn');
+			assert.strictEqual(agent.sendMessageCalls[0].prompt, 'follow-up');
+		});
+
+		test('keeps a stranded steering message queued after a cancel instead of dropping it', async () => {
+			setupSession();
+			startTurn('turn-1');
+
+			const set = {
+				type: ActionType.ChatPendingMessageSet as const,
+				kind: PendingMessageKind.Steering,
+				id: 'steer-cancelled',
+				message: { text: 'after stop', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, set, { clientId: 'test', clientSeq: 2 });
+			sideEffects.handleAction(defaultChatUri, set);
+
+			const cancel = { type: ActionType.ChatTurnCancelled as const, turnId: 'turn-1', duration: 1 };
+			stateManager.dispatchClientAction(defaultChatUri, cancel, { clientId: 'test', clientSeq: 3 });
+			sideEffects.handleAction(defaultChatUri, cancel);
+			// The requeue is deferred one microtask so a same-tick steering
+			// promotion wins over it.
+			await Promise.resolve();
+
+			// Cancelling means "stop": the message must survive as an ordinary
+			// queued message for the user to run manually, not auto-send.
+			const state = stateManager.getSessionState(defaultChatUri);
+			assert.strictEqual(state?.steeringMessage, undefined);
+			assert.deepStrictEqual(state?.queuedMessages?.map(m => m.id), ['steer-cancelled']);
+			assert.strictEqual(agent.sendMessageCalls.length, 0);
+		});
+
+		test('a steering message set while the chat is idle is requeued and sent immediately', async () => {
+			setupSession();
+
+			const set = {
+				type: ActionType.ChatPendingMessageSet as const,
+				kind: PendingMessageKind.Steering,
+				id: 'steer-idle',
+				message: { text: 'raced turn end', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, set, { clientId: 'test', clientSeq: 1 });
+			sideEffects.handleAction(defaultChatUri, set);
+
+			await waitForSendMessageCalls(1);
+			const state = stateManager.getSessionState(defaultChatUri);
+			assert.strictEqual(state?.steeringMessage, undefined);
+			assert.strictEqual(agent.sendMessageCalls[0].prompt, 'raced turn end');
+			// The stranded slot was requeued before the pending push, so the
+			// agent never saw a steering message for an idle chat.
+			assert.strictEqual(agent.setPendingMessagesCalls.every(c => c.steeringMessage === undefined), true);
+		});
+
+		test('a stranded steering message is requeued ahead of messages queued behind the turn', async () => {
+			setupSession();
+			startTurn('turn-1');
+
+			const steer = {
+				type: ActionType.ChatPendingMessageSet as const,
+				kind: PendingMessageKind.Steering,
+				id: 'steer-first',
+				message: { text: 'typed first', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, steer, { clientId: 'test', clientSeq: 2 });
+			sideEffects.handleAction(defaultChatUri, steer);
+			const queued = {
+				type: ActionType.ChatPendingMessageSet as const,
+				kind: PendingMessageKind.Queued,
+				id: 'queued-second',
+				message: { text: 'typed second', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, queued, { clientId: 'test', clientSeq: 3 });
+			sideEffects.handleAction(defaultChatUri, queued);
+
+			const cancel = { type: ActionType.ChatTurnCancelled as const, turnId: 'turn-1', duration: 1 };
+			stateManager.dispatchClientAction(defaultChatUri, cancel, { clientId: 'test', clientSeq: 4 });
+			sideEffects.handleAction(defaultChatUri, cancel);
+			await Promise.resolve();
+
+			const state = stateManager.getSessionState(defaultChatUri);
+			assert.deepStrictEqual(state?.queuedMessages?.map(m => m.id), ['steer-first', 'queued-second']);
 		});
 
 		test('syncs queued message and preserves the enqueuing client attribution', async () => {
@@ -3377,6 +3475,8 @@ suite('AgentSideEffects', () => {
 		test('dispatches ChatPendingMessageRemoved for steering messages on steering_consumed', () => {
 			setupSession();
 			disposables.add(sideEffects.registerProgressListener(agent));
+			// Mid-turn: on an idle chat the steering would be requeued instead.
+			startTurn('turn-rm');
 
 			const envelopes: ActionEnvelope[] = [];
 			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
@@ -3857,6 +3957,59 @@ suite('AgentSideEffects', () => {
 				{ requestId: 'tc-deny-1', approved: false },
 			]);
 		});
+
+		test('forwards the picked confirmation option to the agent', () => {
+			setupSession();
+			stateManager.setSessionConfig(sessionUri.toString(), {
+				schema: { type: 'object', properties: {} },
+				values: {},
+			});
+			startTurn('turn-1', defaultChatUri);
+			disposables.add(sideEffects.registerProgressListener(agent));
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: {
+					type: ActionType.ChatToolCallStart, turnId: 'turn-1',
+					toolCallId: 'tc-opt-1', toolName: 'shell', displayName: 'Shell', contributor: undefined,
+					_meta: { toolKind: undefined, language: undefined },
+				},
+			});
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: {
+					type: ActionType.ChatToolCallReady, turnId: 'turn-1',
+					toolCallId: 'tc-opt-1', invocationMessage: 'Running command', toolInput: undefined,
+					confirmed: ToolCallConfirmationReason.NotNeeded,
+				},
+			});
+			agent.fireProgress({
+				kind: 'pending_confirmation', chat: URI.parse(defaultChatUri),
+				state: {
+					status: ToolCallStatus.PendingConfirmation,
+					toolCallId: 'tc-opt-1', toolName: '', displayName: '',
+					invocationMessage: 'Run command', toolInput: undefined,
+					confirmationTitle: 'Run command', edits: undefined,
+				},
+				permissionKind: undefined, permissionPath: undefined,
+			});
+
+			sideEffects.handleAction(defaultChatUri, {
+				type: ActionType.ChatToolCallConfirmed,
+				turnId: 'turn-1',
+				toolCallId: 'tc-opt-1',
+				approved: true,
+				confirmed: 'user-action' as const,
+				selectedOptionId: 'allow-session',
+			} as ChatAction);
+
+			// Adding the tool to the session allow list only stops *us* asking;
+			// a provider that asks through its own SDK has to hear the session
+			// grant itself, so the option travels with the answer.
+			assert.deepStrictEqual(agent.respondToPermissionCalls, [
+				{ requestId: 'tc-opt-1', approved: true, selectedOptionId: 'allow-session' },
+			]);
+		});
 	});
 
 	// ---- tool_ready progress dispatch -----------------------------------
@@ -4161,7 +4314,7 @@ suite('AgentSideEffects', () => {
 			} as ChatAction);
 
 			assert.deepStrictEqual(agent.respondToPermissionCalls, [
-				{ requestId: 'tc-peer-perm', approved: true },
+				{ requestId: 'tc-peer-perm', approved: true, selectedOptionId: 'allow-session' },
 			]);
 			assert.deepStrictEqual(stateManager.getSessionState(sessionUri.toString())?.config?.values[SessionConfigKey.Permissions], { allow: ['write'], deny: [] });
 		});
@@ -5021,170 +5174,6 @@ suite('AgentSideEffects', () => {
 			assert.strictEqual(await waitForMetadata('customTitle'), 'Custom Title');
 		});
 
-		test('default chat title change updates and persists the session title', async () => {
-			const sessionDataService = createSessionDataService(sessionDb);
-			const localStateManager = disposables.add(new AgentHostStateManager(new NullLogService()));
-			const localAgent = new MockAgent();
-			disposables.add(toDisposable(() => localAgent.dispose()));
-			const localSideEffects = createTestSideEffects(disposables, localStateManager, {
-				getAgent: () => localAgent,
-				agents: observableValue<readonly IAgent[]>('agents', [localAgent]),
-				sessionDataService,
-				onTurnComplete: () => { },
-			});
-			const defaultChat = buildDefaultChatUri(sessionUri);
-			localStateManager.createSession({
-				resource: sessionUri.toString(),
-				provider: 'mock',
-				title: 'Initial',
-				status: SessionStatus.Idle,
-				createdAt: new Date().toISOString(),
-				modifiedAt: new Date().toISOString(),
-			});
-			localStateManager.addChat(sessionUri.toString(), buildChatUri(sessionUri.toString(), 'peer'), { title: 'Peer' });
-
-			localSideEffects.handleAction(defaultChat, {
-				type: ActionType.SessionTitleChanged,
-				title: 'Renamed Default',
-			});
-
-			assert.deepStrictEqual({
-				sessionTitle: localStateManager.getSessionState(sessionUri.toString())?.title,
-				defaultChatTitle: localStateManager.getChatState(defaultChat)?.title,
-				persistedSessionTitle: await waitForMetadata(SESSION_CUSTOM_TITLE_KEY),
-				persistedSessionSource: await waitForMetadata(SESSION_CUSTOM_TITLE_SOURCE_KEY),
-				persistedChatTitle: await waitForMetadata(customChatTitleMetadataKey(defaultChat)),
-				persistedChatSource: await waitForMetadata(customChatTitleSourceMetadataKey(defaultChat)),
-			}, {
-				sessionTitle: 'Renamed Default',
-				defaultChatTitle: 'Renamed Default',
-				persistedSessionTitle: 'Renamed Default',
-				persistedSessionSource: 'user',
-				persistedChatTitle: 'Renamed Default',
-				persistedChatSource: 'user',
-			});
-		});
-
-		test('first peer persists the inherited default chat title and provenance', async () => {
-			await sessionDb.setMetadata(SESSION_CUSTOM_TITLE_KEY, 'Initial');
-			await sessionDb.setMetadata(SESSION_CUSTOM_TITLE_SOURCE_KEY, 'auto');
-			const sessionDataService = createSessionDataService(sessionDb);
-			const localStateManager = disposables.add(new AgentHostStateManager(new NullLogService()));
-			const localAgent = new MockAgent();
-			disposables.add(toDisposable(() => localAgent.dispose()));
-			createTestSideEffects(disposables, localStateManager, {
-				getAgent: () => localAgent,
-				agents: observableValue<readonly IAgent[]>('agents', [localAgent]),
-				sessionDataService,
-				onTurnComplete: () => { },
-			});
-			const defaultChat = buildDefaultChatUri(sessionUri);
-			localStateManager.createSession({
-				resource: sessionUri.toString(),
-				provider: 'mock',
-				title: 'Initial',
-				status: SessionStatus.Idle,
-				createdAt: new Date().toISOString(),
-				modifiedAt: new Date().toISOString(),
-			});
-
-			localStateManager.addChat(sessionUri.toString(), buildChatUri(sessionUri.toString(), 'peer'), { title: 'Peer' });
-
-			assert.deepStrictEqual({
-				title: await waitForMetadata(customChatTitleMetadataKey(defaultChat)),
-				source: await waitForMetadata(customChatTitleSourceMetadataKey(defaultChat)),
-			}, {
-				title: 'Initial',
-				source: 'auto',
-			});
-		});
-
-		test('default chat title snapshot does not overwrite an existing persisted title', async () => {
-			const defaultChat = buildDefaultChatUri(sessionUri);
-			await sessionDb.setMetadata(customChatTitleMetadataKey(defaultChat), 'Existing');
-			const localStateManager = disposables.add(new AgentHostStateManager(new NullLogService()));
-			const localAgent = new MockAgent();
-			disposables.add(toDisposable(() => localAgent.dispose()));
-			createTestSideEffects(disposables, localStateManager, {
-				getAgent: () => localAgent,
-				agents: observableValue<readonly IAgent[]>('agents', [localAgent]),
-				sessionDataService: createSessionDataService(sessionDb),
-				onTurnComplete: () => { },
-			});
-			localStateManager.createSession({
-				resource: sessionUri.toString(),
-				provider: 'mock',
-				title: 'Initial',
-				status: SessionStatus.Idle,
-				createdAt: new Date().toISOString(),
-				modifiedAt: new Date().toISOString(),
-			});
-
-			localStateManager.addChat(sessionUri.toString(), buildChatUri(sessionUri.toString(), 'peer'), { title: 'Peer' });
-			await timeout(10);
-
-			assert.strictEqual(await sessionDb.getMetadata(customChatTitleMetadataKey(defaultChat)), 'Existing');
-		});
-
-		test('a same-turn default chat rename wins after the inherited title snapshot', async () => {
-			const defaultChat = buildDefaultChatUri(sessionUri);
-			await sessionDb.setMetadata(SESSION_CUSTOM_TITLE_SOURCE_KEY, 'auto');
-			const localStateManager = disposables.add(new AgentHostStateManager(new NullLogService()));
-			const localAgent = new MockAgent();
-			disposables.add(toDisposable(() => localAgent.dispose()));
-			const localSideEffects = createTestSideEffects(disposables, localStateManager, {
-				getAgent: () => localAgent,
-				agents: observableValue<readonly IAgent[]>('agents', [localAgent]),
-				sessionDataService: createSessionDataService(sessionDb),
-				onTurnComplete: () => { },
-			});
-			localStateManager.createSession({
-				resource: sessionUri.toString(),
-				provider: 'mock',
-				title: 'Initial',
-				status: SessionStatus.Idle,
-				createdAt: new Date().toISOString(),
-				modifiedAt: new Date().toISOString(),
-			});
-
-			localStateManager.addChat(sessionUri.toString(), buildChatUri(sessionUri.toString(), 'peer'), { title: 'Peer' });
-			localSideEffects.handleAction(defaultChat, {
-				type: ActionType.SessionTitleChanged,
-				title: 'Newer',
-			});
-
-			assert.deepStrictEqual({
-				chatTitle: await waitForMetadata(customChatTitleMetadataKey(defaultChat)),
-				chatSource: await waitForMetadata(customChatTitleSourceMetadataKey(defaultChat)),
-				sessionTitle: await waitForMetadata(SESSION_CUSTOM_TITLE_KEY),
-				sessionSource: await waitForMetadata(SESSION_CUSTOM_TITLE_SOURCE_KEY),
-			}, {
-				chatTitle: 'Newer',
-				chatSource: 'user',
-				sessionTitle: 'Newer',
-				sessionSource: 'user',
-			});
-		});
-
-		test('handleListSessions returns persisted custom title', async () => {
-			const sessionDataService = createSessionDataService(sessionDb);
-			const localAgent = new MockAgent();
-			disposables.add(toDisposable(() => localAgent.dispose()));
-			const localService = disposables.add(createTestAgentService(new NullLogService(), fileService, sessionDataService, { _serviceBrand: undefined } as IProductService, createNoopGitService()));
-			localService.registerProvider(localAgent);
-
-			await localService.createSession({ provider: localAgent.id });
-
-			// Persist a custom title in the DB
-			await sessionDb.setMetadata('customTitle', 'My Custom Title');
-
-			const sessions = await localService.listSessions();
-			assert.strictEqual(sessions.length, 1);
-			// Custom title comes from the DB and is returned via the agent's listSessions
-			// The mock agent summary is used; the service doesn't read the DB for list
-			assert.ok(sessions[0].summary);
-		});
-
 		test('handleRestoreSession uses persisted custom title', async () => {
 			const sessionDataService = createSessionDataService(sessionDb);
 			const localAgent = new MockAgent();
@@ -5769,6 +5758,85 @@ suite('AgentSideEffects', () => {
 			}, {
 				message: 'Follow up',
 				response: { kind: ResponsePartKind.Markdown, id: 'follow-up-part', content: 'Follow-up response' },
+				completedTurns: 1,
+			});
+		});
+
+		test('a subagent spawned inside another subagent materializes under its immediate parent chat', () => {
+			// The host half of E2: given the nested `subagent_started` the Claude
+			// mapper now emits, the nested chat has to land inside the spawning
+			// subagent's chat — not the top-level one — and take its own output.
+			setupSession();
+			startTurn('turn-1');
+			disposables.add(sideEffects.registerProgressListener(agent));
+
+			agent.fireProgress({ kind: 'action', resource: URI.parse(defaultChatUri), action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 'tc-outer', toolName: 'Task', displayName: 'Task', contributor: undefined, _meta: { toolKind: 'subagent' } } });
+			agent.fireProgress({ kind: 'subagent_started', chat: URI.parse(defaultChatUri), toolCallId: 'tc-outer', agentName: 'Explore', agentDisplayName: 'Explore' });
+
+			// The outer subagent runs a Task of its own: that tool call lives in
+			// the outer subagent's chat, so it arrives tagged with `tc-outer`.
+			agent.fireProgress({ kind: 'action', resource: URI.parse(defaultChatUri), parentToolCallId: 'tc-outer', action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 'tc-nested', toolName: 'Task', displayName: 'Task', contributor: undefined, _meta: { toolKind: 'subagent' } } });
+			agent.fireProgress({ kind: 'action', resource: URI.parse(defaultChatUri), parentToolCallId: 'tc-outer', action: { type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 'tc-nested', invocationMessage: 'Run subagent task', toolInput: undefined, confirmed: ToolCallConfirmationReason.NotNeeded } });
+			agent.fireProgress({ kind: 'subagent_started', chat: URI.parse(defaultChatUri), toolCallId: 'tc-nested', agentName: 'Plan', agentDisplayName: 'Plan', parentToolCallId: 'tc-outer' });
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri), parentToolCallId: 'tc-nested',
+				action: { type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Markdown, id: 'nested-part', content: 'nested output' } },
+			});
+
+			const outerUri = buildSubagentChatUri(sessionUri.toString(), 'tc-outer');
+			const nestedUri = buildSubagentChatUri(sessionUri.toString(), 'tc-nested');
+			const nestedToolCall = stateManager.getSessionState(outerUri)?.activeTurn?.responseParts
+				.find(rp => rp.kind === ResponsePartKind.ToolCall && rp.toolCall.toolCallId === 'tc-nested');
+			const discoveryOnOuter = nestedToolCall?.kind === ResponsePartKind.ToolCall && nestedToolCall.toolCall.status === ToolCallStatus.Running
+				? nestedToolCall.toolCall.content
+				: undefined;
+
+			assert.deepStrictEqual({
+				nestedResponse: stateManager.getSessionState(nestedUri)?.activeTurn?.responseParts[0],
+				discoveryOnOuter,
+				topLevelHasNestedToolCall: stateManager.getSessionState(defaultChatUri)?.activeTurn?.responseParts
+					.some(rp => rp.kind === ResponsePartKind.ToolCall && rp.toolCall.toolCallId === 'tc-nested'),
+			}, {
+				nestedResponse: { kind: ResponsePartKind.Markdown, id: 'nested-part', content: 'nested output' },
+				discoveryOnOuter: [{ type: ToolResultContentType.Subagent, resource: nestedUri, title: 'Plan', agentName: 'Plan', description: undefined }],
+				topLevelHasNestedToolCall: false,
+			});
+		});
+
+		test('late output for a completed subagent chat opens its next turn instead of being dropped', () => {
+			// E6: a background subagent can still report after the signal that
+			// closed its chat. The chat stays registered exactly so it can take
+			// another turn; dropping the output loses it with nothing to show
+			// for it.
+			setupSession();
+			startTurn('turn-1');
+			disposables.add(sideEffects.registerProgressListener(agent));
+
+			agent.fireProgress({ kind: 'action', resource: URI.parse(defaultChatUri), action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 'tc-late', toolName: 'runSubagent', displayName: 'Run Subagent', contributor: undefined, _meta: { toolKind: undefined, language: undefined } } });
+			agent.fireProgress({ kind: 'subagent_started', chat: URI.parse(defaultChatUri), toolCallId: 'tc-late', agentName: 'helper', agentDisplayName: 'Helper', agentDescription: 'Helps' });
+			agent.fireProgress({ kind: 'subagent_completed', chat: URI.parse(defaultChatUri), toolCallId: 'tc-late' });
+
+			const subagentUri = buildSubagentChatUri(sessionUri.toString(), 'tc-late');
+			assert.strictEqual(stateManager.getSessionState(subagentUri)?.activeTurn, undefined, 'the subagent chat starts this scenario closed');
+
+			agent.fireProgress({
+				kind: 'action',
+				resource: URI.parse(defaultChatUri),
+				parentToolCallId: 'tc-late',
+				action: {
+					type: ActionType.ChatResponsePart,
+					turnId: 'turn-1',
+					part: { kind: ResponsePartKind.Markdown, id: 'late-part', content: 'audit finding' },
+				},
+			});
+
+			const subState = stateManager.getSessionState(subagentUri);
+			assert.deepStrictEqual({
+				response: subState?.activeTurn?.responseParts[0],
+				completedTurns: subState?.turns.length,
+			}, {
+				response: { kind: ResponsePartKind.Markdown, id: 'late-part', content: 'audit finding' },
 				completedTurns: 1,
 			});
 		});

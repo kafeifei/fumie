@@ -47,7 +47,15 @@ const MAX_BATCH_BYTES = 1024 * 1024;
 // the GC pressure these logs are meant to help diagnose. When a serialized
 // entry exceeds this size we re-serialize it with oversized string values
 // elided so the line stays well-formed JSONL.
-const MAX_LOG_LINE_LENGTH = 1024 * 1024;
+//
+// Counted in UTF-16 code units, because that is what `String.length` gives us
+// for free — measuring the encoded byte length would mean encoding the very
+// multi-MB string we are trying not to materialize. UTF-8 uses at most 3 bytes
+// per code unit, so this budget caps a written line at ~1 MiB. Keeping the old
+// 1 Mi-code-unit value meant CJK-heavy traffic (~2 bytes per unit) sailed past
+// it: a tool-call stream carrying Chinese text wrote 1.24 MB lines, 78 MB per
+// log file, without ever tripping the trim.
+const MAX_LOG_LINE_LENGTH = 340 * 1024;
 // When trimming an oversized entry, individual string values are capped to this
 // length. Generous enough to keep messages useful for debugging.
 const MAX_LOGGED_STRING_LENGTH = 16 * 1024;
@@ -65,6 +73,7 @@ export class AhpJsonlLogger extends Disposable {
 	private _queue = Promise.resolve();
 	private _pending: VSBuffer[] = [];
 	private _drainScheduled = false;
+	private _stopped = false;
 	private _folderCreated: Promise<IFileStatWithMetadata> | undefined;
 
 	constructor(
@@ -87,6 +96,9 @@ export class AhpJsonlLogger extends Disposable {
 	}
 
 	log(message: object, dir: AhpLogDirection, byteLength?: number): void {
+		if (this._stopped) {
+			return;
+		}
 		const meta: IAhpLogMeta = {
 			ts: new Date().toISOString(),
 			dir,
@@ -124,7 +136,14 @@ export class AhpJsonlLogger extends Disposable {
 		}
 		this._drainScheduled = true;
 		this._queue = this._queue.then(() => this._drainPending()).catch(error => {
-			this._logService.error('[AHPLog] Failed to write transport log', error);
+			// The destination never comes back: on web the shared IndexedDB is
+			// closed for the rest of the page's life as soon as shutdown starts,
+			// and a failed folder creation is memoized. These logs are best-effort
+			// diagnostics, so report once and stop rather than failing again for
+			// every message that still arrives.
+			this._stopped = true;
+			this._pending = [];
+			this._logService.warn('[AHPLog] Stopped writing transport log', error);
 		});
 	}
 
@@ -205,6 +224,12 @@ export class AhpJsonlLogger extends Disposable {
 		} catch {
 			return 0;
 		}
+	}
+
+	override dispose(): void {
+		this._stopped = true;
+		this._pending = [];
+		super.dispose();
 	}
 }
 

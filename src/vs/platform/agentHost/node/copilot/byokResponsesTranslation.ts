@@ -3,9 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { decodeBase64 } from '../../../../base/common/buffer.js';
 import {
-	ByokLmImageMimeType,
 	IByokLmChatRequest,
 	IByokLmChatResult,
 	IByokLmContentPart,
@@ -13,6 +11,14 @@ import {
 	IByokLmOutputItem,
 	IByokLmTool,
 } from '../../common/agentHostByokLm.js';
+import {
+	ByokWireErrorType,
+	ByokWireTranslationError,
+	imagePartFromDataUrl,
+	nextWireId,
+	requiredString,
+	sseEvent,
+} from './byokWireCommon.js';
 
 interface IResponsesContentPart {
 	readonly type?: string;
@@ -23,19 +29,6 @@ interface IResponsesContentPart {
 interface IResponsesSummaryPart {
 	readonly type?: string;
 	readonly text?: string;
-}
-
-function isSupportedImageMimeType(mimeType: string): mimeType is ByokLmImageMimeType {
-	switch (mimeType) {
-		case 'image/png':
-		case 'image/jpeg':
-		case 'image/gif':
-		case 'image/webp':
-		case 'image/bmp':
-			return true;
-		default:
-			return false;
-	}
 }
 
 interface IResponsesInputItem {
@@ -74,8 +67,6 @@ export interface IResponsesRequest {
 	readonly [key: string]: unknown;
 }
 
-export class ResponsesTranslationError extends Error { }
-
 function toBridgeRole(role: string | undefined): 'system' | 'developer' | 'user' | 'assistant' {
 	switch (role) {
 		case 'system':
@@ -84,7 +75,7 @@ function toBridgeRole(role: string | undefined): 'system' | 'developer' | 'user'
 		case 'user':
 			return role;
 		default:
-			throw new ResponsesTranslationError(`Unsupported message role '${role ?? ''}'`);
+			throw new ByokWireTranslationError(`Unsupported message role '${role ?? ''}'`);
 	}
 }
 
@@ -100,33 +91,10 @@ function toContentParts(content: string | IResponsesContentPart[] | undefined, i
 			return { type: 'text' as const, text: part.text };
 		}
 		if (part.type === 'input_image' && typeof part.image_url === 'string') {
-			const match = /^data:(?<mimeType>image\/[^;,]+)(?:;[^,]*)?;base64,(?<data>.*)$/.exec(part.image_url);
-			if (match?.groups) {
-				if (!isSupportedImageMimeType(match.groups.mimeType)) {
-					throw new ResponsesTranslationError(`Unsupported input[${itemIndex}].content[${contentIndex}].image_url MIME type '${match.groups.mimeType}'`);
-				}
-				try {
-					decodeBase64(match.groups.data);
-				} catch {
-					throw new ResponsesTranslationError(`Invalid input[${itemIndex}].content[${contentIndex}].image_url`);
-				}
-				return {
-					type: 'image' as const,
-					mimeType: match.groups.mimeType,
-					data: match.groups.data,
-				};
-			}
-			throw new ResponsesTranslationError(`Unsupported input[${itemIndex}].content[${contentIndex}].image_url`);
+			return imagePartFromDataUrl(part.image_url, `input[${itemIndex}].content[${contentIndex}].image_url`);
 		}
-		throw new ResponsesTranslationError(`Unsupported input[${itemIndex}].content[${contentIndex}] type '${part.type ?? ''}'`);
+		throw new ByokWireTranslationError(`Unsupported input[${itemIndex}].content[${contentIndex}] type '${part.type ?? ''}'`);
 	});
-}
-
-function requiredString(value: string | undefined, path: string): string {
-	if (!value) {
-		throw new ResponsesTranslationError(`${path} is required`);
-	}
-	return value;
 }
 
 function toBridgeInputItem(item: IResponsesInputItem, index: number): IByokLmInputItem {
@@ -143,7 +111,7 @@ function toBridgeInputItem(item: IResponsesInputItem, index: number): IByokLmInp
 				id: item.id,
 				summary: (item.summary ?? []).map((part, summaryIndex) => {
 					if (part.type !== 'summary_text' || typeof part.text !== 'string') {
-						throw new ResponsesTranslationError(`Unsupported input[${index}].summary[${summaryIndex}]`);
+						throw new ByokWireTranslationError(`Unsupported input[${index}].summary[${summaryIndex}]`);
 					}
 					return part.text;
 				}),
@@ -176,7 +144,7 @@ function toBridgeInputItem(item: IResponsesInputItem, index: number): IByokLmInp
 				output: item.output ?? '',
 			};
 		default:
-			throw new ResponsesTranslationError(`Unsupported input[${index}] type '${item.type ?? ''}'`);
+			throw new ByokWireTranslationError(`Unsupported input[${index}] type '${item.type ?? ''}'`);
 	}
 }
 
@@ -200,7 +168,7 @@ function toBridgeTools(tools: IResponsesTool[] | undefined): IByokLmTool[] | und
 					description: tool.description,
 				};
 			default:
-				throw new ResponsesTranslationError(`Unsupported tools[${index}] type '${tool.type ?? ''}'`);
+				throw new ByokWireTranslationError(`Unsupported tools[${index}] type '${tool.type ?? ''}'`);
 		}
 	});
 }
@@ -239,17 +207,6 @@ export function responsesRequestToBridge(vendor: string, body: IResponsesRequest
 	};
 }
 
-let responseCounter = 0;
-
-function nextId(prefix: string): string {
-	responseCounter = (responseCounter + 1) % Number.MAX_SAFE_INTEGER;
-	return `${prefix}_byok_${Date.now().toString(36)}_${responseCounter.toString(36)}`;
-}
-
-function sseEvent(eventName: string, data: unknown): string {
-	return `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
 type ResponsesOutputItem =
 	| { readonly id: string; readonly type: 'message'; readonly role: 'assistant'; readonly status: 'completed'; readonly content: Array<{ readonly type: 'output_text'; readonly text: string; readonly annotations: unknown[]; readonly logprobs: unknown[] }> }
 	| { readonly id: string; readonly type: 'reasoning'; readonly status: 'completed'; readonly summary: Array<{ readonly type: 'summary_text'; readonly text: string }>; readonly encrypted_content: string | null }
@@ -273,7 +230,7 @@ function toResponsesOutputItem(item: IByokLmOutputItem): ResponsesOutputItem {
 	switch (item.type) {
 		case 'message':
 			return {
-				id: nextId('msg'),
+				id: nextWireId('msg'),
 				type: 'message',
 				role: 'assistant',
 				status: 'completed',
@@ -281,7 +238,7 @@ function toResponsesOutputItem(item: IByokLmOutputItem): ResponsesOutputItem {
 			};
 		case 'reasoning':
 			return {
-				id: item.id?.startsWith('rs') ? item.id : nextId('rs'),
+				id: item.id?.startsWith('rs') ? item.id : nextWireId('rs'),
 				type: 'reasoning',
 				status: 'completed',
 				summary: item.summary.map(text => ({ type: 'summary_text', text })),
@@ -289,7 +246,7 @@ function toResponsesOutputItem(item: IByokLmOutputItem): ResponsesOutputItem {
 			};
 		case 'function_call':
 			return {
-				id: nextId('fc'),
+				id: nextWireId('fc'),
 				type: 'function_call',
 				status: 'completed',
 				call_id: item.callId,
@@ -298,7 +255,7 @@ function toResponsesOutputItem(item: IByokLmOutputItem): ResponsesOutputItem {
 			};
 		case 'custom_tool_call':
 			return {
-				id: nextId('ctc'),
+				id: nextWireId('ctc'),
 				type: 'custom_tool_call',
 				status: 'completed',
 				call_id: item.callId,
@@ -338,7 +295,7 @@ function responseEnvelope(responseId: string, model: string, status: 'in_progres
 }
 
 function prepareResponse(result: IByokLmChatResult, model: string) {
-	const responseId = result.responseId ?? nextId('resp');
+	const responseId = result.responseId ?? nextWireId('resp');
 	const output = result.output.map(toResponsesOutputItem);
 	const inputTokens = result.usage?.inputTokens ?? 0;
 	const outputTokens = result.usage?.outputTokens ?? 0;
@@ -520,6 +477,10 @@ export function bridgeResultToResponsesSseFrames(result: IByokLmChatResult, mode
 	return frames;
 }
 
-export function responsesErrorBody(message: string, type = 'api_error'): string {
+/**
+ * The OpenAI error envelope, shared by the Responses and Chat Completions
+ * routes (both SDKs read `error.message`).
+ */
+export function responsesErrorBody(message: string, type: ByokWireErrorType = 'api_error'): string {
 	return JSON.stringify({ error: { message, type } });
 }

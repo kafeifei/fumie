@@ -4,8 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { assertNever } from '../../../../base/common/assert.js';
+import { disposableTimeout } from '../../../../base/common/async.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
-import { Disposable, IReference } from '../../../../base/common/lifecycle.js';
+import { Disposable, IDisposable, IReference } from '../../../../base/common/lifecycle.js';
 import { ResourceMap } from '../../../../base/common/map.js';
 import { IObservable, observableFromEvent } from '../../../../base/common/observable.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -795,7 +796,21 @@ export class AnnotationsStateSubscription extends BaseAgentSubscription<Annotati
 	}
 }
 
-type ManagedSubscriptionEntry = { sub: ManagedSubscription; kind: StateComponents; refCount: number; holders: Map<number, string> };
+type ManagedSubscriptionEntry = {
+	sub: ManagedSubscription;
+	kind: StateComponents;
+	refCount: number;
+	holders: Map<number, string>;
+	phase: 'waitingCreate' | 'subscribing' | 'settled';
+	releaseTimer?: IDisposable;
+	releaseExpired: boolean;
+	localDisposed: boolean;
+	unsubscribeSent: boolean;
+	unsubscribeAfterSubscribe: boolean;
+};
+
+const DEFAULT_SUBSCRIPTION_RELEASE_GRACE_MS = 5_000;
+const DEFAULT_MAX_IDLE_SUBSCRIPTIONS = 64;
 
 // --- Subscription Manager ----------------------------------------------------
 
@@ -805,7 +820,11 @@ type ManagedSubscriptionEntry = { sub: ManagedSubscription; kind: StateComponent
  *
  * Provides refcounted access via {@link getSubscription} — the subscription
  * is created on first acquire, subscribes to the server, and stays alive
- * until the last reference is disposed.
+ * through a short, bounded release grace after the last reference is disposed.
+ * This lets transient sequential readers and rapid session switches reuse the
+ * same in-flight request or hydrated snapshot. Settled idle subscriptions are
+ * time- and entry-bounded; an already-issued subscribe remains retained until
+ * its Promise settles so a matching unsubscribe cannot overtake it on the wire.
  *
  * The connection feeds action envelopes to all active subscriptions via
  * {@link receiveEnvelope}.
@@ -813,6 +832,7 @@ type ManagedSubscriptionEntry = { sub: ManagedSubscription; kind: StateComponent
 export class AgentSubscriptionManager extends Disposable {
 
 	private readonly _subscriptions = new ResourceMap<ManagedSubscriptionEntry>();
+	private readonly _idleSubscriptions = new Map<ManagedSubscriptionEntry, URI>();
 	private readonly _inflightCreates = new ResourceMap<Promise<unknown>>();
 	private _referenceOwnerIds = 0;
 	private readonly _rootState: RootStateSubscription;
@@ -828,6 +848,8 @@ export class AgentSubscriptionManager extends Disposable {
 		log: (msg: string) => void,
 		subscribe: (resource: URI) => Promise<IStateSnapshot>,
 		unsubscribe: (resource: URI) => void,
+		private readonly _releaseGraceMs: number = DEFAULT_SUBSCRIPTION_RELEASE_GRACE_MS,
+		private readonly _maxIdleSubscriptions: number = DEFAULT_MAX_IDLE_SUBSCRIPTIONS,
 	) {
 		super();
 		this._clientId = clientId;
@@ -875,6 +897,9 @@ export class AgentSubscriptionManager extends Disposable {
 	 * for the Promise before issuing the wire-level subscribe.
 	 */
 	trackSessionCreate(resource: URI, promise: Promise<unknown>): void {
+		if (this._store.isDisposed) {
+			return;
+		}
 		this._inflightCreates.set(resource, promise);
 		// This branch only observes settlement to evict the inflight entry; the
 		// `createSession` caller (and the server, via logService.error) owns the
@@ -899,14 +924,19 @@ export class AgentSubscriptionManager extends Disposable {
 	 * acquiring class name.
 	 */
 	getSubscription<T>(kind: StateComponents, resource: URI, owner: string): IReference<IAgentSubscription<T>> {
+		if (this._store.isDisposed) {
+			throw new Error('AgentSubscriptionManager is disposed');
+		}
 		const existing = this._subscriptions.get(resource);
 		if (existing) {
-			if (existing.sub.value instanceof Error) {
+			if (existing.sub.value instanceof Error && existing.phase === 'settled') {
 				// Failed subscriptions should not poison the resource forever. Evict
-				// the errored entry so this acquire performs a fresh subscribe.
-				this._subscriptions.delete(resource);
-				this._disposeSubscriptionEntry(resource, existing);
+				// the settled errored entry so this acquire performs a fresh subscribe.
+				// An in-flight subscribe cannot be replaced without risking an
+				// unsubscribe-before-subscribe wire race, so pending entries are shared.
+				this._finalizeSubscriptionEntry(resource, existing, true);
 			} else {
+				this._cancelScheduledRelease(existing);
 				existing.refCount++;
 				return this._acquireReference<T>(resource, existing, owner);
 			}
@@ -915,7 +945,17 @@ export class AgentSubscriptionManager extends Disposable {
 		// Create new subscription based on caller-specified kind
 		const key = resource.toString();
 		const sub = this._createSubscription(kind, key);
-		const entry: ManagedSubscriptionEntry = { sub, kind, refCount: 1, holders: new Map() };
+		const entry: ManagedSubscriptionEntry = {
+			sub,
+			kind,
+			refCount: 1,
+			holders: new Map(),
+			phase: 'waitingCreate',
+			releaseExpired: false,
+			localDisposed: false,
+			unsubscribeSent: false,
+			unsubscribeAfterSubscribe: false,
+		};
 		this._subscriptions.set(resource, entry);
 
 		// Kick off server subscription asynchronously.
@@ -932,6 +972,13 @@ export class AgentSubscriptionManager extends Disposable {
 					// subscription, matching the no-inflight path.
 				}
 			}
+			// The last reference may have expired while an eager session create was
+			// still pending, or the manager may have been disposed. Do not create a
+			// wire subscription that no live entry can own.
+			if (this._subscriptions.get(resource) !== entry || entry.localDisposed) {
+				return;
+			}
+			entry.phase = 'subscribing';
 			try {
 				const snapshot = await this._subscribe(resource);
 				if (this._subscriptions.get(resource) === entry) {
@@ -940,6 +987,13 @@ export class AgentSubscriptionManager extends Disposable {
 			} catch (err) {
 				if (this._subscriptions.get(resource) === entry) {
 					sub.setError(err instanceof Error ? err : new Error(String(err)));
+				}
+			} finally {
+				entry.phase = 'settled';
+				if (entry.unsubscribeAfterSubscribe) {
+					this._disposeSubscriptionEntry(resource, entry, true);
+				} else if (this._subscriptions.get(resource) === entry && entry.refCount <= 0 && entry.releaseExpired) {
+					this._finalizeSubscriptionEntry(resource, entry, true);
 				}
 			}
 		})();
@@ -971,12 +1025,87 @@ export class AgentSubscriptionManager extends Disposable {
 		};
 	}
 
-	private _disposeSubscriptionEntry(resource: URI, entry: ManagedSubscriptionEntry): void {
-		this._tryUnsubscribe(resource);
-		if (entry.sub instanceof SessionStateSubscription || entry.sub instanceof ChatStateSubscription || entry.sub instanceof AnnotationsStateSubscription) {
-			entry.sub.clearPending();
+	private _cancelScheduledRelease(entry: ManagedSubscriptionEntry): void {
+		entry.releaseTimer?.dispose();
+		entry.releaseTimer = undefined;
+		entry.releaseExpired = false;
+		this._idleSubscriptions.delete(entry);
+	}
+
+	private _scheduleSubscriptionRelease(resource: URI, entry: ManagedSubscriptionEntry): void {
+		this._cancelScheduledRelease(entry);
+		if (this._releaseGraceMs <= 0 || this._maxIdleSubscriptions <= 0) {
+			this._expireSubscriptionRelease(resource, entry);
+			return;
 		}
-		entry.sub.dispose();
+
+		const releaseTimer = disposableTimeout(() => {
+			if (entry.releaseTimer === releaseTimer) {
+				entry.releaseTimer = undefined;
+			}
+			releaseTimer.dispose();
+			this._expireSubscriptionRelease(resource, entry);
+		}, this._releaseGraceMs);
+		entry.releaseTimer = releaseTimer;
+		this._idleSubscriptions.set(entry, resource);
+
+		while (this._idleSubscriptions.size > this._maxIdleSubscriptions) {
+			const oldest = this._idleSubscriptions.entries().next().value as [ManagedSubscriptionEntry, URI] | undefined;
+			if (!oldest) {
+				break;
+			}
+			oldest[0].releaseTimer?.dispose();
+			oldest[0].releaseTimer = undefined;
+			this._expireSubscriptionRelease(oldest[1], oldest[0]);
+		}
+	}
+
+	private _expireSubscriptionRelease(resource: URI, entry: ManagedSubscriptionEntry): void {
+		this._idleSubscriptions.delete(entry);
+		if (this._subscriptions.get(resource) !== entry || entry.refCount > 0) {
+			return;
+		}
+
+		entry.releaseExpired = true;
+		switch (entry.phase) {
+			case 'waitingCreate':
+				// No subscribe was sent yet. Removing the entry makes the post-create
+				// identity guard skip it without emitting an unmatched unsubscribe.
+				this._finalizeSubscriptionEntry(resource, entry, false);
+				break;
+			case 'subscribing':
+				// A wire request cannot be cancelled. Keep this tombstone until it
+				// settles so unsubscribe is ordered after subscribe.
+				break;
+			case 'settled':
+				this._finalizeSubscriptionEntry(resource, entry, true);
+				break;
+		}
+	}
+
+	private _finalizeSubscriptionEntry(resource: URI, entry: ManagedSubscriptionEntry, unsubscribe: boolean): void {
+		if (this._subscriptions.get(resource) === entry) {
+			this._subscriptions.delete(resource);
+		}
+		this._disposeSubscriptionEntry(resource, entry, unsubscribe);
+	}
+
+	private _disposeSubscriptionEntry(resource: URI, entry: ManagedSubscriptionEntry, unsubscribe: boolean): void {
+		entry.releaseTimer?.dispose();
+		entry.releaseTimer = undefined;
+		this._idleSubscriptions.delete(entry);
+
+		if (unsubscribe && !entry.unsubscribeSent) {
+			entry.unsubscribeSent = true;
+			this._tryUnsubscribe(resource);
+		}
+		if (!entry.localDisposed) {
+			entry.localDisposed = true;
+			if (entry.sub instanceof SessionStateSubscription || entry.sub instanceof ChatStateSubscription || entry.sub instanceof AnnotationsStateSubscription) {
+				entry.sub.clearPending();
+			}
+			entry.sub.dispose();
+		}
 	}
 
 	private _tryUnsubscribe(resource: URI): void {
@@ -1133,7 +1262,10 @@ export class AgentSubscriptionManager extends Disposable {
 	markSubscriptionsMissing(missing: readonly URI[]): void {
 		for (const resource of missing) {
 			const entry = this._subscriptions.get(resource);
-			if (entry) {
+			if (entry?.phase === 'settled') {
+				// A subscribe already in flight owns its eventual wire ordering. Let it
+				// settle before it can be replaced, otherwise a reacquire could send an
+				// unsubscribe and replacement subscribe ahead of the original request.
 				if (entry.sub instanceof SessionStateSubscription || entry.sub instanceof ChatStateSubscription || entry.sub instanceof AnnotationsStateSubscription) {
 					entry.sub.clearPending();
 				}
@@ -1170,17 +1302,24 @@ export class AgentSubscriptionManager extends Disposable {
 		}
 		entry.refCount--;
 		if (entry.refCount <= 0) {
-			this._subscriptions.delete(resource);
-			this._disposeSubscriptionEntry(resource, entry);
+			this._scheduleSubscriptionRelease(resource, entry);
 		}
 	}
 
 	override dispose(): void {
 		for (const [resource, entry] of this._subscriptions) {
-			this._tryUnsubscribe(resource);
-			entry.sub.dispose();
+			if (entry.phase === 'subscribing') {
+				// The request may reach the server after dispose. Defer the wire
+				// unsubscribe until its Promise settles to preserve protocol order.
+				entry.unsubscribeAfterSubscribe = true;
+				this._disposeSubscriptionEntry(resource, entry, false);
+			} else {
+				this._disposeSubscriptionEntry(resource, entry, entry.phase === 'settled');
+			}
 		}
 		this._subscriptions.clear();
+		this._idleSubscriptions.clear();
+		this._inflightCreates.clear();
 		super.dispose();
 	}
 }

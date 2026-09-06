@@ -4,9 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { distinct } from '../../../../../base/common/arrays.js';
+import { IAction } from '../../../../../base/common/actions.js';
 import { IMatch, IFilter, or, matchesCamelCase, matchesWords, matchesBaseContiguousSubString } from '../../../../../base/common/filters.js';
 import { Emitter } from '../../../../../base/common/event.js';
-import { getLanguageModelProviderDisplayName, ILanguageModelChatMetadata, ILanguageModelsService, ILanguageModelProviderDescriptor, ILanguageModelChatMetadataAndIdentifier } from '../../../chat/common/languageModels.js';
+import { getLanguageModelProviderDisplayName, ILanguageModelChatMetadata, ILanguageModelsService, ILanguageModelProviderDescriptor, ILanguageModelChatMetadataAndIdentifier, parseByokModelIdentifierGroup } from '../../../chat/common/languageModels.js';
 import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { ILanguageModelsProviderGroup } from '../../common/languageModelsConfiguration.js';
 import Severity from '../../../../../base/common/severity.js';
@@ -37,6 +38,17 @@ export interface ILanguageModelProvider {
 	group: ILanguageModelsProviderGroup;
 	sourceId?: string;
 	sourcePresentation?: ILanguageModelSourcePresentation;
+	/**
+	 * Whether {@link group} is an entry the user actually has in the models
+	 * configuration file, as opposed to one synthesized for display — a BYOK
+	 * model's upstream vendor, a model group's transport, or a vendor's own name
+	 * standing in for a group that was never configured.
+	 *
+	 * Group commands address a group by `(vendor, name)` in that file, so they
+	 * only mean anything for a real entry. Offering Rename or Delete on a
+	 * synthesized row gives the user a button that silently does nothing.
+	 */
+	isConfiguredGroup?: boolean;
 }
 
 export interface ILanguageModel extends ILanguageModelChatMetadataAndIdentifier {
@@ -46,6 +58,36 @@ export interface ILanguageModel extends ILanguageModelChatMetadataAndIdentifier 
 
 export function getManageModelsProviderLabel(model: ILanguageModel): string {
 	return model.provider.group.name;
+}
+
+/**
+ * Whether a provider row may offer the group commands (Open in JSON, Rename,
+ * Delete, …).
+ *
+ * They address a group by `(vendor, name)` in the models configuration file, so
+ * they need both a vendor configured through that file and a row that is a real
+ * entry in it. A synthesized row — a BYOK model's upstream vendor, or a
+ * transport group like the `openai` prefix a subscription model carries —
+ * inherits the descriptor of whichever vendor published its models, so the
+ * vendor half alone would arm Delete on a group the file has never heard of.
+ */
+export function canManageProviderGroup(provider: ILanguageModelProvider): boolean {
+	return !!provider.vendor.configuration && !!provider.isConfiguredGroup;
+}
+
+/**
+ * Whether a row's visibility is the agent host's to state rather than this window's.
+ *
+ * True for an agent-host copy of a BYOK model that is listed in its own right, i.e. one
+ * whose original is not registered here — the Agents window in a browser. The host holds
+ * the provider configuration and the Manage Models state that goes with it, so the row
+ * shows what the host reports and this window's own hidden set is left out of it: keeping
+ * a second set for the same model could only ever diverge from the first. Hiding from
+ * here means asking the host to hide, which is not wired up yet
+ * (`docs/architecture.md`).
+ */
+function isHostOwnedVisibility(metadata: ILanguageModelChatMetadata): boolean {
+	return metadata.byokModelIdentifier !== undefined;
 }
 
 export interface ILanguageModelEntry {
@@ -83,6 +125,9 @@ export interface IStatusEntry {
 	id: string;
 	message: string;
 	severity: Severity;
+	action?: IAction;
+	/** See {@link ILanguageModelProviderStatus.explicitActionOnly}. */
+	explicitActionOnly?: boolean;
 }
 
 export interface ILanguageModelEntriesGroup {
@@ -124,10 +169,11 @@ export class ChatModelsViewModel extends Disposable {
 	readonly onDidChangeGrouping = this._onDidChangeGrouping.event;
 
 	private languageModels: ILanguageModel[];
-	private languageModelGroupStatuses: Array<{ provider: ILanguageModelProvider; status: { severity: Severity; message: string } }> = [];
+	private languageModelGroupStatuses: Array<{ provider: ILanguageModelProvider; status: { severity: Severity; message: string; action?: IAction; explicitActionOnly?: boolean } }> = [];
 	private languageModelGroups: ILanguageModelEntriesGroup[] = [];
 
 	private readonly collapsedGroups = new Set<string>();
+	private readonly seenGroups = new Set<string>();
 	private searchValue: string = '';
 	private modelsSorted: boolean = false;
 
@@ -188,7 +234,9 @@ export class ChatModelsViewModel extends Disposable {
 			|| this.languageModelGroups.some(group => isLanguageModelProviderEntry(group.group) && group.group.sourcePresentation !== undefined);
 
 		for (const group of this.languageModelGroups) {
-			if (this.collapsedGroups.has(group.group.id)) {
+			// A collapsed group without a visible header row would make its
+			// models unreachable, so collapsing only applies with headers.
+			if (shouldShowGroupHeaders && this.collapsedGroups.has(group.group.id)) {
 				group.group.collapsed = true;
 				if (shouldShowGroupHeaders) {
 					viewModelEntries.push(group.group);
@@ -350,7 +398,16 @@ export class ChatModelsViewModel extends Disposable {
 	private groupModels(languageModels: ILanguageModel[]): ILanguageModelEntriesGroup[] {
 		const result: ILanguageModelEntriesGroup[] = [];
 		if (this.groupBy === ChatModelGroup.Vendor) {
+			// One row per model. Identifiers are unique per registered model, so this
+			// only bites for agent-host BYOK copies keyed by their shared original:
+			// every agent that can run the model contributes one, and the provider's
+			// group must list it once, as it would if the provider were configured here.
+			const placed = new Set<string>();
 			for (const model of languageModels) {
+				if (placed.has(model.identifier)) {
+					continue;
+				}
+				placed.add(model.identifier);
 				const groupId = this.getProviderGroupId(model.provider);
 				let group = result.find(group => group.group.id === groupId);
 				if (!group) {
@@ -406,6 +463,15 @@ export class ChatModelsViewModel extends Disposable {
 
 	private createLanguageModelProviderEntry(provider: ILanguageModelProvider): ILanguageModelProviderEntry {
 		const id = this.getProviderGroupId(provider);
+		// Provider groups start collapsed the first time they appear (vendors
+		// resolve asynchronously, so seeding happens per group, not once).
+		// While a search is active the group must stay expanded to show matches.
+		if (!this.seenGroups.has(id)) {
+			this.seenGroups.add(id);
+			if (!this.searchValue) {
+				this.collapsedGroups.add(id);
+			}
+		}
 		return {
 			type: 'vendor',
 			id,
@@ -418,12 +484,20 @@ export class ChatModelsViewModel extends Disposable {
 		};
 	}
 
+	/**
+	 * The vendors this list is about. A vendor marked `hiddenFromManagement` is
+	 * dropped here rather than at render time, so it takes its models with it —
+	 * and with them the groups derived from those models, such as a ChatGPT
+	 * source row, which exist only for as long as something is in them.
+	 */
 	getVendors(): ILanguageModelProviderDescriptor[] {
-		return [...this.languageModelsService.getVendors()].sort((a, b) => {
-			if (a.isDefault) { return -1; }
-			if (b.isDefault) { return 1; }
-			return a.displayName.localeCompare(b.displayName);
-		});
+		return this.languageModelsService.getVendors()
+			.filter(vendor => !vendor.hiddenFromManagement)
+			.sort((a, b) => {
+				if (a.isDefault) { return -1; }
+				if (b.isDefault) { return 1; }
+				return a.displayName.localeCompare(b.displayName);
+			});
 	}
 
 	async refresh(): Promise<void> {
@@ -466,14 +540,17 @@ export class ChatModelsViewModel extends Disposable {
 					vendor: vendor.vendor,
 					name: vendor.displayName
 				},
-				vendor
+				vendor,
+				isConfiguredGroup: !!group.group
 			};
 			if (group.status) {
 				this.languageModelGroupStatuses.push({
 					provider: defaultProvider,
 					status: {
 						message: group.status.message,
-						severity: group.status.severity
+						severity: group.status.severity,
+						action: group.status.action,
+						explicitActionOnly: group.status.explicitActionOnly
 					}
 				});
 			}
@@ -486,17 +563,44 @@ export class ChatModelsViewModel extends Disposable {
 					continue;
 				}
 				// Agent-host BYOK models are copies of the user's own BYOK models surfaced
-				// by an agent host (e.g. Copilot CLI). They already appear under their real
-				// provider group, so listing them again under the agent-host vendor would
-				// duplicate the entire BYOK catalogue (e.g. hundreds of OpenRouter models
-				// under "Copilot"). Skip them here.
-				if (ILanguageModelChatMetadata.getAgentHostByokManageModelsIdentifier(metadata) !== undefined) {
+				// by an agent host (e.g. Copilot CLI). Where the original is registered here
+				// it already has a row under its real provider group, so listing the copies
+				// too would duplicate the entire BYOK catalogue (e.g. hundreds of OpenRouter
+				// models under "Copilot"). Skip them there. A window that reaches the
+				// catalogue only through a host — the Agents window in a browser — has no
+				// original to defer to, so the copy is the row: it keeps the provider name
+				// carried in the identifier, and is keyed by that identifier so one toggle
+				// covers every agent that offers the same model.
+				const byokIdentifier = ILanguageModelChatMetadata.getAgentHostByokManageModelsIdentifier(metadata);
+				if (byokIdentifier !== undefined && this.languageModelsService.lookupLanguageModel(byokIdentifier)) {
 					continue;
 				}
+				const byokGroup = byokIdentifier !== undefined ? parseByokModelIdentifierGroup(byokIdentifier) : undefined;
 				const sourcePresentation = metadata.modelGroup?.sourceId
 					? languageModelSourcePresentationRegistry.get(metadata.vendor, metadata.modelGroup.sourceId)
 					: undefined;
-				const provider = metadata.modelGroup ? {
+				// A session model's transport group is picker presentation (for example,
+				// Claude can offer the same subscription model through `anthropic` and
+				// `copilot`). Manage Models must keep those native subscription rows without
+				// manufacturing configurable transport Providers from their group ids. A
+				// trusted source presentation, such as ChatGPT subscription, remains its own
+				// explicit group; otherwise native session rows stay under the owning Agent.
+				//
+				// But only when there is no real group to fall into. A subscription provider
+				// the user added *has* a configured group — its own entry — and its models
+				// belong under that row. Deriving a separate group from their `modelGroup`
+				// (the ChatGPT transport, say) would strand every model in a phantom row with
+				// no delete, leaving the added provider empty. The derivation is for vendors
+				// with no configured group of their own, where the alternative is a bare
+				// source id. The picker keeps its own ChatGPT group regardless: it reads
+				// `modelGroup` and the source registry directly, untouched by this.
+				const provider = byokGroup ? {
+					vendor,
+					group: {
+						vendor: byokGroup.vendor,
+						name: byokGroup.name ?? getLanguageModelProviderDisplayName(this.languageModelsService, byokGroup.vendor),
+					},
+				} satisfies ILanguageModelProvider : !group.group && metadata.modelGroup && (metadata.targetChatSessionType === undefined || sourcePresentation !== undefined) ? {
 					vendor,
 					group: {
 						vendor: metadata.modelGroup.id,
@@ -505,11 +609,12 @@ export class ChatModelsViewModel extends Disposable {
 					sourceId: metadata.modelGroup.sourceId,
 					sourcePresentation,
 				} satisfies ILanguageModelProvider : defaultProvider;
+				const rowIdentifier = byokIdentifier ?? identifier;
 				models.push({
-					identifier,
+					identifier: rowIdentifier,
 					metadata,
 					provider,
-					hidden: this.languageModelsService.isModelHidden(identifier),
+					hidden: isHostOwnedVisibility(metadata) ? metadata.byokModelHidden === true : this.languageModelsService.isModelHidden(rowIdentifier),
 				});
 			}
 		}
@@ -528,19 +633,24 @@ export class ChatModelsViewModel extends Disposable {
 	}
 
 	toggleModelHidden(entry: ILanguageModelEntry): void {
-		this.languageModelsService.setModelHidden(entry.model.identifier, !entry.model.hidden);
+		this.setModelsHidden([entry], !entry.model.hidden);
 	}
 
 	toggleGroupHidden(entry: ILanguageModelProviderEntry): void {
-		this.languageModelsService.setModelsHidden(this.getModelsForGroup(entry).map(model => model.identifier), !entry.hidden);
+		this.languageModelsService.setModelsHidden(this.getModelsForGroup(entry).filter(model => !isHostOwnedVisibility(model.metadata)).map(model => model.identifier), !entry.hidden);
 	}
 
 	setModelsHidden(entries: readonly ILanguageModelEntry[], hidden: boolean): void {
-		this.languageModelsService.setModelsHidden(entries.map(entry => entry.model.identifier), hidden);
+		// Host-owned rows are skipped rather than stored: their state is the host's, and
+		// a local entry for them would show nowhere while quietly disagreeing with it.
+		this.languageModelsService.setModelsHidden(entries.filter(entry => !isHostOwnedVisibility(entry.model.metadata)).map(entry => entry.model.identifier), hidden);
 	}
 
 	private refreshVisibility(): void {
 		for (const model of this.languageModels) {
+			if (isHostOwnedVisibility(model.metadata)) {
+				continue;
+			}
 			model.hidden = this.languageModelsService.isModelHidden(model.identifier);
 		}
 		// Rebuild groups so provider/group header `hidden` reflects the new state.

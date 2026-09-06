@@ -9,7 +9,9 @@ import type { Personality } from './protocol/generated/Personality.js';
 import type { WebSearchMode } from './protocol/generated/WebSearchMode.js';
 import type { ModeKind } from './protocol/generated/ModeKind.js';
 import type { SandboxMode } from './protocol/generated/v2/SandboxMode.js';
-import { CodexSessionConfigKey, CODEX_DEFAULT_PERMISSIONS_PRESET, narrowCodexPermissionsPreset, presetForResolvedPermissions, resolveCodexPermissionsPreset, type CodexApprovalPolicy, type ICodexResolvedPermissions } from '../../common/codexSessionConfigKeys.js';
+import { CodexSessionConfigKey, CODEX_DEFAULT_PERMISSIONS_PRESET, narrowCodexPermissionsPreset, presetForResolvedPermissions, resolveCodexPermissionsPreset, type CodexApprovalPolicy, type CodexPermissionsPreset, type ICodexResolvedPermissions } from '../../common/codexSessionConfigKeys.js';
+import { codexPermissionsPresetForTier, narrowPermissionTier, permissionTierForCodexPreset } from '../../common/fumiePermissionTiers.js';
+import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 
 // Re-export the shared, protocol-free config-key surface so node callers can
 // keep importing everything from this module.
@@ -39,20 +41,33 @@ export function narrowSandboxMode(value: unknown): SandboxMode | undefined {
 }
 
 /**
+ * Read a session's permissions preset out of its stored config values. The
+ * platform {@link SessionConfigKey.AutoApprove} tier is the user-facing source
+ * of truth; a session persisted before the tier switch carries only the legacy
+ * {@link CodexSessionConfigKey.PermissionsPreset} key and is read from there.
+ */
+export function codexPermissionsPresetFromValues(values: Record<string, unknown> | undefined): CodexPermissionsPreset | undefined {
+	const tier = narrowPermissionTier(values?.[SessionConfigKey.AutoApprove]);
+	return tier !== undefined
+		? codexPermissionsPresetForTier(tier)
+		: narrowCodexPermissionsPreset(values?.[CodexSessionConfigKey.PermissionsPreset]);
+}
+
+/**
  * Resolve the Codex security axes (approval policy, sandbox, approvals
  * reviewer) for a session's stored config values.
  *
- * The user-facing {@link CodexSessionConfigKey.PermissionsPreset} is the source
- * of truth; when present it expands into all three axes. For backward
- * compatibility (older sessions / programmatic config) we fall back to the
- * individual {@link CodexSessionConfigKey.ApprovalPolicy} /
+ * The user-facing permissions preset is the source of truth; when present it
+ * expands into all three axes. For backward compatibility (older sessions /
+ * programmatic config) we fall back to the individual
+ * {@link CodexSessionConfigKey.ApprovalPolicy} /
  * {@link CodexSessionConfigKey.SandboxMode} keys with a `user` reviewer.
  */
 export function resolveCodexPermissions(
 	values: Record<string, unknown> | undefined,
 	defaults: { approvalPolicy: CodexApprovalPolicy; sandboxMode: SandboxMode },
 ): ICodexResolvedPermissions {
-	const preset = narrowCodexPermissionsPreset(values?.[CodexSessionConfigKey.PermissionsPreset]);
+	const preset = codexPermissionsPresetFromValues(values);
 	if (preset) {
 		return resolveCodexPermissionsPreset(preset);
 	}
@@ -76,8 +91,9 @@ export function resolveCodexPermissions(
  * session as `workspace-write`.
  *
  * The returned object contains ONLY the permission keys that should be present
- * afterwards, so callers should drop all three permission keys before applying
- * it:
+ * afterwards — the platform `autoApprove` tier or the raw axes — so callers
+ * should drop `autoApprove` and all three legacy permission keys before
+ * applying it:
  * - an explicitly chosen preset is kept as-is;
  * - legacy axes that map exactly onto a preset are migrated to that preset
  *   (single source of truth) and the raw axes dropped;
@@ -99,14 +115,14 @@ export function migrateCodexPermissionValues(
 	config: Record<string, unknown> | undefined,
 	defaults: { approvalPolicy: CodexApprovalPolicy; sandboxMode: SandboxMode },
 ): Record<string, string> {
-	const explicitPreset = narrowCodexPermissionsPreset(config?.[CodexSessionConfigKey.PermissionsPreset]);
+	const explicitPreset = codexPermissionsPresetFromValues(config);
 	if (explicitPreset) {
-		return { [CodexSessionConfigKey.PermissionsPreset]: explicitPreset };
+		return { [SessionConfigKey.AutoApprove]: permissionTierForCodexPreset(explicitPreset) };
 	}
 	const resolved = resolveCodexPermissions(config, defaults);
 	const equivalentPreset = presetForResolvedPermissions(resolved);
 	if (equivalentPreset) {
-		return { [CodexSessionConfigKey.PermissionsPreset]: equivalentPreset };
+		return { [SessionConfigKey.AutoApprove]: permissionTierForCodexPreset(equivalentPreset) };
 	}
 	// `read-only` is more locked-down than any preset's sandbox and cannot be
 	// represented by one, so preserve the raw axes — surfacing a preset here
@@ -121,9 +137,9 @@ export function migrateCodexPermissionValues(
 	// and the resolved axes stay consistent (`danger-full-access` → Full Access,
 	// any other non-exact `workspace-write` combo → Default Permissions).
 	return {
-		[CodexSessionConfigKey.PermissionsPreset]: resolved.sandboxMode === 'danger-full-access'
+		[SessionConfigKey.AutoApprove]: permissionTierForCodexPreset(resolved.sandboxMode === 'danger-full-access'
 			? 'full-access'
-			: CODEX_DEFAULT_PERMISSIONS_PRESET,
+			: CODEX_DEFAULT_PERMISSIONS_PRESET),
 	};
 }
 

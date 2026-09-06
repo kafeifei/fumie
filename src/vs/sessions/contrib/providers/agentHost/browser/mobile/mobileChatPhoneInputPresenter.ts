@@ -17,10 +17,10 @@ import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase 
 import { IToggleChatModeArgs, ToggleAgentModeActionId } from '../../../../../../workbench/contrib/chat/browser/actions/chatExecuteActions.js';
 import { ChatPhoneInputPresenterRequest, IChatPhoneInputPresenter, IChatPhoneInputSessionContext, IChatPhonePresenterImpl } from '../../../../../../workbench/contrib/chat/browser/widget/input/chatPhoneInputPresenter.js';
 import { IModePickerDelegate } from '../../../../../../workbench/contrib/chat/browser/widget/input/modePickerActionItem.js';
-import { IModelPickerDelegate } from '../../../../../../workbench/contrib/chat/browser/widget/input/modelPicker/modelPickerActionItem.js';
+import { IModelConfigurationAccess, IModelPickerDelegate } from '../../../../../../workbench/contrib/chat/browser/widget/input/modelPicker/modelPickerActionItem.js';
 import { getModelProviderIcon } from '../../../../../../workbench/contrib/chat/browser/widget/input/modelPicker/modelProviderIcons.js';
 import { IChatMode } from '../../../../../../workbench/contrib/chat/common/chatModes.js';
-import { ILanguageModelChatMetadataAndIdentifier } from '../../../../../../workbench/contrib/chat/common/languageModels.js';
+import { ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService } from '../../../../../../workbench/contrib/chat/common/languageModels.js';
 import { IWorkbenchLayoutService } from '../../../../../../workbench/services/layout/browser/layoutService.js';
 import { type IAgentHostSessionsProvider, isAgentHostProvider } from '../../../../../common/agentHostSessionsProvider.js';
 import { ISessionsService } from '../../../../../services/sessions/browser/sessionsService.js';
@@ -40,9 +40,123 @@ type ChatPhonePickerAction =
 	| { kind: 'mode'; mode: IChatMode }
 	| { kind: 'model'; model: ILanguageModelChatMetadataAndIdentifier }
 	| { kind: 'agentHostMode'; value: string }
-	| { kind: 'agentHostModel'; model: ILanguageModelChatMetadataAndIdentifier };
+	| { kind: 'agentHostModel'; model: ILanguageModelChatMetadataAndIdentifier }
+	| { kind: 'modelConfiguration'; modelIdentifier: string; property: string; value: unknown };
 
 type RegisterChatPhonePickerAction = (action: ChatPhonePickerAction) => string;
+
+const modelConfigurationGroupOrder = ['navigation', 'performance', 'tokens'] as const;
+
+/** Projects the same enum-based model configuration groups as the desktop picker into phone sheet rows. */
+export function createMobileModelConfigurationSheetItems(
+	model: ILanguageModelChatMetadataAndIdentifier | undefined,
+	currentConfig: Record<string, unknown>,
+	registerValue: (property: string, value: unknown) => string,
+): IMobilePickerSheetItem[] {
+	const properties = model?.metadata.configurationSchema?.properties;
+	if (!properties) {
+		return [];
+	}
+
+	const items: IMobilePickerSheetItem[] = [];
+	for (const group of modelConfigurationGroupOrder) {
+		const entry = Object.entries(properties).find(([, schema]) => schema.group === group && Array.isArray(schema.enum) && schema.enum.length > 0);
+		if (!entry) {
+			continue;
+		}
+		const [property, schema] = entry;
+		const currentValue = currentConfig[property] ?? schema.default;
+		const fallbackTitle = group === 'navigation'
+			? localize('chatPhoneInput.thinkingSection', "Thinking Effort")
+			: group === 'performance'
+				? localize('chatPhoneInput.performanceSection', "Speed")
+				: localize('chatPhoneInput.contextSection', "Context Size");
+		const sectionTitle = typeof schema.title === 'string' ? schema.title : fallbackTitle;
+		const defaultLabel = localize('chatPhoneInput.defaultDescription', "Default");
+		schema.enum!.forEach((value, index) => {
+			const enumDescription = schema.enumDescriptions?.[index];
+			const isDefault = value === schema.default;
+			items.push({
+				id: registerValue(property, value),
+				label: schema.enumItemLabels?.[index] ?? String(value),
+				description: isDefault
+					? enumDescription ? `${defaultLabel} · ${enumDescription}` : defaultLabel
+					: enumDescription,
+				checked: currentValue === value,
+				sectionTitle: index === 0 ? sectionTitle : undefined,
+			});
+		});
+	}
+	return items;
+}
+
+/**
+ * Mode and Model rows for an agent-host session.
+ *
+ * `selectedModelId` is what the input shows as selected, which is not always
+ * `session.modelId`: a session whose model was resolved for it never writes
+ * one through to the provider, so reading the provider alone leaves every row
+ * unchecked under a trigger label that names one of them. Falls back to the
+ * provider's model when the caller has no picker state to speak for.
+ */
+export function buildAgentHostSheetItems(
+	session: IChatPhoneInputSessionContext,
+	provider: IAgentHostSessionsProvider,
+	configurationAccess: IModelConfigurationAccess,
+	registerAction: RegisterChatPhonePickerAction,
+	selectedModelId: string | undefined,
+): IMobilePickerSheetItem[] {
+	const items: IMobilePickerSheetItem[] = [];
+	const config = provider.getSessionConfig(session.sessionId);
+	const modeSchema = config?.schema.properties[SessionConfigKey.Mode];
+	const modeItems = (modeSchema && isWellKnownModeSchema(modeSchema))
+		? (modeSchema.enum ?? []).map((value, index) => ({
+			value: String(value),
+			label: modeSchema.enumLabels?.[index] ?? String(value),
+			description: modeSchema.enumDescriptions?.[index],
+		}))
+		: [];
+	const rawCurrentMode = config?.values[SessionConfigKey.Mode] ?? modeSchema?.default;
+	const currentModeValue = typeof rawCurrentMode === 'string' && modeItems.some(item => item.value === rawCurrentMode)
+		? rawCurrentMode
+		: modeItems[0]?.value;
+
+	modeItems.forEach((item, index) => items.push({
+		id: registerAction({ kind: 'agentHostMode', value: item.value }),
+		label: item.label,
+		description: item.description,
+		icon: getAgentHostModeIcon(item.value),
+		checked: item.value === currentModeValue,
+		sectionTitle: index === 0 ? localize('chatPhoneInput.modeSection', "Agent Mode") : undefined,
+	}));
+
+	const models = provider.getModelsSnapshot(session.sessionId).models;
+	const currentModelId = selectedModelId ?? session.modelId;
+	models.forEach((model, index) => items.push({
+		id: registerAction({ kind: 'agentHostModel', model }),
+		label: model.metadata.name,
+		icon: getModelProviderIcon(model),
+		checked: model.identifier === currentModelId,
+		sectionTitle: index === 0 ? localize('chatPhoneInput.modelSection', "Model") : undefined,
+	}));
+	const currentModel = models.find(model => model.identifier === currentModelId);
+	items.push(...createMobileModelConfigurationSheetItems(
+		currentModel,
+		currentModel ? configurationAccess.getModelConfiguration(currentModel.identifier) ?? {} : {},
+		(property, value) => registerAction({ kind: 'modelConfiguration', modelIdentifier: currentModel!.identifier, property, value }),
+	));
+
+	const options = normalizeModelPickerOptions(provider.getModelPickerOptions(session.sessionId));
+	if (models.length === 0 && !options.showAutoModel) {
+		items.push({
+			id: 'chat-phone-picker-no-models',
+			label: localize('chatPhoneInput.noModels', "No models available"),
+			disabled: true,
+			sectionTitle: localize('chatPhoneInput.modelSection', "Model"),
+		});
+	}
+	return items;
+}
 
 /**
  * Sessions-side implementation of {@link IChatPhoneInputPresenter}.
@@ -66,6 +180,7 @@ class MobileChatPhoneInputPresenter extends Disposable implements IChatPhonePres
 		@ISessionsService private readonly _sessionsService: ISessionsService,
 		@ISessionsProvidersService private readonly _sessionsProvidersService: ISessionsProvidersService,
 		@IUriIdentityService private readonly _uriIdentityService: IUriIdentityService,
+		@ILanguageModelsService private readonly _languageModelsService: ILanguageModelsService,
 	) {
 		super();
 
@@ -98,14 +213,23 @@ class MobileChatPhoneInputPresenter extends Disposable implements IChatPhonePres
 		const target = createChatPhoneInputTarget(sessionContext, this._uriIdentityService);
 		const rawProvider = sessionContext ? this._sessionsProvidersService.getProvider(sessionContext.providerId) : undefined;
 		const agentHostProvider = rawProvider && isAgentHostProvider(rawProvider) ? rawProvider : undefined;
+		const configurationAccess = request.kind === 'delegates'
+			? request.modelDelegate.modelConfiguration ?? this._languageModelsService
+			: this._languageModelsService;
+		// What the input shows as selected. The provider's own `modelId` is not
+		// always set — a model resolved for the session is never written through —
+		// so the sheet has to be told what the picker it opened from is showing.
+		const selectedModelId = request.kind === 'delegates'
+			? request.modelDelegate.currentModel.get()?.identifier
+			: request.getSelectedModelId?.();
 		let sheetItems: IMobilePickerSheetItem[];
 		if (sessionContext && agentHostProvider) {
-			sheetItems = this._buildAgentHostSheetItems(sessionContext, agentHostProvider, registerAction);
+			sheetItems = buildAgentHostSheetItems(sessionContext, agentHostProvider, configurationAccess, registerAction, selectedModelId);
 		} else {
 			if (request.kind !== 'delegates') {
 				return;
 			}
-			sheetItems = this._buildDelegateSheetItems(request.modeDelegate, request.modelDelegate, registerAction);
+			sheetItems = this._buildDelegateSheetItems(request.modeDelegate, request.modelDelegate, configurationAccess, registerAction);
 		}
 
 		if (sheetItems.length === 0) {
@@ -133,60 +257,10 @@ class MobileChatPhoneInputPresenter extends Disposable implements IChatPhonePres
 		);
 	}
 
-	private _buildAgentHostSheetItems(
-		session: IChatPhoneInputSessionContext,
-		provider: IAgentHostSessionsProvider,
-		registerAction: RegisterChatPhonePickerAction,
-	): IMobilePickerSheetItem[] {
-		const items: IMobilePickerSheetItem[] = [];
-		const config = provider.getSessionConfig(session.sessionId);
-		const modeSchema = config?.schema.properties[SessionConfigKey.Mode];
-		const modeItems = (modeSchema && isWellKnownModeSchema(modeSchema))
-			? (modeSchema.enum ?? []).map((value, index) => ({
-				value: String(value),
-				label: modeSchema.enumLabels?.[index] ?? String(value),
-				description: modeSchema.enumDescriptions?.[index],
-			}))
-			: [];
-		const rawCurrentMode = config?.values[SessionConfigKey.Mode] ?? modeSchema?.default;
-		const currentModeValue = typeof rawCurrentMode === 'string' && modeItems.some(item => item.value === rawCurrentMode)
-			? rawCurrentMode
-			: modeItems[0]?.value;
-
-		modeItems.forEach((item, index) => items.push({
-			id: registerAction({ kind: 'agentHostMode', value: item.value }),
-			label: item.label,
-			description: item.description,
-			icon: getAgentHostModeIcon(item.value),
-			checked: item.value === currentModeValue,
-			sectionTitle: index === 0 ? localize('chatPhoneInput.modeSection', "Agent Mode") : undefined,
-		}));
-
-		const models = provider.getModelsSnapshot(session.sessionId).models;
-		const currentModelId = session.modelId;
-		models.forEach((model, index) => items.push({
-			id: registerAction({ kind: 'agentHostModel', model }),
-			label: model.metadata.name,
-			icon: getModelProviderIcon(model),
-			checked: model.identifier === currentModelId,
-			sectionTitle: index === 0 ? localize('chatPhoneInput.modelSection', "Model") : undefined,
-		}));
-
-		const options = normalizeModelPickerOptions(provider.getModelPickerOptions(session.sessionId));
-		if (models.length === 0 && !options.showAutoModel) {
-			items.push({
-				id: 'chat-phone-picker-no-models',
-				label: localize('chatPhoneInput.noModels', "No models available"),
-				disabled: true,
-				sectionTitle: localize('chatPhoneInput.modelSection', "Model"),
-			});
-		}
-		return items;
-	}
-
 	private _buildDelegateSheetItems(
 		modeDelegate: IModePickerDelegate,
 		modelDelegate: IModelPickerDelegate,
+		configurationAccess: IModelConfigurationAccess,
 		registerAction: RegisterChatPhonePickerAction,
 	): IMobilePickerSheetItem[] {
 		const items: IMobilePickerSheetItem[] = [];
@@ -211,6 +285,11 @@ class MobileChatPhoneInputPresenter extends Disposable implements IChatPhonePres
 			checked: model.identifier === currentModel?.identifier,
 			sectionTitle: index === 0 ? localize('chatPhoneInput.modelSection', "Model") : undefined,
 		}));
+		items.push(...createMobileModelConfigurationSheetItems(
+			currentModel,
+			currentModel ? configurationAccess.getModelConfiguration(currentModel.identifier) ?? {} : {},
+			(property, value) => registerAction({ kind: 'modelConfiguration', modelIdentifier: currentModel!.identifier, property, value }),
+		));
 		return items;
 	}
 
@@ -257,6 +336,22 @@ class MobileChatPhoneInputPresenter extends Disposable implements IChatPhonePres
 					}
 				}
 				break;
+			case 'modelConfiguration': {
+				const selectedModel = request.kind === 'delegates'
+					? request.modelDelegate.currentModel.get()
+					: session && agentHostProvider
+						? agentHostProvider.getModelsSnapshot(session.sessionId).models.find(model => model.identifier === session.modelId)
+						: undefined;
+				const schema = selectedModel?.metadata.configurationSchema?.properties?.[action.property];
+				if (selectedModel?.identifier !== action.modelIdentifier || !schema?.enum?.includes(action.value)) {
+					break;
+				}
+				const configurationAccess = request.kind === 'delegates'
+					? request.modelDelegate.modelConfiguration ?? this._languageModelsService
+					: this._languageModelsService;
+				configurationAccess.setModelConfiguration(action.modelIdentifier, { [action.property]: action.value }).catch(() => { });
+				break;
+			}
 		}
 	}
 

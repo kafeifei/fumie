@@ -39,6 +39,7 @@ import { IServerEnvironmentService, ServerParsedArgs } from './serverEnvironment
 import { IServerLifetimeService } from './serverLifetimeService.js';
 import { setupServerServices, SocketServer } from './serverServices.js';
 import { CacheControl, serveError, serveFile, WebClientServer } from './webClientServer.js';
+import { isFumieWebShellPath, IFumieWebShellServer } from './fumie/serverFumieWebShell.js';
 const require = createRequire(import.meta.url);
 
 function parseRequestUrl(requestUrl: string): URL | undefined {
@@ -96,6 +97,7 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 		@ILogService private readonly _logService: ILogService,
 		@IInstantiationService private readonly _instantiationService: IInstantiationService,
 		@IServerLifetimeService private readonly _serverLifetimeService: IServerLifetimeService,
+		@IFumieWebShellServer private readonly _fumieWebShellServer: IFumieWebShellServer,
 	) {
 		super();
 		this._webEndpointOriginChecker = WebEndpointOriginChecker.create(this._productService);
@@ -118,6 +120,22 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 		this._reconnectionGraceTime = this._environmentService.reconnectionGraceTime;
 	}
 
+	/**
+	 * The request path with the prefixes this server answers from taken off —
+	 * its base path, and its product path — so a route only has to know its own
+	 * address. Serve from both '/' and serverBasePath; for now accept all paths,
+	 * with or without the server product path.
+	 */
+	private _stripServerPaths(pathname: string): string {
+		if (this._serverBasePath !== undefined && pathname.startsWith(this._serverBasePath)) {
+			pathname = pathname.substring(this._serverBasePath.length) || '/';
+		}
+		if (pathname.startsWith(this._serverProductPath) && pathname.charCodeAt(this._serverProductPath.length) === CharCode.Slash) {
+			pathname = pathname.substring(this._serverProductPath.length);
+		}
+		return pathname;
+	}
+
 	public async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
 		// Only serve GET requests
 		if (req.method !== 'GET') {
@@ -132,20 +150,11 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 		if (!parsedUrl) {
 			return serveError(req, res, 400, `Bad request.`);
 		}
-		let pathname = parsedUrl.pathname;
-
-		if (!pathname) {
+		if (!parsedUrl.pathname) {
 			return serveError(req, res, 400, `Bad request.`);
 		}
 
-		// Serve from both '/' and serverBasePath
-		if (this._serverBasePath !== undefined && pathname.startsWith(this._serverBasePath)) {
-			pathname = pathname.substring(this._serverBasePath.length) || '/';
-		}
-		// for now accept all paths, with or without server product path
-		if (pathname.startsWith(this._serverProductPath) && pathname.charCodeAt(this._serverProductPath.length) === CharCode.Slash) {
-			pathname = pathname.substring(this._serverProductPath.length);
-		}
+		const pathname = this._stripServerPaths(parsedUrl.pathname);
 
 		// Version
 		if (pathname === '/version') {
@@ -158,6 +167,14 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 			this._serverLifetimeService.delay();
 			res.writeHead(200);
 			return void res.end('OK');
+		}
+
+		// Fumie web shell. It carries its own capability in the path and its own
+		// session cookie, which is the whole of its access control, so it sits
+		// ahead of the connection token rather than behind it — the two secrets
+		// are independent and neither is weakened by the other's absence.
+		if (isFumieWebShellPath(pathname)) {
+			return this._fumieWebShellServer.handleRequest(req, res, pathname, parsedUrl.pathname.substring(0, parsedUrl.pathname.length - pathname.length));
 		}
 
 		if (!httpRequestHasValidConnectionToken(this._connectionToken, req, parsedUrl.searchParams)) {
@@ -220,6 +237,11 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 				this._logService.warn('WebSocket connection rejected: invalid request URL');
 				socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
 				return;
+			}
+			// Fumie web shell bridge, on the prefix the shell owns outright.
+			const shellPathname = this._stripServerPaths(parsedUrl.pathname);
+			if (isFumieWebShellPath(shellPathname)) {
+				return this._fumieWebShellServer.handleUpgrade(req, socket, Buffer.alloc(0), shellPathname);
 			}
 			const query = parsedUrl.searchParams;
 			const reconnectionTokens = query.getAll('reconnectionToken');

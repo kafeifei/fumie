@@ -46,6 +46,7 @@ import { StopWatch } from '../../../base/common/stopwatch.js';
 import { isCI, setTimeout0 } from '../../../base/common/platform.js';
 import { IExtHostManagedSockets } from './extHostManagedSockets.js';
 import { Dto } from '../../services/extensions/common/proxyIdentifier.js';
+import product from '../../../platform/product/common/product.js';
 
 interface ITestRunner {
 	/** Old test runner API, as exported from `vscode/lib/testrunner` */
@@ -495,6 +496,13 @@ export abstract class AbstractExtHostExtensionService extends Disposable impleme
 			comment: 'Data about how/why an extension was activated';
 		} & TelemetryActivationEventFragment;
 		this._mainThreadTelemetryProxy.$publicLog2<TelemetryActivationEvent, ActivatePluginClassification>('activatePlugin', event);
+		const requiredEnvironment = product.extensionActivationEnvironmentRequirements?.[ExtensionIdentifier.toKey(extensionDescription.identifier)];
+		const missingEnvironment = requiredEnvironment && Object.entries(requiredEnvironment)
+			.filter(([name, value]) => process.env[name] !== value)
+			.map(([name]) => name);
+		if (missingEnvironment?.length) {
+			return Promise.reject(new Error(`Extension '${extensionDescription.identifier.value}' requires product-defined environment variables: ${missingEnvironment.join(', ')}`));
+		}
 		const entryPoint = this._getEntryPoint(extensionDescription);
 		if (!entryPoint) {
 			// Treat the extension as being empty => NOT AN ERROR CASE

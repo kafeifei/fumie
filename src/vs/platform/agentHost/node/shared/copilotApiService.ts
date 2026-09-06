@@ -71,6 +71,14 @@ export interface ICopilotUtilityChatCompletionRequest {
 	readonly messages: readonly ICopilotUtilityChatMessage[];
 	readonly temperature?: number;
 	readonly maxTokens?: number;
+	/**
+	 * The CAPI model to run this request on, named by model family (e.g.
+	 * `'gpt-4o-mini'`) or by exact model id. Absent keeps the fixed
+	 * {@link UTILITY_DEFAULT_MODEL_FAMILY} default, so a caller that has no
+	 * opinion about the model is unaffected. Set it when the request must run on
+	 * the model the user picked for a session rather than the utility default.
+	 */
+	readonly modelFamily?: string;
 }
 
 /**
@@ -649,7 +657,7 @@ export class CopilotApiService implements ICopilotApiService {
 		options?: ICopilotApiServiceRequestOptions,
 	): Promise<string> {
 		const capiClient = await this._getClientForToken(githubToken);
-		const modelId = await this._resolveUtilityModelId(githubToken, UTILITY_DEFAULT_MODEL_FAMILY);
+		const modelId = await this._resolveUtilityModelId(githubToken, request.modelFamily ?? UTILITY_DEFAULT_MODEL_FAMILY);
 		const requestId = generateUuid();
 
 		this._logService.debug('[CopilotApiService] POST chat completions', `model=${modelId} requestId=${requestId}`);
@@ -984,9 +992,14 @@ export class CopilotApiService implements ICopilotApiService {
 	}
 
 	/**
-	 * Resolve the concrete CAPI model id for the supplied family (e.g.
-	 * `gpt-4o-mini`). Cached with the per-GitHub-token CAPI client so
-	 * endpoint or authentication invalidation also clears the model id.
+	 * Resolve the concrete CAPI model id to send a utility request to.
+	 * `modelFamily` is matched against each catalog model's family (e.g.
+	 * `gpt-4o-mini`) and against its own id, so a caller may name either — the
+	 * utility default is a family, a session's current model an id. Throws when
+	 * neither matches, which the caller reports as a failed utility request
+	 * rather than silently substituting another model. Cached with the
+	 * per-GitHub-token CAPI client so endpoint or authentication invalidation
+	 * also clears the model id.
 	 */
 	private async _resolveUtilityModelId(githubToken: string, modelFamily: string): Promise<string> {
 		const entry = await this._getEntryForToken(githubToken);
@@ -996,9 +1009,9 @@ export class CopilotApiService implements ICopilotApiService {
 		}
 
 		const models = await this.models(githubToken);
-		const match = models.find(m => m.capabilities?.family === modelFamily);
+		const match = models.find(m => m.capabilities?.family === modelFamily) ?? models.find(m => m.id === modelFamily);
 		if (!match) {
-			throw new Error(`No CAPI model available for family '${modelFamily}'`);
+			throw new Error(`No CAPI model available for family or id '${modelFamily}'`);
 		}
 
 		entry.utilityModelIdsByFamily.set(modelFamily, match.id);

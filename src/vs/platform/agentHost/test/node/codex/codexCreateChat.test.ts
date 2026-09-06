@@ -19,7 +19,7 @@ import { TestInstantiationService } from '../../../../../platform/instantiation/
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { AgentSession, type AgentSignal, type IAgentChatContext, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentMaterializeChatEvent } from '../../../common/agent.js';
-import { buildChatUri, buildDefaultChatUri } from '../../../common/state/sessionState.js';
+import { buildChatUri, buildDefaultChatUri, type ModelSelection } from '../../../common/state/sessionState.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import { CustomizationType, McpServerStatus } from '../../../common/state/protocol/channels-session/state.js';
 import type { IAgentServerToolHost } from '../../../common/agentServerTools.js';
@@ -33,6 +33,10 @@ import { IAgentHostSessionTitleSignal } from '../../../node/agentHostSessionTitl
 import { IAgentHostGitHubEndpointService } from '../../../node/agentHostGitHubEndpointService.js';
 import { IAgentSdkDownloader } from '../../../node/agentSdkDownloader.js';
 import { CodexAgent, toCodexModelSelectionId } from '../../../node/codex/codexAgent.js';
+import { CodexBackingStore, encodeCodexChat } from '../../../node/codex/codexBackingStore.js';
+import { ByokLmBridgeRegistry, IByokLmBridgeRegistry } from '../../../node/byokLmBridgeRegistry.js';
+import { IChatGptSubscriptionService } from '../../../node/chatGptSubscription.js';
+import { createTestChatGptSubscriptionService } from '../testChatGptSubscriptionService.js';
 import { CodexAppServerClient, type ICodexAppServerTransport } from '../../../node/codex/codexAppServerClient.js';
 import { ICodexProxyService } from '../../../node/codex/codexProxyService.js';
 import { ICopilotApiService } from '../../../node/shared/copilotApiService.js';
@@ -41,6 +45,10 @@ import { createTestGitHubEndpointService } from '../testGitHubEndpointService.js
 import { createNoopCustomizationEnablementService } from '../testCustomizationEnablementService.js';
 
 const COPILOT_TEST_MODEL = toCodexModelSelectionId('vscode-proxy', 'gpt-test');
+
+function fumieReceipt(sessionId: string, threadId?: string): string {
+	return encodeCodexChat({ storage: CodexBackingStore.Fumie, sessionId, ...(threadId ? { threadId } : {}) });
+}
 
 interface ITestWireRequest {
 	readonly id: number;
@@ -51,6 +59,7 @@ interface ITestWireRequest {
 		readonly numTurns?: number;
 		readonly input?: readonly { readonly type: string; readonly text?: string; readonly text_elements?: readonly object[] }[];
 		readonly additionalContext?: Readonly<Record<string, { readonly kind: string; readonly value: string }>>;
+		readonly serviceTier?: string | null;
 	};
 }
 
@@ -205,12 +214,33 @@ async function createAgent(disposables: Pick<DisposableStore, 'add'>, options: I
 	instantiationService.stub(INativeEnvironmentService, { userHome: URI.file('/tmp') });
 	instantiationService.stub(IFileService, fileService);
 	instantiationService.stub(ILogService, logService);
+	instantiationService.stub(IByokLmBridgeRegistry, new ByokLmBridgeRegistry());
+	instantiationService.stub(IChatGptSubscriptionService, createTestChatGptSubscriptionService());
 	const agent = disposables.add(instantiationService.createInstance(CodexAgent));
 	agent['_refreshSkillHookCustomizations'] = async () => { };
 	agent['_refreshSkillExtraRoots'] = async () => { };
 	await agent.authenticate(agent.getProtectedResources()[0].resource, 'test-token');
 	await agent.refreshModels();
 	return agent;
+}
+
+function advertiseFastTier(agent: CodexAgent): void {
+	const advertised = agent.models.get()[0];
+	agent['_copilotModels'] = [{
+		...advertised,
+		configSchema: {
+			type: 'object',
+			properties: {
+				serviceTier: {
+					type: 'string',
+					title: 'Speed',
+					default: 'standard',
+					enum: ['standard', 'priority'],
+				},
+			},
+		},
+	}];
+	agent['_publishModels']();
 }
 
 /**
@@ -233,6 +263,15 @@ function connectPeer(agent: CodexAgent, peer: ITestPeer): void {
 	agent['_connection'] = {
 		kind: 'ready',
 		client,
+		usageSource: 'github',
+		child: { kill: () => true },
+	} as never;
+}
+
+function connectNativePeer(agent: CodexAgent, peer: ITestPeer): void {
+	agent['_nativeConnection'] = {
+		kind: 'ready',
+		client: new CodexAppServerClient(peer.transport),
 		usageSource: 'github',
 		child: { kill: () => true },
 	} as never;
@@ -530,6 +569,7 @@ suite('CodexAgent createChat', () => {
 
 	test('fork: preserves the exact source thread and binds the forked session directly to the target chat', async () => {
 		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true });
+		advertiseFastTier(agent);
 		const peer = disposables.add(createTestPeer());
 		connectPeer(agent, peer);
 
@@ -539,7 +579,7 @@ suite('CodexAgent createChat', () => {
 			const folder = URI.file('/repo/source');
 			await createSessionBackedChat(agent, sourceChat, { configurationResource: sourceSessionUri, resource: sourceChat }, {
 				workingDirectories: [folder],
-				model: { id: COPILOT_TEST_MODEL },
+				model: { id: COPILOT_TEST_MODEL, config: { serviceTier: 'priority' } },
 			});
 			const sourceEntry = agent['_sessions'].get('session-source')!;
 			const start = await readNextRequest(peer.outbound);
@@ -576,6 +616,7 @@ suite('CodexAgent createChat', () => {
 			peer.push({ id: forkInventory.id, result: { data: [], nextCursor: null } });
 
 			assert.deepStrictEqual({
+				serviceTier: fork.params.serviceTier,
 				provisional: forked.provisional,
 				// The fork stands the owning session's runtime up, so it adopts
 				// that session's identity and reports the forked thread as the
@@ -589,6 +630,7 @@ suite('CodexAgent createChat', () => {
 				threadId: agent['_sessions'].get('session-fork-target')?.threadId,
 				chatChannel: agent['_sessions'].get('session-fork-target')?.chatChannel?.toString(),
 			}, {
+				serviceTier: 'priority',
 				provisional: undefined,
 				session: forkSessionUri.toString(),
 				backingSession: AgentSession.uri('codex', newThreadId).toString(),
@@ -607,12 +649,14 @@ suite('CodexAgent createChat', () => {
 			const resume = await readNextRequest(peer.outbound);
 			assert.strictEqual(resume.method, 'thread/resume');
 			assert.strictEqual(resume.params.threadId, newThreadId);
+			assert.strictEqual(resume.params.serviceTier, 'priority');
 			peer.push({ id: resume.id, result: { thread: { id: newThreadId, cwd: folder.fsPath }, cwd: folder.fsPath } });
 			const resumeInventory = await readNextRequest(peer.outbound);
 			assert.strictEqual(resumeInventory.method, 'mcpServerStatus/list');
 			assert.strictEqual(resumeInventory.params.threadId, newThreadId);
 			peer.push({ id: resumeInventory.id, result: { data: [], nextCursor: null } });
 			const turn = await readNextRequest(peer.outbound);
+			assert.strictEqual(turn.params.serviceTier, 'priority');
 			peer.push({ id: turn.id, result: {} });
 			await sending;
 		} finally {
@@ -875,7 +919,7 @@ suite('CodexAgent exact chat routing', () => {
 		}
 	});
 
-	test('disposeChat tears down the runtime of the addressed chat and forgets its binding', async () => {
+	test('deleteChat tears down the runtime, deletes the durable thread, and then forgets its binding', async () => {
 		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true });
 		const peer = disposables.add(createTestPeer());
 		connectPeer(agent, peer);
@@ -895,24 +939,203 @@ suite('CodexAgent exact chat routing', () => {
 			await entry.materializePromise;
 			assert.strictEqual(agent['_sessionIdByChatUri'].get(chat.toString()), 'session-dispose-intent');
 
-			// Agent Host's teardown order: dispose every chat. Configuration-
+			// Agent Host's teardown order: delete every chat. Configuration-
 			// scope ref tracking reclaims any remaining scope-level resources
 			// inline once the scope's last chat is disposed — no separate
 			// finalize call is needed.
-			const disposing = agent.chats.disposeChat(chat, context);
+			const disposing = agent.chats.deleteChat(chat, context);
 			const unsubscribe = await readNextRequest(peer.outbound);
 			peer.push({ id: unsubscribe.id, result: {} });
+			const deleting = await readNextRequest(peer.outbound);
+			peer.push({ id: deleting.id, result: {} });
 			await disposing;
 
 			assert.deepStrictEqual({
-				unsubscribed: { method: unsubscribe.method, threadId: unsubscribe.params.threadId },
+				requests: [
+					{ method: unsubscribe.method, threadId: unsubscribe.params.threadId },
+					{ method: deleting.method, threadId: deleting.params.threadId },
+				],
 				hasRuntime: agent['_sessions'].has('session-dispose-intent'),
 				hasBinding: agent['_sessionIdByChatUri'].has(chat.toString()),
 			}, {
-				unsubscribed: { method: 'thread/unsubscribe', threadId: 'dispose-thread' },
+				requests: [
+					{ method: 'thread/unsubscribe', threadId: 'dispose-thread' },
+					{ method: 'thread/delete', threadId: 'dispose-thread' },
+				],
 				hasRuntime: false,
 				hasBinding: false,
 			});
+		} finally {
+			peer.dispose();
+		}
+	});
+
+	test('deleteChat deletes a cold receipt without materializing, resuming, or reading the thread', async () => {
+		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true });
+		const peer = disposables.add(createTestPeer());
+		connectPeer(agent, peer);
+
+		try {
+			const session = AgentSession.uri('codex', 'cold-owner');
+			const chat = URI.parse(buildDefaultChatUri(session));
+			const receipt = fumieReceipt('cold-runtime', 'cold-thread');
+			const deleting = agent.chats.deleteChat(chat, { configurationResource: session, resource: chat }, receipt);
+			const request = await readNextRequest(peer.outbound);
+			peer.push({ id: request.id, result: {} });
+			await deleting;
+
+			assert.deepStrictEqual({ method: request.method, threadId: request.params.threadId }, {
+				method: 'thread/delete',
+				threadId: 'cold-thread',
+			});
+			assert.strictEqual(agent['_sessions'].size, 0, 'cold delete must not materialize a runtime');
+		} finally {
+			peer.dispose();
+		}
+	});
+
+	test('an unversioned cold receipt deletes only through the native compatibility connection', async () => {
+		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true });
+		const fumiePeer = disposables.add(createTestPeer());
+		const nativePeer = disposables.add(createTestPeer());
+		connectPeer(agent, fumiePeer);
+		connectNativePeer(agent, nativePeer);
+
+		try {
+			const session = AgentSession.uri('codex', 'legacy-owner');
+			const chat = URI.parse(buildDefaultChatUri(session));
+			const deleting = agent.chats.deleteChat(
+				chat,
+				{ configurationResource: session, resource: chat },
+				JSON.stringify({ sessionId: 'legacy-runtime', threadId: 'legacy-thread' }),
+			);
+			const request = await readNextRequest(nativePeer.outbound);
+			nativePeer.push({ id: request.id, result: {} });
+			await deleting;
+			assert.deepStrictEqual({ method: request.method, threadId: request.params.threadId, fumieBytes: fumiePeer.outbound.readableLength }, {
+				method: 'thread/delete',
+				threadId: 'legacy-thread',
+				fumieBytes: 0,
+			});
+		} finally {
+			fumiePeer.dispose();
+			nativePeer.dispose();
+		}
+	});
+
+	test('an unversioned receipt reads and resumes only through the native compatibility connection', async () => {
+		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true, sessionStore: createTestSessionStore() });
+		const fumiePeer = disposables.add(createTestPeer());
+		const nativePeer = disposables.add(createTestPeer());
+		connectPeer(agent, fumiePeer);
+		connectNativePeer(agent, nativePeer);
+
+		try {
+			const session = AgentSession.uri('codex', 'legacy-runtime');
+			const chat = URI.parse(buildDefaultChatUri(session));
+			const context = { configurationResource: session, resource: chat };
+			const receipt = JSON.stringify({ sessionId: 'legacy-runtime', threadId: 'legacy-thread', model: { id: COPILOT_TEST_MODEL } });
+			const metadataPromise = agent.getChatMetadata(chat, context, receipt);
+			const read = await readNextRequest(nativePeer.outbound);
+			nativePeer.push({ id: read.id, result: { thread: { id: 'legacy-thread', cwd: '/repo/legacy', modelProvider: 'vscode-proxy', turns: [] } } });
+			await metadataPromise;
+			const metadataInventory = await readNextRequest(nativePeer.outbound);
+			nativePeer.push({ id: metadataInventory.id, result: { data: [], nextCursor: null } });
+			await agent.materializeChat(chat, context, receipt);
+
+			const sending = agent.chats.sendMessage(chat, 'continue', [URI.file('/repo/legacy')], undefined, 'legacy-turn', undefined, undefined, context);
+			const unsubscribe = await readNextRequest(nativePeer.outbound);
+			nativePeer.push({ id: unsubscribe.id, result: {} });
+			const resume = await readNextRequest(nativePeer.outbound);
+			nativePeer.push({ id: resume.id, result: { thread: { id: 'legacy-thread', cwd: '/repo/legacy' }, cwd: '/repo/legacy' } });
+			const resumeInventory = await readNextRequest(nativePeer.outbound);
+			nativePeer.push({ id: resumeInventory.id, result: { data: [], nextCursor: null } });
+			const turn = await readNextRequest(nativePeer.outbound);
+			nativePeer.push({ id: turn.id, result: { turn: { id: 'native-turn' } } });
+			await sending;
+
+			assert.deepStrictEqual({
+				read: { method: read.method, threadId: read.params.threadId },
+				metadataInventory: { method: metadataInventory.method, threadId: metadataInventory.params.threadId },
+				unsubscribe: { method: unsubscribe.method, threadId: unsubscribe.params.threadId },
+				resume: { method: resume.method, threadId: resume.params.threadId },
+				resumeInventory: { method: resumeInventory.method, threadId: resumeInventory.params.threadId },
+				turn: { method: turn.method, threadId: turn.params.threadId },
+				fumieBytes: fumiePeer.outbound.readableLength,
+			}, {
+				read: { method: 'thread/read', threadId: 'legacy-thread' },
+				metadataInventory: { method: 'mcpServerStatus/list', threadId: 'legacy-thread' },
+				unsubscribe: { method: 'thread/unsubscribe', threadId: 'legacy-thread' },
+				resume: { method: 'thread/resume', threadId: 'legacy-thread' },
+				resumeInventory: { method: 'mcpServerStatus/list', threadId: 'legacy-thread' },
+				turn: { method: 'turn/start', threadId: 'legacy-thread' },
+				fumieBytes: 0,
+			});
+		} finally {
+			fumiePeer.dispose();
+			nativePeer.dispose();
+		}
+	});
+
+	test('deleteChat failure retains the binding and exact receipt so a cold retry can succeed', async () => {
+		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true });
+		const peer = disposables.add(createTestPeer());
+		connectPeer(agent, peer);
+
+		try {
+			const session = AgentSession.uri('codex', 'delete-retry-runtime');
+			const chat = URI.parse(buildDefaultChatUri(session));
+			const context = { configurationResource: session, resource: chat };
+			await createSessionBackedChat(agent, chat, context, {
+				workingDirectories: [URI.file('/repo/delete-retry')],
+				model: { id: COPILOT_TEST_MODEL },
+			});
+			const entry = agent['_sessions'].get('delete-retry-runtime')!;
+			const start = await readNextRequest(peer.outbound);
+			peer.push({ id: start.id, result: { thread: { id: 'delete-retry-thread', cwd: '/repo/delete-retry' } } });
+			await entry.materializePromise;
+			const receipt = fumieReceipt('delete-retry-runtime', 'delete-retry-thread');
+
+			const firstDelete = agent.chats.deleteChat(chat, context, receipt);
+			const unsubscribe = await readNextRequest(peer.outbound);
+			peer.push({ id: unsubscribe.id, result: {} });
+			const failedRequest = await readNextRequest(peer.outbound);
+			peer.push({ id: failedRequest.id, error: { code: -32077, message: 'delete failed' } });
+			await assert.rejects(firstDelete, /delete failed/);
+
+			assert.strictEqual(agent['_sessionIdByChatUri'].get(chat.toString()), 'delete-retry-runtime');
+			assert.strictEqual(agent['_sessions'].has('delete-retry-runtime'), false, 'retry must be cold after live teardown');
+
+			const retry = agent.chats.deleteChat(chat, context, receipt);
+			const retryRequest = await readNextRequest(peer.outbound);
+			peer.push({ id: retryRequest.id, result: {} });
+			await retry;
+			assert.deepStrictEqual({ method: retryRequest.method, threadId: retryRequest.params.threadId }, {
+				method: 'thread/delete',
+				threadId: 'delete-retry-thread',
+			});
+			assert.strictEqual(agent['_sessionIdByChatUri'].has(chat.toString()), false);
+		} finally {
+			peer.dispose();
+		}
+	});
+
+	test('deleteChat treats the pinned app-server repeated-delete response as idempotent success', async () => {
+		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true });
+		const peer = disposables.add(createTestPeer());
+		connectPeer(agent, peer);
+
+		try {
+			const session = AgentSession.uri('codex', 'missing-owner');
+			const chat = URI.parse(buildDefaultChatUri(session));
+			const deleting = agent.chats.deleteChat(
+				chat,
+				{ configurationResource: session, resource: chat },
+				fumieReceipt('missing-runtime', 'missing-thread'),
+			);
+			const request = await readNextRequest(peer.outbound);
+			peer.push({ id: request.id, error: { code: -32600, message: 'no rollout found for thread id missing-thread' } });
+			await deleting;
 		} finally {
 			peer.dispose();
 		}
@@ -958,7 +1181,7 @@ suite('CodexAgent exact chat routing', () => {
 		}
 	});
 
-	test('disposeChat tears down a still-provisional (never-sent) chat: pending registries reject, the runtime and binding are dropped, and a queued prewarm can no longer materialize a thread', async () => {
+	test('deleteChat tears down a still-provisional (never-sent) chat without a thread RPC', async () => {
 		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true });
 		const sessionUri = AgentSession.uri('codex', 'session-dispose-provisional');
 		const chat = sessionChatWithPeerShape(sessionUri);
@@ -980,7 +1203,7 @@ suite('CodexAgent exact chat routing', () => {
 		// No peer is connected: a provisional runtime's teardown never touches
 		// the wire (there is no codex thread yet to `thread/unsubscribe`), so
 		// disposal must resolve entirely in-memory.
-		await agent.chats.disposeChat(chat, context);
+		await agent.chats.deleteChat(chat, context);
 
 		await assert.rejects(toolCall);
 		// Command approvals are unparked by resolving (`denyAll('decline')`),
@@ -1021,7 +1244,7 @@ suite('CodexAgent exact chat routing', () => {
 		assert.doesNotThrow(() => agent['_schedulePrewarm'](entry));
 	});
 
-	test('OTel: releaseChat preserves the runtime\'s trace context; a later disposeChat of the already-evicted runtime releases it through the scope-finalization path', async () => {
+	test('OTel: releaseChat preserves trace context; a later cold deleteChat releases it after thread/delete', async () => {
 		const released: string[] = [];
 		const agent = await createAgent(disposables, {
 			sdkResolvableWithoutDownload: true,
@@ -1060,16 +1283,20 @@ suite('CodexAgent exact chat routing', () => {
 			// the scope-finalization reclaim path rather than the in-memory
 			// runtime teardown, since `_sessions` no longer has an entry.
 			assert.strictEqual(agent['_sessions'].has('session-otel-scope'), false, 'precondition: the runtime was evicted by the release above');
-			await agent.chats.disposeChat(chat, context);
+			const deleting = agent.chats.deleteChat(chat, context, fumieReceipt('session-otel-scope', 'otel-scope-thread'));
+			const deleteRequest = await readNextRequest(peer.outbound);
+			peer.push({ id: deleteRequest.id, result: {} });
+			await deleting;
 
-			assert.ok(released.length >= 1, 'disposeChat must release the trace context once the scope has no chats left');
+			assert.deepStrictEqual({ method: deleteRequest.method, threadId: deleteRequest.params.threadId }, { method: 'thread/delete', threadId: 'otel-scope-thread' });
+			assert.ok(released.length >= 1, 'deleteChat must release the trace context once the scope has no chats left');
 			assert.ok(released.every(key => key === sessionUri.toString()), 'every release must use the exact acquisition key (this runtime\'s own sessionUri), never a different one');
 		} finally {
 			peer.dispose();
 		}
 	});
 
-	test('OTel: disposeChat of a live in-memory runtime releases its trace context under the exact key it was acquired with', async () => {
+	test('OTel: deleteChat of a live runtime releases its trace context under the exact key it was acquired with', async () => {
 		const released: string[] = [];
 		const agent = await createAgent(disposables, {
 			sdkResolvableWithoutDownload: true,
@@ -1095,9 +1322,11 @@ suite('CodexAgent exact chat routing', () => {
 			peer.push({ id: start.id, result: { thread: { id: 'otel-live-thread', cwd: '/repo/otel-live' } } });
 			await entry.materializePromise;
 
-			const disposing = agent.chats.disposeChat(chat, context);
+			const disposing = agent.chats.deleteChat(chat, context);
 			const unsubscribe = await readNextRequest(peer.outbound);
 			peer.push({ id: unsubscribe.id, result: {} });
+			const deleting = await readNextRequest(peer.outbound);
+			peer.push({ id: deleting.id, result: {} });
 			await disposing;
 
 			assert.deepStrictEqual(released, [sessionUri.toString()]);
@@ -1208,9 +1437,11 @@ suite('CodexAgent exact chat routing', () => {
 			// peer chat's contribution or its handle.
 			agent.removeActiveClient(sessionChat, sessionContext, 'client-exact');
 
-			const disposing = agent.chats.disposeChat(peerChat, peerContext);
+			const disposing = agent.chats.deleteChat(peerChat, peerContext);
 			const unsubscribe = await readNextRequest(peer.outbound);
 			peer.push({ id: unsubscribe.id, result: {} });
+			const deleting = await readNextRequest(peer.outbound);
+			peer.push({ id: deleting.id, result: {} });
 			await disposing;
 
 			assert.deepStrictEqual({
@@ -1314,13 +1545,13 @@ suite('CodexAgent chat backing durability', () => {
 	 * `threadId`, and drive the first send so the session-scoped materialize
 	 * receipt — the one carrying the refreshed chat backing — is emitted.
 	 */
-	async function materializeSession(agent: CodexAgent, peer: ITestPeer, session: URI, chat: URI, folder: URI, threadId: string): Promise<IAgentMaterializeChatEvent> {
+	async function materializeSession(agent: CodexAgent, peer: ITestPeer, session: URI, chat: URI, folder: URI, threadId: string, model: ModelSelection = { id: COPILOT_TEST_MODEL }): Promise<IAgentMaterializeChatEvent> {
 		const receipts: IAgentMaterializeChatEvent[] = [];
 		const listener = agent.onDidMaterializeChat(e => receipts.push(e));
 		try {
 			await createSessionBackedChat(agent, chat, { configurationResource: session, resource: chat }, {
 				workingDirectories: [folder],
-				model: { id: COPILOT_TEST_MODEL },
+				model,
 			});
 			const start = await readNextRequest(peer.outbound);
 			peer.push({ id: start.id, result: { thread: { id: threadId, cwd: folder.fsPath } } });
@@ -1365,29 +1596,31 @@ suite('CodexAgent chat backing durability', () => {
 		const chat = URI.parse(buildDefaultChatUri(session));
 		const folder = URI.file('/repo/durable');
 		const first = await createAgent(disposables, { sdkResolvableWithoutDownload: true, sessionStore });
+		advertiseFastTier(first);
 		const firstPeer = disposables.add(createTestPeer());
 		connect(first, firstPeer);
 		let secondPeer: ITestPeer | undefined;
 
 		try {
-			const receipt = await materializeSession(first, firstPeer, session, chat, folder, 'codex-thread');
+			const receipt = await materializeSession(first, firstPeer, session, chat, folder, 'codex-thread', {
+				id: COPILOT_TEST_MODEL,
+				config: { serviceTier: 'priority' },
+			});
 
 			// A host restart: a brand-new agent is offered nothing but the
 			// persisted backing blob and the URIs Agent Host owns.
 			const second = await createAgent(disposables, { sdkResolvableWithoutDownload: true, sessionStore });
+			advertiseFastTier(second);
 			secondPeer = disposables.add(createTestPeer());
 			connect(second, secondPeer);
 			const signals: AgentSignal[] = [];
 			disposables.add(second.onDidChatProgress(signal => signals.push(signal)));
 
 			const restoring = second.getChatMetadata(chat, { configurationResource: session, resource: chat }, receipt.result?.providerData);
-			const originalProbe = await readNextRequest(secondPeer.outbound);
-			assert.strictEqual(originalProbe.params.threadId, 'host-session');
-			secondPeer.push({ id: originalProbe.id, error: { code: -32000, message: 'thread not found' } });
 			const read = await readNextRequest(secondPeer.outbound);
 			assert.strictEqual(read.params.threadId, 'codex-thread');
 			secondPeer.push({ id: read.id, result: { thread: { id: 'codex-thread', cwd: folder.fsPath, modelProvider: 'vscode-proxy', turns: [] } } });
-			await restoring;
+			const restoredMetadata = await restoring;
 			const restoreInventory = await readNextRequest(secondPeer.outbound);
 			secondPeer.push({ id: restoreInventory.id, result: { data: [], nextCursor: null } });
 			await second.materializeChat(chat, { configurationResource: session, resource: chat }, receipt.result?.providerData);
@@ -1410,26 +1643,31 @@ suite('CodexAgent chat backing durability', () => {
 			const restored = second['_sessions'].get('host-session');
 			assert.deepStrictEqual({
 				backingSessionId: JSON.parse(receipt.result!.providerData!).sessionId,
+				backingThreadId: JSON.parse(receipt.result!.providerData!).threadId,
 				backingSession: receipt.result?.backingSession?.toString(),
+				restoredModel: restoredMetadata?.model,
 				restoredThreadId: restored?.threadId,
 				restoredSessionUri: restored?.sessionUri.toString(),
 				restoredChatChannel: restored?.chatChannel?.toString(),
 				unsubscribe: { method: unsubscribe.method, threadId: unsubscribe.params.threadId },
-				resume: { method: resume.method, threadId: resume.params.threadId },
+				resume: { method: resume.method, threadId: resume.params.threadId, serviceTier: resume.params.serviceTier },
+				turn: { method: turn.method, serviceTier: turn.params.serviceTier },
 				turnActions: signals.flatMap(signal => signal.kind === 'action'
 					? [{ resource: signal.resource.toString(), type: signal.action.type }]
 					: []),
 			}, {
-				// The runtime's own durable id — not the app-server thread id,
-				// which the metadata overlay owns and a rematerialization
-				// replaces.
+				// The stable runtime id and exact current thread id are both in the
+				// opaque receipt. The metadata overlay remains a legacy fallback.
 				backingSessionId: 'host-session',
+				backingThreadId: 'codex-thread',
 				backingSession: AgentSession.uri('codex', 'codex-thread').toString(),
+				restoredModel: { id: COPILOT_TEST_MODEL, config: { serviceTier: 'priority' } },
 				restoredThreadId: 'codex-thread',
 				restoredSessionUri: session.toString(),
 				restoredChatChannel: chat.toString(),
 				unsubscribe: { method: 'thread/unsubscribe', threadId: 'codex-thread' },
-				resume: { method: 'thread/resume', threadId: 'codex-thread' },
+				resume: { method: 'thread/resume', threadId: 'codex-thread', serviceTier: 'priority' },
+				turn: { method: 'turn/start', serviceTier: 'priority' },
 				turnActions: [
 					{ resource: chat.toString(), type: ActionType.ChatError },
 					{ resource: chat.toString(), type: ActionType.ChatTurnComplete },
@@ -1455,7 +1693,7 @@ suite('CodexAgent chat backing durability', () => {
 			const addressed = AgentSession.uri('codex', 'addressed-session');
 			const chat = URI.parse(buildDefaultChatUri(addressed));
 			const context = { configurationResource: addressed, resource: chat };
-			const restoring = agent.getChatMetadata(chat, context, JSON.stringify({ sessionId: 'backing-runtime' }));
+			const restoring = agent.getChatMetadata(chat, context, fumieReceipt('backing-runtime'));
 			const read = await readNextRequest(peer.outbound);
 			peer.push({ id: read.id, result: { thread: { id: 'backing-thread', cwd: '/repo/addressed', turns: [] } } });
 			const metadata = await restoring;
@@ -1463,6 +1701,8 @@ suite('CodexAgent chat backing durability', () => {
 			peer.push({ id: inventory.id, result: { data: [], nextCursor: null } });
 
 			const restored = agent['_sessions'].get('backing-runtime');
+			const advertisedBeforeMaterialize = [...advertised];
+			await agent.materializeChat(chat, context, fumieReceipt('backing-runtime'));
 			assert.deepStrictEqual({
 				metadataChat: metadata?.chat.toString(),
 				// The entry's own URI must round-trip to the key it is stored
@@ -1474,12 +1714,14 @@ suite('CodexAgent chat backing durability', () => {
 				addressedRuntimeExists: agent['_sessions'].has('addressed-session'),
 				// Server tools are session-scoped, so they are advertised on
 				// the session Agent Host addressed — the only URI it knows.
+				advertisedBeforeMaterialize,
 				advertised,
 			}, {
 				metadataChat: chat.toString(),
 				restoredSessionUri: AgentSession.uri('codex', 'backing-runtime').toString(),
 				restoredThreadId: 'backing-thread',
 				addressedRuntimeExists: false,
+				advertisedBeforeMaterialize: [addressed.toString()],
 				advertised: [addressed.toString()],
 			});
 		} finally {
@@ -1504,7 +1746,7 @@ suite('CodexAgent chat backing durability', () => {
 			// `thread/read` for a thread of its own that is blocked waiting on a
 			// dynamic tool call, which is exactly the state a session server
 			// tool runs in.
-			const metadata = await agent.getChatMetadata(chat, { configurationResource: session, resource: chat }, JSON.stringify({ sessionId: 'live-session' }));
+			const metadata = await agent.getChatMetadata(chat, { configurationResource: session, resource: chat }, fumieReceipt('live-session'));
 
 			assert.deepStrictEqual({
 				chat: metadata?.chat.toString(),
@@ -1533,7 +1775,7 @@ suite('CodexAgent chat backing durability', () => {
 			const session = AgentSession.uri('codex', 'named-session');
 			const chat = URI.parse(buildDefaultChatUri(session));
 			const context = { configurationResource: session, resource: chat };
-			const providerData = JSON.stringify({ sessionId: 'named-session' });
+			const providerData = fumieReceipt('named-session');
 			const restoring = agent.getChatMetadata(chat, context, providerData);
 			const read = await readNextRequest(peer.outbound);
 			assert.strictEqual(read.method, 'thread/read');
@@ -1583,15 +1825,15 @@ suite('CodexAgent chat backing durability', () => {
 		const session = AgentSession.uri('codex', 'metadata-owner');
 		const defaultChat = URI.parse(buildDefaultChatUri(session));
 		const peerChat = URI.parse(buildChatUri(session, 'metadata-peer'));
-		await agent.materializeChat(defaultChat, { configurationResource: session, resource: defaultChat }, JSON.stringify({ sessionId: 'default-runtime' }));
-		await agent.materializeChat(peerChat, { configurationResource: session, resource: peerChat }, JSON.stringify({ sessionId: 'peer-runtime' }));
+		await agent.materializeChat(defaultChat, { configurationResource: session, resource: defaultChat }, fumieReceipt('default-runtime'));
+		await agent.materializeChat(peerChat, { configurationResource: session, resource: peerChat }, fumieReceipt('peer-runtime'));
 		agent['_sessions'].get('default-runtime')!.workingDirectory = URI.file('/repo/default');
 		agent['_sessions'].get('peer-runtime')!.workingDirectory = URI.file('/repo/peer');
 
 		const metadata = await agent.getChatMetadata(
 			peerChat,
 			{ configurationResource: session, resource: peerChat },
-			JSON.stringify({ sessionId: 'peer-runtime' }),
+			fumieReceipt('peer-runtime'),
 		);
 
 		assert.deepStrictEqual({
@@ -1631,16 +1873,17 @@ suite('CodexAgent chat backing durability', () => {
 				// The fork is materialized on return, so `onDidMaterializeChat`
 				// never fires for it — the create result is the host's only
 				// chance to persist a backing it can restore from. The blob names
-				// the runtime's own durable id, the thread id is decoupled into
-				// the metadata overlay, and the thread itself is reported as the
-				// exact backing so the host can mark it internal.
+				// both the stable runtime id and exact current thread id; the thread
+				// itself is also reported so the host can mark it internal.
 				backingSessionId: forked.providerData ? JSON.parse(forked.providerData).sessionId : undefined,
+				backingThreadId: forked.providerData ? JSON.parse(forked.providerData).threadId : undefined,
 				backingSession: forked.backingSession?.toString(),
 				runtimeSessionUri: agent['_sessions'].get('fork-target')?.sessionUri.toString(),
 				runtimeThreadId: agent['_sessions'].get('fork-target')?.threadId,
 			}, {
 				session: forkSession.toString(),
 				backingSessionId: 'fork-target',
+				backingThreadId: 'forked-thread',
 				backingSession: AgentSession.uri('codex', 'forked-thread').toString(),
 				runtimeSessionUri: forkSession.toString(),
 				runtimeThreadId: 'forked-thread',

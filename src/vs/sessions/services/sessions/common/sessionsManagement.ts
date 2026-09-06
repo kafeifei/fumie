@@ -19,6 +19,11 @@ export class WorkspaceNotTrustedError extends Error {
 	}
 }
 
+export interface IArchiveSessionOptions {
+	/** The calling UI already obtained an explicit confirmation for this archive action. */
+	readonly userConfirmed?: boolean;
+}
+
 /**
  * Options for sending a request through the sessions management service.
  *
@@ -332,10 +337,16 @@ export interface ISessionsManagementService {
 	 */
 	readonly onDidSendRequest: Event<ISendRequestSentEvent>;
 
+	/** Fires synchronously before a session is archived via {@link archiveSession}. */
+	readonly onWillArchiveSession: Event<ISession>;
 	/** Fires after a session was successfully archived via {@link archiveSession}. */
 	readonly onDidArchiveSession: Event<ISession>;
 	/** Fires after a session was successfully unarchived via {@link unarchiveSession}. */
 	readonly onDidUnarchiveSession: Event<ISession>;
+	/** Fires synchronously before a session is deleted via {@link deleteSession} or {@link deleteSessions}. */
+	readonly onWillDeleteSession: Event<ISession>;
+	/** Fires when archive/delete failed after teardown preflight stopped session tasks. */
+	readonly onDidFailSessionTeardown: Event<ISession>;
 	/** Fires after a session was successfully deleted via {@link deleteSession}. */
 	readonly onDidDeleteSession: Event<ISession>;
 	/** Fires after a chat was successfully deleted via {@link deleteChat}. */
@@ -511,8 +522,8 @@ export interface ISessionsManagementService {
 	/** Cancel the current request in a session's main chat. */
 	cancelCurrentRequest(session: ISession): Promise<void>;
 
-	/** Archive a session. */
-	archiveSession(session: ISession): Promise<void>;
+	/** Archive a session after explicit user confirmation. */
+	archiveSession(session: ISession, options?: IArchiveSessionOptions): Promise<void>;
 
 	/** Unarchive a session. */
 	unarchiveSession(session: ISession): Promise<void>;

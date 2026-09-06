@@ -498,8 +498,12 @@ export class ExplorerView extends ViewPane implements IExplorerView {
 		}
 	}
 
+	protected createFilesFilter(): FilesFilter {
+		return this.instantiationService.createInstance(FilesFilter);
+	}
+
 	private createTree(container: HTMLElement): void {
-		this.filter = this.instantiationService.createInstance(FilesFilter);
+		this.filter = this.createFilesFilter();
 		this._register(this.filter);
 		this._register(this.filter.onDidChange(() => this.refresh(true)));
 		const explorerLabels = this.instantiationService.createInstance(ResourceLabels, { onDidChangeVisibility: this.onDidChangeBodyVisibility });

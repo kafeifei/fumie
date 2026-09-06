@@ -13,6 +13,7 @@ import {
 	ToolCallConfirmationReason,
 	ToolCallStatus,
 	ToolResultContentType,
+	TurnState,
 	type ResponsePart,
 	type ToolCallResponsePart,
 	type ToolResultContent,
@@ -57,6 +58,14 @@ import type { Turn as CodexTurn } from './protocol/generated/v2/Turn.js';
  *  - `contextCompaction` → completed compaction `ToolCallResponsePart`
  *  - everything else    → currently dropped (reasoning/plan/mcp/collab)
  *
+ * A codex turn holding several `userMessage` items (a steered/mid-turn
+ * follow-up codex folded into the running turn) is split into one host turn
+ * per user message, mirroring how the live mapper promotes a steer into its
+ * own turn. The codex turn id stays on the LAST segment — the id contract
+ * `truncateChat`/fork rely on ("keep through this turn" keeps the whole
+ * codex turn); earlier segments get derived `<id>#<n>` ids, which those
+ * consumers treat as unknown and safely no-op on.
+ *
  * Mirrors the live mapper's translation kernel — including the sandbox
  * pre-flight coalescing (see {@link codexMapAppServerEvents}) — so restored
  * sessions render identically to active ones.
@@ -68,14 +77,11 @@ export function replayThreadToTurns(
 ): Turn[] {
 	const turns: Turn[] = [];
 	for (const codexTurn of thread.turns ?? []) {
-		const turn = replayTurnToTurn(
+		turns.push(...replayTurnToTurns(
 			codexTurn,
 			modelsByTurnId?.get(codexTurn.id),
 			_threadCoordinationByTurnId?.get(codexTurn.id),
-		);
-		if (turn) {
-			turns.push(turn);
-		}
+		));
 	}
 	return turns;
 }
@@ -83,9 +89,15 @@ export function replayThreadToTurns(
 /** A completed `commandExecution` item narrowed to its terminal fields. */
 type CommandExecutionItem = Extract<ThreadItem, { type: 'commandExecution' }>;
 
-function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefined, rolloutCoordination: readonly ICodexThreadCoordinationCall[] | undefined): Turn | undefined {
-	let userText = '';
-	const parts: ResponsePart[] = [];
+/** One host-visible turn segment of a codex turn: a user message plus the response parts that followed it. */
+interface IReplaySegment {
+	userText: string;
+	parts: ResponsePart[];
+}
+
+function replayTurnToTurns(codexTurn: CodexTurn, model: ModelSelection | undefined, rolloutCoordination: readonly ICodexThreadCoordinationCall[] | undefined): Turn[] {
+	const segments: IReplaySegment[] = [];
+	let current: IReplaySegment = { userText: '', parts: [] };
 	const linkedCreatedThreadIds = new Set<string>();
 	const remainingRolloutCoordination = new Map<string, number>();
 	for (const coordination of rolloutCoordination ?? []) {
@@ -94,7 +106,7 @@ function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefine
 		if (coordination.toolName === SessionServerToolName.CreateSession) {
 			linkedCreatedThreadIds.add(coordination.targetThreadId);
 		}
-		parts.push(threadCoordinationToolCallPart(coordination));
+		current.parts.push(threadCoordinationToolCallPart(coordination));
 	}
 	// Separate consecutive agent messages so the chat model's separator-less
 	// markdown coalescing keeps a following heading on its own line.
@@ -106,7 +118,7 @@ function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefine
 	let pendingPreflight: { command: string; item: CommandExecutionItem } | undefined;
 	const flushPreflight = () => {
 		if (pendingPreflight) {
-			parts.push(shellToolCallPart(pendingPreflight.item, pendingPreflight.command));
+			current.parts.push(shellToolCallPart(pendingPreflight.item, pendingPreflight.command));
 			pendingPreflight = undefined;
 		}
 	};
@@ -119,7 +131,7 @@ function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefine
 				// item (it carries the real output/approval), dropping the
 				// output-less pre-flight box.
 				pendingPreflight = undefined;
-				parts.push(shellToolCallPart(item, command));
+				current.parts.push(shellToolCallPart(item, command));
 				continue;
 			}
 			flushPreflight();
@@ -129,7 +141,7 @@ function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefine
 				pendingPreflight = { command, item };
 				continue;
 			}
-			parts.push(shellToolCallPart(item, command));
+			current.parts.push(shellToolCallPart(item, command));
 			continue;
 		}
 
@@ -145,14 +157,26 @@ function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefine
 				}
 			}
 			if (collected.length > 0) {
-				userText = collected.join('\n\n');
+				const text = collected.join('\n\n');
+				if (!current.userText) {
+					current.userText = text;
+				} else {
+					// A second user message inside one codex turn is a steered
+					// follow-up codex folded into the running turn. Split it into
+					// its own host turn — mirroring the live mapper, which promotes
+					// a steer into a fresh turn — instead of overwriting (and thus
+					// dropping) the earlier prompt.
+					segments.push(current);
+					current = { userText: text, parts: [] };
+					agentMessageCount = 0;
+				}
 			}
 		} else if (item.type === 'agentMessage') {
 			const message = extractCodexCreatedThreadDirectives(item.text ?? '');
 			if (message.text.length > 0) {
 				const separator = agentMessageCount > 0 ? '\n\n' : '';
 				agentMessageCount++;
-				parts.push({
+				current.parts.push({
 					kind: ResponsePartKind.Markdown,
 					id: generateUuid(),
 					content: separator + message.text,
@@ -161,7 +185,7 @@ function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefine
 			for (const threadId of message.threadIds) {
 				if (!linkedCreatedThreadIds.has(threadId)) {
 					linkedCreatedThreadIds.add(threadId);
-					parts.push(threadCoordinationToolCallPart({
+					current.parts.push(threadCoordinationToolCallPart({
 						toolName: SessionServerToolName.CreateSession,
 						targetThreadId: threadId,
 						openLink: buildCodexThreadOpenLink(threadId),
@@ -170,11 +194,11 @@ function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefine
 				}
 			}
 		} else if (item.type === 'webSearch') {
-			parts.push(webSearchToolCallPart(item));
+			current.parts.push(webSearchToolCallPart(item));
 		} else if (item.type === 'imageGeneration') {
-			parts.push(imageGenerationToolCallPart(item));
+			current.parts.push(imageGenerationToolCallPart(item));
 		} else if (item.type === 'fileChange') {
-			parts.push(fileChangeToolCallPart(item));
+			current.parts.push(fileChangeToolCallPart(item));
 		} else if (item.type === 'dynamicToolCall') {
 			const coordination = getCodexThreadCoordinationCall(item);
 			if (coordination) {
@@ -186,40 +210,50 @@ function replayTurnToTurn(codexTurn: CodexTurn, model: ModelSelection | undefine
 					if (coordination.toolName === SessionServerToolName.CreateSession) {
 						linkedCreatedThreadIds.add(coordination.targetThreadId);
 					}
-					parts.push(threadCoordinationToolCallPart(coordination));
+					current.parts.push(threadCoordinationToolCallPart(coordination));
 				}
 			}
 		} else if (item.type === 'contextCompaction') {
-			if (!userText) {
-				userText = '/compact';
+			if (!current.userText) {
+				current.userText = '/compact';
 			}
-			parts.push(compactionToolCallPart());
+			current.parts.push(compactionToolCallPart());
 		}
 		// Other item types (plan/reasoning/mcpToolCall/collabAgentToolCall/…)
 		// are not yet reconstructed in replay.
 	}
 	flushPreflight();
-	const delegation = parseCodexDelegation(userText);
+	segments.push(current);
 
-	// If we got nothing recognizable, drop the turn — there's nothing for
-	// the UI to render.
-	if (!userText && parts.length === 0) {
-		return undefined;
-	}
-	return {
-		id: codexTurn.id,
-		...codexTurnTiming(codexTurn),
-		message: {
-			text: delegation?.input ?? userText,
-			origin: { kind: MessageKind.User },
-			...(model ? { model } : {}),
-			...(delegation ? { _meta: toAgentMessageDelegationMeta({ sourceThreadId: delegation.sourceThreadId }) } : {}),
-		},
-		responseParts: parts,
-		usage: model ? { model: model.id } : undefined,
-		state: turnStateFromStatus(codexTurn.status),
-		...(codexTurn.status === 'failed' && codexTurn.error ? { error: mapCodexTurnError(codexTurn.error) } : {}),
-	};
+	// Drop segments with nothing to render (an empty codex turn yields a
+	// single all-empty segment; split segments always carry user text).
+	const rendered = segments.filter(segment => segment.userText || segment.parts.length > 0);
+	const timing = codexTurnTiming(codexTurn);
+	return rendered.map((segment, index) => {
+		const last = index === rendered.length - 1;
+		const delegation = parseCodexDelegation(segment.userText);
+		return {
+			// The codex turn id names the whole codex turn for truncate/fork, so
+			// it must land on exactly one host turn — the last segment, which is
+			// where "keep through this turn" and the live id-correlation both
+			// point. Earlier segments get derived ids those consumers ignore.
+			id: last ? codexTurn.id : `${codexTurn.id}#${index}`,
+			...(index === 0 ? timing : {}),
+			message: {
+				text: delegation?.input ?? segment.userText,
+				origin: { kind: MessageKind.User },
+				...(model ? { model } : {}),
+				...(delegation ? { _meta: toAgentMessageDelegationMeta({ sourceThreadId: delegation.sourceThreadId }) } : {}),
+			},
+			responseParts: segment.parts,
+			usage: model ? { model: model.id } : undefined,
+			// Only the final segment reflects how the codex turn actually ended;
+			// earlier segments were superseded by the follow-up user message,
+			// same as a live steer completes the turn it interrupts.
+			state: last ? turnStateFromStatus(codexTurn.status) : TurnState.Complete,
+			...(last && codexTurn.status === 'failed' && codexTurn.error ? { error: mapCodexTurnError(codexTurn.error) } : {}),
+		};
+	});
 }
 
 function threadCoordinationToolCallPart(coordination: ICodexThreadCoordinationCall): ToolCallResponsePart {

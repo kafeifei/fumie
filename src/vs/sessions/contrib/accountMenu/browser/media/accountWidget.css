@@ -74,6 +74,87 @@
 	padding: 4px 6px;
 }
 
+/* Desktop account/status row. The full account widget moved here from the
+	title bar; keep its rich state and panel while adapting the trigger to the
+	available sidebar width. */
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget {
+	flex: 1 1 auto;
+	justify-content: flex-start;
+	gap: 6px;
+	box-sizing: border-box;
+	height: 26px;
+	width: auto;
+	min-width: 0;
+	padding: 0 6px;
+	overflow: hidden;
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget.has-chatgpt-account {
+	width: auto;
+	min-width: 0;
+	overflow: hidden;
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget:focus {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget .sessions-account-titlebar-widget-label {
+	display: block;
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	font-size: var(--vscode-agents-fontSize-label1);
+	font-weight: var(--vscode-agents-fontWeight-semiBold);
+	text-align: left;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget.has-chatgpt-account .sessions-account-titlebar-widget-avatar,
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget.has-chatgpt-account .sessions-account-titlebar-widget-icon {
+	left: 4px;
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget.has-chatgpt-account .sessions-account-titlebar-widget-codex-icon {
+	left: 14px;
+	right: auto;
+	border-color: var(--vscode-sideBar-background);
+	background: var(--vscode-sideBar-background);
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget.has-chatgpt-account .sessions-account-titlebar-widget-label {
+	margin-left: 28px;
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget .sessions-account-titlebar-widget-badge.dot-badge {
+	left: 15px;
+	right: auto;
+	border-color: var(--vscode-sideBar-background);
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .sessions-account-sidebar-widget.has-chatgpt-account .sessions-account-titlebar-widget-badge.dot-badge {
+	left: 24px;
+}
+
+/* Settings is a sibling menu action, not part of the account trigger. */
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .action-item:has(> .action-label.codicon-settings-gear) {
+	flex: 0 0 26px;
+	height: 26px;
+}
+
+.monaco-workbench.agent-sessions-workbench .part.sidebar > .sidebar-footer .action-item > .action-label.codicon-settings-gear {
+	box-sizing: border-box;
+	width: 26px;
+	height: 26px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	border-radius: var(--vscode-cornerRadius-small);
+}
+
 /* Chat status dashboard shown from sidebar footer */
 .monaco-hover .chat-status-bar-entry-tooltip {
 	font-size: var(--vscode-agents-fontSize-label1);

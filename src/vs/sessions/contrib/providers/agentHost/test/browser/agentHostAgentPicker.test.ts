@@ -5,8 +5,11 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+import { isIMenuItem, MenuId, MenuRegistry } from '../../../../../../platform/actions/common/actions.js';
 import { CustomizationType, type AgentCustomization } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { agentHostAgentPickerStorageKey, resolveAgentHostAgent } from '../../../../../../platform/agentHost/common/customAgents.js';
+import { Menus } from '../../../../../browser/menus.js';
+import { AGENT_HOST_AGENT_PICKER_ACTION_ID } from '../../browser/agentHostAgentPicker.js';
 
 suite('agentHostAgentPicker', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -14,6 +17,14 @@ suite('agentHostAgentPicker', () => {
 	const alpha: AgentCustomization = { type: CustomizationType.Agent, id: 'agent://a', uri: 'agent://a', name: 'alpha' };
 	const beta: AgentCustomization = { type: CustomizationType.Agent, id: 'agent://b', uri: 'agent://b', name: 'beta', description: 'b desc' };
 	const agents: readonly AgentCustomization[] = [alpha, beta];
+
+	test('does not put an Agent chip on the Agents composer menus', () => {
+		const ids = (menu: MenuId) => MenuRegistry.getMenuItems(menu)
+			.filter(isIMenuItem)
+			.map(item => item.command.id);
+		assert.ok(!ids(Menus.NewSessionConfig).includes(AGENT_HOST_AGENT_PICKER_ACTION_ID));
+		assert.ok(!ids(MenuId.ChatInput).includes(AGENT_HOST_AGENT_PICKER_ACTION_ID));
+	});
 
 	suite('agentHostAgentPickerStorageKey', () => {
 		test('builds a per-scheme storage key', () => {

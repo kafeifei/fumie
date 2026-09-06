@@ -26,6 +26,7 @@ import { CodeWindow, mainWindow } from '../../../base/browser/window.js';
 import { TitlebarPart, TitleService } from '../../browser/parts/titlebarPart.js';
 import { isMacintosh, isWindows } from '../../../base/common/platform.js';
 import { localize } from '../../../nls.js';
+import { formatFumieDebugBuildNumber } from '../../common/fumieDebugBuildNumber.js';
 
 export class NativeTitlebarPart extends TitlebarPart {
 
@@ -61,7 +62,10 @@ export class NativeTitlebarPart extends TitlebarPart {
 		// matches the BrowserWindow's initial title.
 		// See: https://github.com/microsoft/vscode/issues/191288
 		const window = getWindow(this.element);
-		const agentsTitle = localize('agentsWindowTitle', "Agents");
+		const buildNumberLabel = formatFumieDebugBuildNumber(this.productService.fumieDebugBuildNumber);
+		const agentsTitle = buildNumberLabel
+			? localize('agentsWindowTitleWithProductAndBuildNumber', "{0} · {1}", this.productService.nameShort, buildNumberLabel)
+			: this.productService.nameLong;
 		if (isMacintosh) {
 			const initialTitle = this.productService.nameLong;
 			if (!window.document.title || window.document.title === initialTitle) {
@@ -71,6 +75,11 @@ export class NativeTitlebarPart extends TitlebarPart {
 		window.document.title = agentsTitle;
 
 		const result = super.createContentArea(parent);
+		if (buildNumberLabel) {
+			const buildLabel = localize('fumieDebugBuildLabel', "{0} · {1}", this.productService.nameShort, buildNumberLabel);
+			const buildNumberElement = append(this.leftContainer, $('span.fumie-debug-build-number'));
+			buildNumberElement.textContent = buildLabel;
+		}
 		const targetWindow = getWindow(parent);
 		const targetWindowId = getWindowId(targetWindow);
 

@@ -4,7 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { stub } from 'sinon';
 import * as dom from '../../../../../base/browser/dom.js';
+import { Emitter } from '../../../../../base/common/event.js';
 import { DisposableStore, MutableDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { observableValue } from '../../../../../base/common/observable.js';
 import { URI } from '../../../../../base/common/uri.js';
@@ -12,15 +14,140 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import { CHAT_WIDGET_VIEW_STATE_CACHE_LIMIT } from '../../../../../workbench/contrib/chat/browser/chat.js';
 import { ChatInputNoticeHost, ChatInputNoticeLane } from '../../../../../workbench/contrib/chat/browser/widget/input/chatInputNoticeHost.js';
 import { isChatInputStackSlotShowing } from '../../../../../workbench/contrib/chat/browser/widget/input/chatInputStack.js';
-import { findTranscriptContextEntry, getTranscriptProgress, NewChatView, shouldShowSessionChatTip, shouldShowTranscriptPreparationProgress } from '../../browser/chatView.js';
+import { ChatView, createFumieAgentsChatWidgetViewOptions, findTranscriptContextEntry, getTranscriptProgress, NewChatView, shouldShowSessionChatTip, shouldShowTranscriptPreparationProgress } from '../../browser/chatView.js';
 import { SessionsChatViewStateService } from '../../browser/chatViewStateService.js';
 import { NewChatInSessionWidget } from '../../browser/newChatInSessionWidget.js';
 import { NewChatWidget } from '../../browser/newChatWidget.js';
 import { IChatRequestTranscriptContextVariableEntry } from '../../../../../workbench/contrib/chat/common/attachments/chatVariableEntries.js';
-import { SessionStatus } from '../../../../services/sessions/common/session.js';
+import { IChat, ISession, SessionStatus } from '../../../../services/sessions/common/session.js';
+import { installMobileChatKeyboardDismissal } from '../../browser/mobile/mobileChatKeyboard.js';
 
 suite('Sessions - Chat View', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	function createReadTrackingView() {
+		const targetWindow = dom.getWindow(document);
+		const focused = stub(document, 'hasFocus').returns(true);
+		const visibility = stub(document, 'visibilityState').get(() => 'visible');
+		disposables.add(toDisposable(() => { focused.restore(); visibility.restore(); }));
+		const resource = URI.parse('test:///unread');
+		const isRead = observableValue('isRead', true);
+		const chats = observableValue<readonly IChat[]>('chats', [{ resource } as IChat]);
+		const session = { resource, isRead, chats } as unknown as ISession;
+		const currentSession = observableValue<ISession | undefined>('session', session);
+		const currentResource = observableValue<URI | undefined>('resource', resource);
+		const active = observableValue('active', true);
+		const visible = observableValue('visible', true);
+		const onDidChangeViewModel = disposables.add(new Emitter<void>());
+		const onDidScroll = disposables.add(new Emitter<void>());
+		const onDidChangeContentHeight = disposables.add(new Emitter<void>());
+		let atBottom = true;
+		const marked: ISession[] = [];
+		const widget = {
+			viewModel: { sessionResource: resource } as { sessionResource: URI } | undefined,
+			viewportHeight: 500,
+			getViewState: () => ({ isAtBottom: atBottom }),
+			onDidChangeViewModel: onDidChangeViewModel.event,
+			onDidScroll: onDidScroll.event,
+			onDidChangeContentHeight: onDidChangeContentHeight.event,
+		};
+		const view = Object.assign(Object.create(ChatView.prototype), {
+			element: dom.$('.chat-view-read-test'),
+			_register: <T extends { dispose(): void }>(value: T) => disposables.add(value),
+			_currentSessionObs: currentSession,
+			_currentChatResourceObs: currentResource,
+			_isActiveObs: active,
+			_isVisibleObs: visible,
+			_widget: widget,
+			sessionsManagementService: { markRead: async (value: ISession) => { marked.push(value); isRead.set(true, undefined); } },
+			logService: { error: (err: unknown) => { throw err; } },
+		}) as { _setupReadTracking(): void };
+		view._setupReadTracking();
+		return {
+			isRead, focused, visibility, active, visible, widget, marked, resource, chats, currentSession, currentResource,
+			onDidChangeViewModel, onDidChangeContentHeight,
+			scroll: (bottom: boolean) => { atBottom = bottom; onDidScroll.fire(); },
+			focus: () => { focused.returns(true); targetWindow.dispatchEvent(new FocusEvent('focus')); },
+			flush: () => new Promise<void>(resolve => dom.scheduleAtNextAnimationFrame(targetWindow, () => resolve(), -100)),
+		};
+	}
+
+	test('keeps a completed selected session unread in a background window until returning', async () => {
+		const view = createReadTrackingView();
+		view.focused.returns(false);
+		view.isRead.set(false, undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), false);
+		view.focus();
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), true);
+		assert.strictEqual(view.marked.length, 1);
+	});
+
+	test('keeps new output unread while reading older content and clears it after scrolling down', async () => {
+		const view = createReadTrackingView();
+		view.scroll(false);
+		view.isRead.set(false, undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), false);
+		view.scroll(true);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), true);
+	});
+
+	test('requires an active visible transcript, including when visibility changes without a scroll', async () => {
+		const view = createReadTrackingView();
+		view.active.set(false, undefined);
+		view.isRead.set(false, undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), false);
+		view.visible.set(false, undefined);
+		view.active.set(true, undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), false);
+		view.visible.set(true, undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), true);
+	});
+
+	test('waits for the correct model and restored scroll position before marking read', async () => {
+		const view = createReadTrackingView();
+		view.widget.viewModel = undefined;
+		view.isRead.set(false, undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), false);
+		view.widget.viewModel = { sessionResource: view.resource };
+		view.onDidChangeViewModel.fire();
+		view.scroll(false);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), false);
+		view.scroll(true);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), true);
+	});
+
+	test('requires a bound chat belonging to the session and preserves session-wide read semantics', async () => {
+		const view = createReadTrackingView();
+		const sideChat = URI.parse('test:///side-chat');
+		view.currentResource.set(sideChat, undefined);
+		view.widget.viewModel = { sessionResource: sideChat };
+		view.isRead.set(false, undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), false);
+		view.chats.set([...view.chats.get(), { resource: sideChat } as IChat], undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), true);
+	});
+
+	test('acknowledges new output already visible at the bottom', async () => {
+		const view = createReadTrackingView();
+		view.isRead.set(false, undefined);
+		await view.flush();
+		assert.strictEqual(view.isRead.get(), true);
+		view.onDidChangeContentHeight.fire();
+		await view.flush();
+		assert.strictEqual(view.marked.length, 1);
+	});
 
 	/** Reaches the banner without standing up the widget's whole service graph. */
 	interface ISubSessionTipRenderer {
@@ -143,6 +270,84 @@ suite('Sessions - Chat View', () => {
 			variableData: { variables: [] },
 			attachedContext: [attachment],
 		}]), attachment);
+	});
+
+	test('Agents chat composer does not expose Copilot Agent/Ask/Plan modes', () => {
+		const options = createFumieAgentsChatWidgetViewOptions();
+		assert.strictEqual(options.supportsChangingModes, false);
+		assert.strictEqual(options.isSessionsWindow, true);
+		assert.strictEqual(typeof options.modelPickerDelegateAdapter, 'function');
+	});
+
+	test('dismisses a phone keyboard only after an accepted input is reset', async () => {
+		const host = dom.append(document.body, dom.$('.mobile-keyboard-test-host'));
+		const composer = dom.append(host, dom.$('.mobile-keyboard-test-composer'));
+		const input = dom.append(composer, dom.$('textarea'));
+		const outside = dom.append(host, dom.$('button'));
+		disposables.add(toDisposable(() => host.remove()));
+
+		const accepted = disposables.add(new Emitter<void>());
+		const loaded = disposables.add(new Emitter<void>());
+		const changed = disposables.add(new Emitter<void>());
+		let value = 'message';
+		let phoneLayout = true;
+		disposables.add(installMobileChatKeyboardDismissal({
+			onDidAcceptInput: accepted.event,
+			onDidLoadInputState: loaded.event,
+			onDidChangeInput: changed.event,
+			getInputValue: () => value,
+			inputContainer: composer,
+			isPhoneLayout: () => phoneLayout,
+		}));
+
+		input.focus();
+		accepted.fire();
+		loaded.fire();
+		value = '';
+		changed.fire();
+		await Promise.resolve();
+		const phoneAcceptedCleared = document.activeElement !== input;
+
+		input.focus();
+		phoneLayout = false;
+		value = 'message';
+		accepted.fire();
+		loaded.fire();
+		value = '';
+		changed.fire();
+		await Promise.resolve();
+		const desktopAcceptedCleared = document.activeElement === input;
+
+		input.focus();
+		phoneLayout = true;
+		value = 'message';
+		accepted.fire();
+		value = '';
+		changed.fire();
+		loaded.fire();
+		await Promise.resolve();
+		const failedSubmissionStayedFocused = document.activeElement === input;
+
+		outside.focus();
+		value = 'message';
+		accepted.fire();
+		loaded.fire();
+		value = '';
+		changed.fire();
+		await Promise.resolve();
+		const outsideFocusPreserved = document.activeElement === outside;
+
+		assert.deepStrictEqual({
+			phoneAcceptedCleared,
+			desktopAcceptedCleared,
+			failedSubmissionStayedFocused,
+			outsideFocusPreserved,
+		}, {
+			phoneAcceptedCleared: true,
+			desktopAcceptedCleared: true,
+			failedSubmissionStayedFocused: true,
+			outsideFocusPreserved: true,
+		});
 	});
 
 	test('the sub-session tip yields the space to a notification and comes back', () => {

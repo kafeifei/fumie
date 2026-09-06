@@ -7,6 +7,7 @@ import { decodeBase64, VSBuffer } from '../../../base/common/buffer.js';
 import { disposableTimeout } from '../../../base/common/async.js';
 import { Emitter, Event } from '../../../base/common/event.js';
 import { Disposable, DisposableStore, IDisposable, MutableDisposable, toDisposable } from '../../../base/common/lifecycle.js';
+import { posix } from '../../../base/common/path.js';
 import { URI } from '../../../base/common/uri.js';
 import { createFileSystemProviderError, FileChangeType, FilePermission, FileSystemProviderCapabilities, FileSystemProviderErrorCode, FileType, IFileChange, IFileDeleteOptions, IFileOverwriteOptions, IFileSystemProvider, IFileSystemProviderWithFileRealpathCapability, IFileWriteOptions, IStat, IWatchOptions } from '../../files/common/files.js';
 import { fromAgentHostUri, toAgentHostUri } from './agentHostUri.js';
@@ -119,6 +120,23 @@ export async function createRemoteWatchHandle(
 	};
 }
 
+type WatchResource = NonNullable<IRemoteFilesystemConnection['watchResource']>;
+
+/**
+ * Parent directory of a remote resource, or `undefined` once at the root.
+ * Deliberately posix-only: the path belongs to the remote endpoint, so the
+ * client's own platform must not decide where it is split.
+ */
+function parentResource(resource: URI): URI | undefined {
+	const parent = posix.dirname(resource.path);
+	return parent === resource.path ? undefined : resource.with({ path: parent });
+}
+
+/** Whether a rejected remote operation means "that path is not there". */
+function isNotFoundError(err: unknown): boolean {
+	return err instanceof ProtocolError && err.code === AhpErrorCodes.NotFound;
+}
+
 /**
  * Build a {@link AGENT_HOST_SCHEME} URI for a given connection authority
  * and remote path. Assumes the remote path is a `file://` resource.
@@ -154,6 +172,10 @@ interface IAuthorityEntry {
 	readonly expiry: MutableDisposable<IDisposable>;
 }
 
+const GIT_BLOB_READ_CACHE_MAX_ENTRIES = 2048;
+const GIT_BLOB_READ_CACHE_MAX_BYTES = 96 * 1024 * 1024;
+const GIT_BLOB_READ_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
+
 /**
  * {@link IFileSystemProvider} that proxies filesystem operations
  * through a {@link IRemoteFilesystemConnection}.
@@ -187,6 +209,10 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 	 * replacement registration instead of failing immediately.
 	 */
 	private readonly _authorities = new Map<string, IAuthorityEntry>();
+	private readonly _connectionGenerations = new Map<string, number>();
+	private readonly _gitBlobReadCache = new Map<string, Uint8Array>();
+	private readonly _gitBlobReadsInFlight = new Map<string, Promise<Uint8Array>>();
+	private _gitBlobReadCacheBytes = 0;
 
 	/**
 	 * Fires the authority whose active connection has changed: added,
@@ -240,7 +266,7 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 			entry.connections.push(connection);
 		}
 		const adopted = entry;
-		this._onDidChangeConnection.fire(authority);
+		this._didChangeConnection(authority);
 
 		return toDisposable(() => {
 			const idx = adopted.connections.indexOf(connection);
@@ -258,9 +284,14 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 			}
 
 			if (wasActive) {
-				this._onDidChangeConnection.fire(authority); // Falling back to an older connection — surface the change.
+				this._didChangeConnection(authority); // Falling back to an older connection — surface the change.
 			}
 		});
+	}
+
+	private _didChangeConnection(authority: string): void {
+		this._connectionGenerations.set(authority, (this._connectionGenerations.get(authority) ?? 0) + 1);
+		this._onDidChangeConnection.fire(authority);
 	}
 
 	private _expireAuthority(authority: string, entry: IAuthorityEntry): void {
@@ -271,7 +302,7 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 		}
 		this._authorities.delete(authority);
 		entry.expiry.dispose();
-		this._onDidChangeConnection.fire(authority);
+		this._didChangeConnection(authority);
 	}
 
 	override dispose(): void {
@@ -280,6 +311,10 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 			entry.connections.length = 0;
 		}
 		this._authorities.clear();
+		this._connectionGenerations.clear();
+		this._gitBlobReadCache.clear();
+		this._gitBlobReadsInFlight.clear();
+		this._gitBlobReadCacheBytes = 0;
 		super.dispose();
 	}
 
@@ -302,10 +337,14 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 		// the full entry-eviction cycle.
 		const store = new DisposableStore();
 		const handleHolder = store.add(new MutableDisposable<IDisposable>());
+		// Holds the ancestor watch used while the watched path itself does
+		// not exist yet (see `monitorAncestor` below).
+		const monitorHolder = store.add(new MutableDisposable<IDisposable>());
 		const authority = resource.authority;
+		const decoded = this._decodeUri(resource);
 		const params: CreateResourceWatchParams = {
 			channel: ROOT_STATE_URI,
-			uri: this._decodeUri(resource).toString(),
+			uri: decoded.toString(),
 			recursive: opts.recursive,
 			...(opts.excludes.length > 0 ? { excludes: { items: [...opts.excludes] } } : {}),
 			...(opts.includes && opts.includes.length > 0
@@ -319,6 +358,60 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 		let attached: IRemoteFilesystemConnection | undefined;
 		let attaching = false;
 		let pendingReattach = false;
+		// Set while the watched path does not exist on the remote. The
+		// connection and root of the ancestor watch standing in for it are
+		// kept so a retry that fails again can reuse it.
+		let suspended = false;
+		let monitorTarget: IRemoteFilesystemConnection | undefined;
+		let monitorRoot: string | undefined;
+
+		const clearMonitor = (): void => {
+			monitorHolder.clear();
+			monitorTarget = undefined;
+			monitorRoot = undefined;
+		};
+
+		// `createResourceWatch` answers `NotFound` for a path that is not
+		// there yet, so a session whose working directory has no
+		// `.claude/settings.json` (or `.mcp.json`, ...) would never learn
+		// that the user created one. Locally the watcher suspends such a
+		// request and resumes it once the path appears
+		// (`platform/files/node/watcher/baseWatcher.ts`); do the same by
+		// watching the closest existing ancestor and using it purely as a
+		// trigger to try the real watch again. Walking stops at the
+		// ancestor a previous suspension settled on: nothing between it and
+		// the watched path existed then, so the handle we hold is still the
+		// right one.
+		const monitorAncestor = async (target: IRemoteFilesystemConnection, watchResource: WatchResource): Promise<void> => {
+			const keepAt = monitorTarget === target ? monitorRoot : undefined;
+			if (!keepAt) {
+				clearMonitor();
+			}
+			let candidate = parentResource(decoded);
+			while (candidate && candidate.toString() !== keepAt) {
+				try {
+					const handle = await watchResource.call(target, { channel: ROOT_STATE_URI, uri: candidate.toString(), recursive: false });
+					if (store.isDisposed) {
+						handle.dispose();
+						return;
+					}
+					const sub = handle.onDidChange(() => void reattach());
+					monitorHolder.value = toDisposable(() => {
+						sub.dispose();
+						handle.dispose();
+					});
+					monitorTarget = target;
+					monitorRoot = candidate.toString();
+					return;
+				} catch (err) {
+					if (!isNotFoundError(err)) {
+						this._onDidWatchError.fire(err instanceof Error ? err.message : String(err));
+						return;
+					}
+				}
+				candidate = parentResource(candidate);
+			}
+		};
 
 		const reattach = async (): Promise<void> => {
 			if (store.isDisposed) {
@@ -337,6 +430,7 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 			attached = undefined;
 			const watchResource = next?.watchResource;
 			if (!next || !watchResource) {
+				clearMonitor();
 				return;
 			}
 			attaching = true;
@@ -363,8 +457,22 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 					handle.dispose();
 				});
 				attached = target;
+				clearMonitor();
+				if (suspended) {
+					suspended = false;
+					// The local watcher reports the path it was waiting for
+					// as it resumes; a caller listening only for changes
+					// would otherwise never hear about the file it asked
+					// about.
+					this._onDidChangeFile.fire([{ resource, type: FileChangeType.ADDED }]);
+				}
 			} catch (err) {
-				this._onDidWatchError.fire(err instanceof Error ? err.message : String(err));
+				if (isNotFoundError(err)) {
+					suspended = true;
+					await monitorAncestor(target, watchResource);
+				} else {
+					this._onDidWatchError.fire(err instanceof Error ? err.message : String(err));
+				}
 			} finally {
 				attaching = false;
 				if (pendingReattach) {
@@ -445,9 +553,99 @@ export abstract class AHPFileSystemProvider extends Disposable implements IFileS
 	}
 
 	async readFile(resource: URI): Promise<Uint8Array> {
-		const connection = await this._getConnection(resource.authority);
+		const originalUri = this._decodeUri(resource);
+		if (this._isImmutableGitBlob(originalUri)) {
+			return this._readGitBlob(resource.authority, originalUri);
+		}
+		return this._readFileUncached(resource.authority, originalUri);
+	}
+
+	private _isImmutableGitBlob(resource: URI): boolean {
+		if (resource.scheme !== 'git-blob' || !resource.query) {
+			return false;
+		}
 		try {
-			const originalUri = this._decodeUri(resource);
+			const query = JSON.parse(resource.query) as { readonly sha?: unknown; readonly immutable?: unknown };
+			return query.immutable === true && typeof query.sha === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(query.sha);
+		} catch {
+			return false;
+		}
+	}
+
+	private async _readGitBlob(authority: string, originalUri: URI): Promise<Uint8Array> {
+		const connectionGeneration = this._connectionGenerations.get(authority) ?? 0;
+		const key = JSON.stringify([authority, connectionGeneration, originalUri.toString()]);
+		const cached = this._getCachedGitBlob(key);
+		if (cached) {
+			return this._copyBytes(cached);
+		}
+
+		let pending = this._gitBlobReadsInFlight.get(key);
+		if (!pending) {
+			const tracked = this._readFileUncached(authority, originalUri).then(value => {
+				if (!this._store.isDisposed && this._connectionGenerations.get(authority) === connectionGeneration) {
+					this._cacheGitBlob(key, value);
+				}
+				if (this._gitBlobReadsInFlight.get(key) === tracked) {
+					this._gitBlobReadsInFlight.delete(key);
+				}
+				return value;
+			}, error => {
+				if (this._gitBlobReadsInFlight.get(key) === tracked) {
+					this._gitBlobReadsInFlight.delete(key);
+				}
+				throw error;
+			});
+			this._gitBlobReadsInFlight.set(key, tracked);
+			pending = tracked;
+		}
+
+		return this._copyBytes(await pending);
+	}
+
+	private _copyBytes(value: Uint8Array): Uint8Array {
+		const copy = new Uint8Array(value.byteLength);
+		copy.set(value);
+		return copy;
+	}
+
+	private _getCachedGitBlob(key: string): Uint8Array | undefined {
+		const value = this._gitBlobReadCache.get(key);
+		if (!value) {
+			return undefined;
+		}
+		this._gitBlobReadCache.delete(key);
+		this._gitBlobReadCache.set(key, value);
+		return value;
+	}
+
+	private _cacheGitBlob(key: string, value: Uint8Array): void {
+		if (value.byteLength > GIT_BLOB_READ_CACHE_MAX_ENTRY_BYTES || value.byteLength > GIT_BLOB_READ_CACHE_MAX_BYTES) {
+			return;
+		}
+
+		const previous = this._gitBlobReadCache.get(key);
+		if (previous) {
+			this._gitBlobReadCache.delete(key);
+			this._gitBlobReadCacheBytes -= previous.byteLength;
+		}
+		this._gitBlobReadCache.set(key, value);
+		this._gitBlobReadCacheBytes += value.byteLength;
+
+		while (this._gitBlobReadCache.size > GIT_BLOB_READ_CACHE_MAX_ENTRIES || this._gitBlobReadCacheBytes > GIT_BLOB_READ_CACHE_MAX_BYTES) {
+			const oldestKey = this._gitBlobReadCache.keys().next().value;
+			if (oldestKey === undefined) {
+				break;
+			}
+			const oldest = this._gitBlobReadCache.get(oldestKey)!;
+			this._gitBlobReadCache.delete(oldestKey);
+			this._gitBlobReadCacheBytes -= oldest.byteLength;
+		}
+	}
+
+	private async _readFileUncached(authority: string, originalUri: URI): Promise<Uint8Array> {
+		const connection = await this._getConnection(authority);
+		try {
 			const result = await connection.resourceRead(originalUri, ContentEncoding.Base64);
 			if (result.encoding === ContentEncoding.Base64) {
 				return decodeBase64(result.data).buffer;

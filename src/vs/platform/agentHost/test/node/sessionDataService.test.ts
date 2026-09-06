@@ -38,6 +38,15 @@ suite('SessionDataService', () => {
 		assert.strictEqual(dir.toString(), URI.joinPath(basePath, 'agentSessionData', 'abc-123').toString());
 	});
 
+	test('uses an explicit session-data home without adding a legacy directory layer', () => {
+		const sessionsHome = URI.joinPath(basePath, 'sessions');
+		const explicit = new SessionDataService(basePath, fileService, new NullLogService(), undefined, sessionsHome);
+		assert.strictEqual(
+			explicit.getSessionDataDir(AgentSession.uri('codex', 'session-1')).toString(),
+			URI.joinPath(sessionsHome, 'session-1').toString(),
+		);
+	});
+
 	test('getSessionDataDir sanitizes unsafe characters', () => {
 		const session = AgentSession.uri('copilot', 'foo/bar:baz\\qux');
 		const dir = service.getSessionDataDir(session);
@@ -70,6 +79,23 @@ suite('SessionDataService', () => {
 		const session = AgentSession.uri('copilot', 'nonexistent');
 		// Should not throw
 		await service.deleteSessionData(session);
+	});
+
+	test('deleteSessionData propagates filesystem failure so lifecycle finalization can retry', async () => {
+		const session = AgentSession.uri('copilot', 'delete-failure');
+		const dir = service.getSessionDataDir(session);
+		await fileService.createFolder(dir);
+		const failure = new Error('session data delete failed');
+		const originalDelete = fileService.del.bind(fileService);
+		fileService.del = async resource => {
+			if (resource.toString() === dir.toString()) {
+				throw failure;
+			}
+			return originalDelete(resource);
+		};
+
+		await assert.rejects(service.deleteSessionData(session), error => error === failure);
+		assert.strictEqual(await fileService.exists(dir), true);
 	});
 
 	test('cleanupOrphanedData deletes orphans but keeps known sessions', async () => {

@@ -17,7 +17,7 @@ import { IInstantiationService } from '../../../util/vs/platform/instantiation/c
 import { resolveModelInfo } from '../common/byokProvider';
 import { OpenAIEndpoint } from '../node/openAIEndpoint';
 import { AbstractOpenAICompatibleLMProvider, LanguageModelChatConfiguration, OpenAICompatibleLanguageModelChatInformation } from './abstractLanguageModelChatProvider';
-import { byokKnownModelToAPIInfoWithEffort } from './byokModelInfo';
+import { byokKnownModelToAPIInfoWithEffort, hasConfiguredModelId } from './byokModelInfo';
 import { IBYOKStorageService } from './byokStorageService';
 
 export type CustomEndpointApiType = 'chat-completions' | 'responses' | 'messages';
@@ -108,6 +108,7 @@ interface _CustomEndpointModelConfig {
 	modelOptions?: IChatModelRequestOptions;
 	zeroDataRetentionEnabled?: boolean;
 	supportsReasoningEffort?: string[];
+	defaultReasoningEffort?: string;
 	reasoningEffortFormat?: 'chat-completions' | 'responses' | 'messages';
 }
 
@@ -143,6 +144,9 @@ export class CustomEndpointBYOKModelProvider extends AbstractOpenAICompatibleLMP
 		const models: OpenAICompatibleLanguageModelChatInformation<CustomEndpointModelProviderConfig>[] = [];
 		if (Array.isArray(configuration?.models)) {
 			for (const modelConfig of configuration.models) {
+				if (!hasConfiguredModelId(modelConfig)) {
+					continue;
+				}
 				models.push({
 					...byokKnownModelToAPIInfoWithEffort(this._name, modelConfig.id, modelConfig),
 					url: modelConfig.url
@@ -174,6 +178,7 @@ export class CustomEndpointBYOKModelProvider extends AbstractOpenAICompatibleLMP
 			modelOptions: modelConfiguration?.modelOptions,
 			zeroDataRetentionEnabled: modelConfiguration?.zeroDataRetentionEnabled,
 			supportsReasoningEffort: modelConfiguration?.supportsReasoningEffort,
+			defaultReasoningEffort: modelConfiguration?.defaultReasoningEffort,
 			reasoningEffortFormat: modelConfiguration?.reasoningEffortFormat
 		};
 		const modelInfo = resolveModelInfo(model.id, this._name, undefined, modelCapabilities);

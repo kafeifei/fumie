@@ -1,0 +1,573 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.agent-settings-section-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+}
+
+.agent-settings-section-header .agent-settings-button-host {
+	min-width: 0;
+}
+
+.agent-settings-section-header .monaco-button {
+	width: auto;
+	padding: 4px 12px;
+}
+
+.agent-settings-row-unavailable .agent-settings-label,
+.agent-settings-link-row.agent-settings-row-unavailable .agent-settings-link-title {
+	color: var(--vscode-descriptionForeground);
+}
+
+/* --- Cards --------------------------------------------------------------- */
+
+.agent-settings-card {
+	margin-top: 12px;
+	padding: 12px 14px;
+	border: 1px solid color-mix(in srgb, var(--session-view-foreground) 12%, transparent);
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--session-view-foreground) 3%, transparent);
+}
+
+.agent-settings-card-header {
+	display: flex;
+	align-items: flex-start;
+	gap: 10px;
+}
+
+.agent-settings-card-icon {
+	flex: 0 0 auto;
+	margin-top: 2px;
+	font-size: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-card-heading {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.agent-settings-card-title {
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 18px;
+}
+
+.agent-settings-card-subline {
+	margin-top: 2px;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-card-actions {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	gap: 8px;
+}
+
+.agent-settings-card-actions .agent-settings-button-host,
+.agent-settings-card-actions .agent-settings-checkbox-host {
+	min-width: 0;
+}
+
+.agent-settings-card-actions .monaco-button {
+	width: auto;
+	padding: 2px 10px;
+}
+
+.agent-settings-card-body {
+	margin-top: 10px;
+	padding-top: 10px;
+	border-top: 1px solid color-mix(in srgb, var(--session-view-foreground) 8%, transparent);
+}
+
+/* --- The address rows on the This Machine card ---------------------------- */
+
+.agent-settings-link-row,
+.agent-settings-info-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.agent-settings-info-row {
+	margin-top: 8px;
+}
+
+.agent-settings-info-icon {
+	flex: 0 0 auto;
+	font-size: 14px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-link-labels {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.agent-settings-link-title {
+	font-size: 12px;
+	font-weight: 600;
+	line-height: 16px;
+}
+
+.agent-settings-link-url {
+	overflow: hidden;
+	font-family: var(--monaco-monospace-font);
+	font-size: 12px;
+	line-height: 18px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agent-settings-link-detail {
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+/* --- The pairing code ----------------------------------------------------- */
+
+.agent-settings-qr-row {
+	align-items: flex-start;
+	gap: 14px;
+}
+
+.agent-settings-qr {
+	/*
+	 * A reader needs genuinely dark modules on a genuinely light plate — an
+	 * inverted code is not reliably scannable — so the code itself does not
+	 * follow the theme and only the frame around it does. Both are variables
+	 * so a theme that knows better can still say so.
+	 */
+	--agent-settings-qr-light: #ffffff;
+	--agent-settings-qr-dark: #000000;
+
+	flex: 0 0 auto;
+	overflow: hidden;
+	border: 1px solid color-mix(in srgb, var(--session-view-foreground) 12%, transparent);
+	border-radius: 6px;
+	background: var(--agent-settings-qr-light);
+	line-height: 0;
+}
+
+.agent-settings-qr-svg {
+	display: block;
+	width: 128px;
+	height: 128px;
+}
+
+.agent-settings-qr-plate {
+	fill: var(--agent-settings-qr-light);
+}
+
+.agent-settings-qr-modules {
+	fill: var(--agent-settings-qr-dark);
+}
+
+.agent-settings-qr-row .agent-settings-link-title {
+	margin-bottom: 8px;
+}
+
+.agent-settings-qr-row .agent-settings-inline-actions {
+	min-width: 0;
+	margin-bottom: 8px;
+}
+
+.agent-settings-qr-row .agent-settings-inline-actions .monaco-button {
+	width: auto;
+	padding: 2px 10px;
+}
+
+/* --- Connected devices ---------------------------------------------------- */
+
+.agent-settings-clients {
+	margin-top: 12px;
+	padding-top: 10px;
+	border-top: 1px solid color-mix(in srgb, var(--session-view-foreground) 8%, transparent);
+}
+
+.agent-settings-clients-title {
+	font-size: 12px;
+	font-weight: 600;
+	line-height: 16px;
+}
+
+.agent-settings-client-list {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin-top: 4px;
+}
+
+.agent-settings-client-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 4px 6px;
+	border-radius: 6px;
+}
+
+.agent-settings-client-row:hover {
+	background: color-mix(in srgb, var(--session-view-foreground) 8%, transparent);
+}
+
+.agent-settings-client-icon {
+	flex: 0 0 auto;
+	font-size: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-client-labels {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.agent-settings-client-name {
+	overflow: hidden;
+	font-size: 13px;
+	line-height: 18px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agent-settings-client-detail {
+	overflow: hidden;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agent-settings-client-row .agent-settings-inline-actions,
+.agent-settings-client-row .agent-settings-button-host {
+	min-width: 0;
+}
+
+.agent-settings-client-row .monaco-button {
+	width: auto;
+	padding: 2px 10px;
+}
+
+.agent-settings-client-empty {
+	padding: 4px 6px;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+/* --- Device cards --------------------------------------------------------- */
+
+.agent-settings-device-card {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.agent-settings-status-dot {
+	flex: 0 0 auto;
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-status-dot.connected {
+	background: var(--vscode-charts-green, var(--vscode-testing-iconPassed));
+}
+
+.agent-settings-status-dot.connecting {
+	background: var(--vscode-charts-yellow, var(--vscode-editorWarning-foreground));
+}
+
+.agent-settings-status-dot.idle {
+	background: color-mix(in srgb, var(--session-view-foreground) 35%, transparent);
+}
+
+.agent-settings-device-icon {
+	flex: 0 0 auto;
+	font-size: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-device-labels {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.agent-settings-device-name {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	overflow: hidden;
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 18px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agent-settings-device-detail {
+	overflow: hidden;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agent-settings-badge {
+	flex: 0 0 auto;
+	padding: 0 6px;
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--session-view-foreground) 12%, transparent);
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	font-weight: 400;
+	line-height: 16px;
+}
+
+.agent-settings-empty-state {
+	margin-top: 12px;
+}
+
+.agent-settings-empty-state .agent-settings-intro {
+	margin-bottom: 12px;
+}
+
+.agent-settings-empty-state .monaco-button {
+	width: auto;
+	padding: 4px 12px;
+}
+
+/* --- Add Device ----------------------------------------------------------- */
+
+.agent-settings-add-header {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.agent-settings-add-title {
+	flex: 1 1 auto;
+	min-width: 0;
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 18px;
+}
+
+.agent-settings-add-header .agent-settings-inline-actions,
+.agent-settings-add-row .agent-settings-inline-actions,
+.agent-settings-add-header .agent-settings-button-host,
+.agent-settings-add-row .agent-settings-button-host,
+.agent-settings-add-actions .agent-settings-button-host {
+	min-width: 0;
+}
+
+.agent-settings-add-header .monaco-button,
+.agent-settings-add-actions .monaco-button {
+	width: auto;
+	padding: 2px 10px;
+}
+
+.agent-settings-add-detail,
+.agent-settings-add-note,
+.agent-settings-add-busy {
+	margin-top: 6px;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-add-error {
+	margin-top: 8px;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-errorForeground);
+}
+
+.agent-settings-add-choices {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	margin-top: 10px;
+}
+
+.agent-settings-add-choice {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	width: 100%;
+	padding: 8px 10px;
+	border: 1px solid color-mix(in srgb, var(--session-view-foreground) 12%, transparent);
+	border-radius: 6px;
+	background: transparent;
+	color: inherit;
+	cursor: pointer;
+	font: inherit;
+	text-align: left;
+}
+
+.agent-settings-add-choice:hover {
+	background: color-mix(in srgb, var(--session-view-foreground) 8%, transparent);
+}
+
+.agent-settings-add-choice:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.agent-settings-add-choice-icon,
+.agent-settings-add-row-icon {
+	flex: 0 0 auto;
+	font-size: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-add-choice-labels,
+.agent-settings-add-row-labels {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.agent-settings-add-choice-label,
+.agent-settings-add-row-name {
+	overflow: hidden;
+	font-size: 13px;
+	line-height: 18px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agent-settings-add-choice-detail,
+.agent-settings-add-row-detail {
+	overflow: hidden;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agent-settings-add-form {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-top: 10px;
+}
+
+.agent-settings-add-field {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.agent-settings-add-field-label {
+	flex: 0 0 88px;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-add-field .agent-settings-input {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.agent-settings-add-list {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	max-height: 220px;
+	margin-top: 8px;
+	overflow-y: auto;
+}
+
+.agent-settings-add-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 4px 6px;
+	border-radius: 6px;
+}
+
+.agent-settings-add-row:hover {
+	background: color-mix(in srgb, var(--session-view-foreground) 8%, transparent);
+}
+
+.agent-settings-add-row .monaco-button {
+	width: auto;
+	padding: 2px 10px;
+}
+
+.agent-settings-add-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 10px;
+}
+
+/* --- The `…` button ------------------------------------------------------- */
+
+.agent-settings-icon-button {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	padding: 0;
+	border: none;
+	border-radius: 4px;
+	background: transparent;
+	color: inherit;
+	cursor: pointer;
+}
+
+.agent-settings-icon-button:hover {
+	background: color-mix(in srgb, var(--session-view-foreground) 10%, transparent);
+}
+
+.agent-settings-icon-button:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+/* --- Advanced ------------------------------------------------------------- */
+
+.agent-settings-collapsible > .agent-settings-collapsible-summary {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	cursor: pointer;
+	list-style: none;
+}
+
+.agent-settings-collapsible > .agent-settings-collapsible-summary::-webkit-details-marker {
+	display: none;
+}
+
+.agent-settings-collapsible > .agent-settings-collapsible-summary .codicon {
+	font-size: 14px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-collapsible[open] > .agent-settings-collapsible-summary .codicon {
+	transform: rotate(90deg);
+}
+
+.agent-settings-collapsible > .agent-settings-collapsible-summary:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 2px;
+}
+
+.agent-settings-collapsible > .agent-settings-section-description {
+	margin-top: 4px;
+}

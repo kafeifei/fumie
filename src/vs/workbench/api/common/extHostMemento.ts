@@ -8,6 +8,7 @@ import { IDisposable } from '../../../base/common/lifecycle.js';
 import { ExtHostStorage } from './extHostStorage.js';
 import { IExtensionDescription } from '../../../platform/extensions/common/extensions.js';
 import { DeferredPromise, RunOnceScheduler } from '../../../base/common/async.js';
+import product from '../../../platform/product/common/product.js';
 
 export class ExtensionMemento implements vscode.Memento {
 
@@ -26,15 +27,21 @@ export class ExtensionMemento implements vscode.Memento {
 		this._id = id;
 		this._shared = global;
 		this._storage = storage;
+		const defaults = this._shared
+			? product.extensionGlobalStateDefaults?.[this._id] ?? product.extensionGlobalStateDefaults?.[this._id.toLowerCase()]
+			: undefined;
+		const withDefaults = (value: object | undefined): { [n: string]: any } => defaults
+			? Object.assign(Object.create(null), defaults, value)
+			: value ?? Object.create(null);
 
 		this._init = this._storage.initializeExtensionStorage(this._shared, this._id, Object.create(null)).then(value => {
-			this._value = value;
+			this._value = withDefaults(value);
 			return this;
 		});
 
 		this._storageListener = this._storage.onDidChangeStorage(e => {
 			if (e.shared === this._shared && e.key === this._id) {
-				this._value = e.value;
+				this._value = withDefaults(e.value);
 			}
 		});
 

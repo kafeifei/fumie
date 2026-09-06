@@ -27,8 +27,9 @@ import { VisibleSessions } from './visibleSessions.js';
 import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { ISessionsPartService } from './sessionsPartService.js';
 import { ICustomViewService } from '../../customView/browser/customViewService.js';
-import { IsNewChatSessionContext } from '../../../common/contextkeys.js';
+import { IsNewChatSessionContext, IsPhoneLayoutContext } from '../../../common/contextkeys.js';
 import { setActiveSessionContextKeys } from '../common/sessionContextKeys.js';
+import { ensureWorktreesTrusted } from '../common/sessionWorkspaceTrust.js';
 import { ISessionChangesStatsCache } from '../common/sessionChangesStatsCache.js';
 
 const ACTIVE_SESSION_STATES_KEY = 'agentSessions.activeSessionStates';
@@ -342,9 +343,9 @@ export class SessionsService extends Disposable implements ISessionsService {
 	private readonly _recencyHistory: SessionsRecencyHistory;
 
 	/**
-	 * Session id (or `undefined` for the new-session slot) that focus was last
-	 * moved into in response to an active-session change. Tracks the active id
-	 * so unrelated visibility updates don't re-focus and steal focus.
+	 * Session id (or `undefined` for the new-session slot) whose active-session
+	 * focus policy was last applied. Tracks the active id so unrelated visibility
+	 * updates don't re-focus and steal focus.
 	 */
 	private _focusedActiveSessionId: string | undefined;
 
@@ -438,16 +439,6 @@ export class SessionsService extends Disposable implements ISessionsService {
 			}
 		}));
 
-		// Viewing a session marks it read. This keeps the active session read
-		// while it stays active, so `ISession.isRead` is the single source of
-		// truth for read state (no display-only overlay needed).
-		this._register(autorun(reader => {
-			const activeSession = this.activeSession.read(reader);
-			if (activeSession && !activeSession.isRead.read(reader)) {
-				this.sessionsManagementService.markRead(activeSession);
-			}
-		}));
-
 		// Reflect provider-level session changes onto the grid: drop removed
 		// sessions and pick a fallback (or the new-session view) when the active
 		// one disappears.
@@ -478,10 +469,14 @@ export class SessionsService extends Disposable implements ISessionsService {
 			// check ensures unrelated visibility updates do not move focus.
 			// `preserveFocus` (published atomically with the active session)
 			// suppresses the focus move for background opens.
+			// Phone browsers also skip this script-driven focus: once the initiating
+			// gesture has ended it cannot open the soft keyboard, leaving a focused
+			// editor that may ignore the user's next tap. Explicit gesture-bound
+			// focus paths (such as the phone New Session button) remain available.
 			const activeId = active?.sessionId;
 			if (activeId !== this._focusedActiveSessionId) {
 				this._focusedActiveSessionId = activeId;
-				if (!preserveFocus) {
+				if (!preserveFocus && IsPhoneLayoutContext.getValue(this.contextKeyService) !== true) {
 					this.sessionsPartService.focusSession(active);
 				}
 			}
@@ -824,6 +819,10 @@ export class SessionsService extends Disposable implements ISessionsService {
 		if (!workspace?.requiresWorkspaceTrust) {
 			return true;
 		}
+		// A worktree created off an already-trusted base repository is auto-trusted
+		// before the check below, so opening a worktree session never prompts for a
+		// folder the user effectively trusts already.
+		await ensureWorktreesTrusted(this.workspaceTrustManagementService, workspace);
 		// Every folder the session operates in must be trusted before it opens, not
 		// just the primary one: the agent — and its tasks, terminals and other
 		// tooling — can run against any of the session's working directories, so we
@@ -1337,32 +1336,24 @@ export class SessionsService extends Disposable implements ISessionsService {
 		const resolved: (ISession | null | undefined)[] = new Array(targets.length).fill(undefined);
 
 		/**
-		 * Insert a resolved session into the grid next to the nearest
-		 * already-placed neighbour, preserving the persisted order regardless of
-		 * the order in which sessions become available. When a neighbour exists
-		 * the active session is left unchanged; only in the edge case where no
-		 * neighbour has been placed yet (e.g. the active target never resurfaced,
-		 * so the grid laid out empty) does the first session to arrive become
-		 * active as a sensible fallback.
+		 * Append a session that resolved after the initial atomic layout.
+		 *
+		 * Restore used to slot stragglers into their persisted position, but the
+		 * part rebinds grid slots by POSITION, so every mid-list insertion
+		 * shifted the slots to its right — the transcript the user was already
+		 * reading swapped to a different session's until the order settled.
+		 * Stragglers now always join at the RIGHT edge: the established layout
+		 * never rebinds, at the cost of persisted-order fidelity for sessions
+		 * that missed the atomic pass (the next persist records what the user
+		 * actually sees). Only when nothing has been placed at all (e.g. the
+		 * active target never resurfaced, so the grid laid out empty) does the
+		 * first session to arrive become active as a sensible fallback.
 		 */
 		const place = (idx: number, session: ISession): void => {
-			let anchor: { id: string | undefined; side: 'left' | 'right' } | undefined;
-			for (let j = idx - 1; j >= 0 && !anchor; j--) {
-				const neighbour = resolved[j];
-				if (neighbour !== undefined) {
-					anchor = { id: neighbour?.sessionId, side: 'right' };
-				}
-			}
-			for (let j = idx + 1; j < targets.length && !anchor; j++) {
-				const neighbour = resolved[j];
-				if (neighbour !== undefined) {
-					anchor = { id: neighbour?.sessionId, side: 'left' };
-				}
-			}
-
 			resolved[idx] = session;
-			if (anchor) {
-				this._visibility.insertAt(session, anchor.id, anchor.side, false);
+			const visible = this.visibleSessions.get();
+			if (visible.length > 0) {
+				this._visibility.insertAt(session, visible[visible.length - 1]?.sessionId, 'right', false);
 			} else {
 				this._activate(session);
 			}
@@ -1422,8 +1413,9 @@ export class SessionsService extends Disposable implements ISessionsService {
 		// Focus is moved into the restored active session by the reconcile
 		// autorun, which observes the active-session change.
 
-		// Place any sessions that became available later in their correct
-		// positions around the already-established layout.
+		// Append any sessions that became available later to the right of the
+		// already-established layout (see `place` for why not their persisted
+		// positions).
 		await Promise.all(targets.map(async (target, idx) => {
 			if (idx === activeIdx || !target.resource || token.isCancellationRequested || resolved[idx] !== undefined) {
 				return;

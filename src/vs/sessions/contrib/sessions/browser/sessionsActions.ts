@@ -1082,6 +1082,16 @@ export abstract class CompactButtonActionViewItem extends BaseActionViewItem {
 		return true;
 	}
 
+	/** Primary filled button (sidebar New Agent) vs the compact secondary pill. */
+	protected get isPrimary(): boolean {
+		return false;
+	}
+
+	/** Optional leading icon before the label. */
+	protected get leadingIcon(): ThemeIcon | undefined {
+		return undefined;
+	}
+
 	/** Hook invoked right before the action runs (e.g. for telemetry). */
 	protected onRun(): void { }
 
@@ -1094,14 +1104,16 @@ export abstract class CompactButtonActionViewItem extends BaseActionViewItem {
 
 		const button = this._register(new Button(this.element, {
 			...defaultButtonStyles,
-			buttonSecondaryBackground: asCssVariable(agentsNewSessionButtonBackground),
-			buttonSecondaryForeground: asCssVariable(agentsNewSessionButtonForeground),
-			buttonSecondaryHoverBackground: asCssVariable(agentsNewSessionButtonHoverBackground),
-			buttonSecondaryBorder: asCssVariable(agentsNewSessionButtonBorder),
-			secondary: true,
+			...(this.isPrimary ? {} : {
+				buttonSecondaryBackground: asCssVariable(agentsNewSessionButtonBackground),
+				buttonSecondaryForeground: asCssVariable(agentsNewSessionButtonForeground),
+				buttonSecondaryHoverBackground: asCssVariable(agentsNewSessionButtonHoverBackground),
+				buttonSecondaryBorder: asCssVariable(agentsNewSessionButtonBorder),
+			}),
+			secondary: !this.isPrimary,
 			supportIcons: true,
 		}));
-		button.element.classList.add('agent-sessions-compact-new-button');
+		button.element.classList.add(this.isPrimary ? 'agent-sessions-new-agent-button' : 'agent-sessions-compact-new-button');
 		const onboardingTargetId = this.onboardingTargetId;
 		if (onboardingTargetId) {
 			this._register(markOnboardingTarget(button.element, onboardingTargetId));
@@ -1116,7 +1128,14 @@ export abstract class CompactButtonActionViewItem extends BaseActionViewItem {
 			this.actionRunner.run(this.action, this._context);
 		}));
 
-		const buttonLabel = $('span.new-session-button-label', undefined, this.label);
+		const buttonLabel = $('span.new-session-button-label');
+		const leadingIcon = this.leadingIcon;
+		if (leadingIcon) {
+			const icon = $('span');
+			icon.classList.add(...ThemeIcon.asClassNameArray(leadingIcon));
+			buttonLabel.appendChild(icon);
+		}
+		buttonLabel.appendChild(document.createTextNode(this.label));
 		const keybindingHint = $('span.new-session-keybinding-hint');
 		const keybindingHintLabel = this.showKeybindingHint
 			? this._register(new KeybindingLabel(keybindingHint, OS, {
@@ -1171,8 +1190,7 @@ export abstract class CompactButtonActionViewItem extends BaseActionViewItem {
 }
 
 /**
- * Renders the new-session action as the compact "New" pill, shared by the sessions sidebar
- * header and the titlebar.
+ * Renders the new-session action as the compact "New" pill in the titlebar.
  */
 class NewSessionActionViewItem extends CompactButtonActionViewItem {
 
@@ -1217,7 +1235,64 @@ class NewSessionActionViewItem extends CompactButtonActionViewItem {
 }
 
 /**
- * Registers {@link NewSessionActionViewItem} in the sessions sidebar header and the titlebar.
+ * Full-width primary "New Agent" button for the sessions sidebar.
+ */
+class SidebarNewAgentActionViewItem extends CompactButtonActionViewItem {
+
+	constructor(
+		action: IAction,
+		private readonly telemetrySource: SessionsInteractionSource,
+		@IKeybindingService keybindingService: IKeybindingService,
+		@IHoverService hoverService: IHoverService,
+		@ITelemetryService private readonly telemetryService: ITelemetryService,
+		@IContextKeyService contextKeyService: IContextKeyService,
+	) {
+		super(action, keybindingService, hoverService, contextKeyService);
+	}
+
+	protected override get commandId(): string {
+		return NEW_SESSION_ACTION_ID;
+	}
+
+	protected override get label(): string {
+		return localize('newAgent', "New Agent");
+	}
+
+	protected override get isPrimary(): boolean {
+		return true;
+	}
+
+	protected override get showKeybindingHint(): boolean {
+		return false;
+	}
+
+	protected override get leadingIcon(): ThemeIcon | undefined {
+		return Codicon.add;
+	}
+
+	protected override get onboardingTargetId(): string {
+		return 'sessions.newSession.button';
+	}
+
+	protected override getHoverContent(keybindingLabel: string | undefined): string {
+		return keybindingLabel
+			? localize('newAgentButtonTitle', "New Agent ({0})", keybindingLabel)
+			: localize('newAgentButtonTitleWithoutKeybinding', "New Agent");
+	}
+
+	protected override getAriaLabel(keybindingAriaLabel: string | undefined): string {
+		return keybindingAriaLabel
+			? localize('newAgentButtonAriaLabel', "New Agent ({0})", keybindingAriaLabel)
+			: localize('newAgentButtonAriaLabelWithoutKeybinding', "New Agent");
+	}
+
+	protected override onRun(): void {
+		logSessionsInteraction(this.telemetryService, 'newSession', this.telemetrySource);
+	}
+}
+
+/**
+ * Registers the sidebar "New Agent" button and the titlebar compact "New" pill.
  * The titlebar entry is gated behind an A/B experiment via {@link SessionsTitleBarNewSessionEnabledContext}.
  */
 export class NewSessionActionViewItemContribution extends Disposable implements IWorkbenchContribution {
@@ -1240,16 +1315,18 @@ export class NewSessionActionViewItemContribution extends Disposable implements 
 		this.titleBarEnabledContext = SessionsTitleBarNewSessionEnabledContext.bindTo(contextKeyService);
 
 		const onDidRegister = this._register(new Emitter<void>());
-		const menus: MenuId[] = [Menus.SidebarSessionsHeader, Menus.TitleBarLeftLayout];
-		for (const menu of menus) {
-			const source: SessionsInteractionSource = menu === Menus.TitleBarLeftLayout ? 'titleBar' : 'sidebar';
-			this._register(actionViewItemService.register(menu, NEW_SESSION_ACTION_ID, (action, _options, instantiationService) => {
-				if (!(action instanceof MenuItemAction)) {
-					return undefined;
-				}
-				return instantiationService.createInstance(NewSessionActionViewItem, action, source);
-			}, onDidRegister.event));
-		}
+		this._register(actionViewItemService.register(Menus.SidebarNewAgent, NEW_SESSION_ACTION_ID, (action, _options, instantiationService) => {
+			if (!(action instanceof MenuItemAction)) {
+				return undefined;
+			}
+			return instantiationService.createInstance(SidebarNewAgentActionViewItem, action, 'sidebar');
+		}, onDidRegister.event));
+		this._register(actionViewItemService.register(Menus.TitleBarLeftLayout, NEW_SESSION_ACTION_ID, (action, _options, instantiationService) => {
+			if (!(action instanceof MenuItemAction)) {
+				return undefined;
+			}
+			return instantiationService.createInstance(NewSessionActionViewItem, action, 'titleBar');
+		}, onDidRegister.event));
 		onDidRegister.fire();
 
 		// Resolve the titlebar experiment now and on refetch.

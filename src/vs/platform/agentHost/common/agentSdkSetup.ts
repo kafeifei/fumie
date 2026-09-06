@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import type { Event } from '../../../base/common/event.js';
 import type { RootState } from './state/protocol/state.js';
 
 /**
@@ -19,10 +20,39 @@ const AGENT_SDK_SETUP_STATUS_KEY_PREFIX = 'vscode.agentSdkSetup.status.';
 export const AGENT_SDK_SETUP_DOWNLOAD_REQUEST_KEY = 'vscode.agentSdkSetup.downloadRequest';
 
 /**
- * Ask an agent to look again at a setup the user completed outside the app
- * (`claude login`, an exported key) — the only completion signal there is.
+ * Ask an agent to start the official sign-in flow it declared.
+ *
+ * Always honoured, including while a sign-in is already running: the shell
+ * cannot see what happens in the browser — a cancelled authorization, a closed
+ * tab — so "already signing in" is only ever a display state, never a reason to
+ * refuse. A repeat request abandons the running attempt and starts a fresh one.
+ */
+export const AGENT_SDK_SETUP_SIGN_IN_REQUEST_KEY = 'vscode.agentSdkSetup.signInRequest';
+
+/** Ask an agent to abandon the sign-in flow it is running and go back to signed-out. */
+export const AGENT_SDK_SETUP_CANCEL_SIGN_IN_REQUEST_KEY = 'vscode.agentSdkSetup.cancelSignInRequest';
+
+/**
+ * Ask an agent to recheck setup after an external credential change, such as an
+ * exported key or a CLI login run outside Fumie.
  */
 export const AGENT_SDK_SETUP_RELOAD_REQUEST_KEY = 'vscode.agentSdkSetup.reloadRequest';
+
+/**
+ * The slice of an agent's SDK setup that a model-provider presentation reads,
+ * plus the two routes out of an unfinished one. The window's own agent host
+ * publishes it through `IAgentSdkSetupService`; a remote host publishes its own
+ * over its connection, and the presentation must not tell the user about this
+ * machine's account when the models come from another one.
+ */
+export interface IAgentSdkSetupPresentationSource {
+	readonly setups: readonly IAgentSdkSetupInfo[];
+	readonly onDidChangeSetups: Event<readonly IAgentSdkSetupInfo[]>;
+	requestDownload(agent: string): void;
+	signIn(agent: string): void;
+	/** Abandon a running sign-in and return the agent to signed-out. */
+	cancelSignIn(agent: string): void;
+}
 
 export function agentSdkSetupStatusKey(agent: string): string {
 	return `${AGENT_SDK_SETUP_STATUS_KEY_PREFIX}${agent}`;
@@ -30,12 +60,11 @@ export function agentSdkSetupStatusKey(agent: string): string {
 
 /**
  * Whether the agent's SDK can be loaded without a network fetch.
- *
- * Deliberately the *only* thing on the wire: account state is derivable from the
- * model list, which already flows over AHP — `ready` plus zero models means "no
- * account" — and publishing it too would be two sources for one truth.
  */
 export type AgentSdkDownloadStatus = 'notDownloaded' | 'downloading' | 'ready';
+
+/** The result of the agent's own authoritative account check. */
+export type AgentSdkAccountStatus = 'unknown' | 'signingIn' | 'signedOut' | 'signedIn' | 'error';
 
 /**
  * What an agent declares about its own setup. Capabilities, never UI: no
@@ -46,9 +75,11 @@ export interface IAgentSdkSetupInfo {
 	/** Agent/provider id, e.g. `'claude'`. */
 	readonly agent: string;
 	readonly download: AgentSdkDownloadStatus;
+	/** Absent for agents that do not publish a first-party account check. */
+	readonly accountStatus?: AgentSdkAccountStatus;
 	/**
-	 * Where the user goes to finish setup, for the agents whose setup happens
-	 * outside the app (`claude login`, an exported API key).
+	 * Where the user can learn about or finish setup, including agents that also
+	 * expose an in-app official sign-in flow.
 	 */
 	readonly setupDocsUrl?: string;
 	/**
@@ -85,6 +116,13 @@ function readOne(value: unknown, agent: string): IAgentSdkSetupInfo | undefined 
 	return {
 		agent,
 		download: info.download,
+		...(info.accountStatus === 'unknown'
+			|| info.accountStatus === 'signingIn'
+			|| info.accountStatus === 'signedOut'
+			|| info.accountStatus === 'signedIn'
+			|| info.accountStatus === 'error'
+			? { accountStatus: info.accountStatus }
+			: {}),
 		setupDocsUrl: typeof info.setupDocsUrl === 'string' ? info.setupDocsUrl : undefined,
 		signInProviderName: typeof info.signInProviderName === 'string' && info.signInProviderName.length > 0 ? info.signInProviderName : undefined,
 	};

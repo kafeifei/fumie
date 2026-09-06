@@ -8,7 +8,7 @@ import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { URI } from '../../../../base/common/uri.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { ResponsePartKind, ToolCallStatus, ToolResultContentType, TurnState } from '../../common/state/protocol/state.js';
+import { MessageAttachmentKind, ResponsePartKind, ToolCallStatus, ToolResultContentType, TurnState } from '../../common/state/protocol/state.js';
 import { mapSessionMessagesToTurns, missingPromptPlaceholder, resolveForkAnchorUuid } from '../../node/claude/claudeReplayMapper.js';
 
 suite('claudeReplayMapper', () => {
@@ -96,7 +96,7 @@ suite('claudeReplayMapper', () => {
 		assert.strictEqual(turns.length, 1);
 		assert.strictEqual(turns[0].id, 'u1', 'Turn.id MUST equal user SessionMessage.uuid');
 		assert.strictEqual(turns[0].message.text, 'hello');
-		assert.strictEqual(turns[0].usage, undefined, 'replay never has usage');
+		assert.strictEqual(turns[0].usage, undefined, 'no usage block in the transcript means no usage on the turn');
 		assert.strictEqual(turns[0].state, TurnState.Complete);
 		assert.strictEqual(turns[0].responseParts.length, 1);
 		const part = turns[0].responseParts[0];
@@ -104,6 +104,92 @@ suite('claudeReplayMapper', () => {
 		if (part.kind === ResponsePartKind.Markdown) {
 			assert.strictEqual(part.content, 'world');
 		}
+	});
+
+	function makeAssistantTextWithUsage(uuid: string, text: string, usage: Record<string, number>, model = 'claude-test'): TimestampedSessionMessage {
+		const base = makeAssistantText(uuid, text);
+		return { ...base, message: { ...(base.message as Record<string, unknown>), model, usage } } as TimestampedSessionMessage;
+	}
+
+	test('restores context occupancy from replayed assistant usage blocks', () => {
+		const messages: SessionMessage[] = [
+			makeUser('u1', 'hello'),
+			makeAssistantTextWithUsage('a1', 'world', { input_tokens: 10, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 100, output_tokens: 50 }),
+			makeUser('u2', 'again'),
+			makeAssistantTextWithUsage('a2', 'ok', { input_tokens: 20, cache_read_input_tokens: 70_000, cache_creation_input_tokens: 1_500, output_tokens: 200 }),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService);
+
+		assert.strictEqual(turns.length, 2);
+		// The turn's last main-loop call, transcribed 1:1 — same as the live
+		// mapper's mapResult, cache creation included via `_meta` because the
+		// generated `UsageInfo` has no field for it. Occupancy is the client's
+		// sum of the three input-side counters: 1_110 and 71_520, exactly what
+		// the pre-folded `inputTokens` used to carry.
+		assert.deepStrictEqual(turns[0].usage, { inputTokens: 10, outputTokens: 50, cacheReadTokens: 1_000, model: 'claude-test', _meta: { cacheCreationTokens: 100 } });
+		assert.deepStrictEqual(turns[1].usage, { inputTokens: 20, outputTokens: 200, cacheReadTokens: 70_000, model: 'claude-test', _meta: { cacheCreationTokens: 1_500 } });
+	});
+
+	test('an all-zero usage block (synthetic notice) does not wipe the last real occupancy', () => {
+		const messages: SessionMessage[] = [
+			makeUser('u1', 'hello'),
+			makeAssistantTextWithUsage('a1', 'world', { input_tokens: 10, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 0, output_tokens: 50 }),
+			makeAssistantTextWithUsage('a2', 'notice', { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 }, '<synthetic>'),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService);
+
+		assert.strictEqual(turns.length, 1);
+		// Occupancy still sums to 1_010, the pre-fold `inputTokens`.
+		assert.deepStrictEqual(turns[0].usage, { inputTokens: 10, outputTokens: 50, cacheReadTokens: 1_000, model: 'claude-test', _meta: { cacheCreationTokens: 0 } });
+	});
+
+	test('a non-zero usage block on a <synthetic> envelope does not wipe the known model', () => {
+		// The zero-usage case above is handled by `readAssistantUsage`. This is
+		// the other half: an SDK-synthesized envelope (error notice, injected
+		// reminder) can carry *real* non-zero usage while naming `<synthetic>`
+		// as its model. Overwriting the recorded model with `undefined` there
+		// strands the turn without a model id — and since replayed usage never
+		// carries `_meta.modelContextWindow`, that id is the only way the
+		// context gauge can resolve its denominator from the model catalog.
+		const messages: SessionMessage[] = [
+			makeUser('u1', 'hello'),
+			makeAssistantTextWithUsage('a1', 'world', { input_tokens: 10, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 0, output_tokens: 50 }, 'claude-sonnet-4-5-20250929'),
+			makeAssistantTextWithUsage('a2', 'notice', { input_tokens: 5, cache_read_input_tokens: 2_000, cache_creation_input_tokens: 0, output_tokens: 7 }, '<synthetic>'),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService);
+
+		assert.strictEqual(turns.length, 1);
+		// Occupancy advances to the synthetic envelope's (it is real usage), but
+		// the model stays the last real one the transcript named.
+		assert.deepStrictEqual(turns[0].usage, { inputTokens: 5, outputTokens: 7, cacheReadTokens: 2_000, model: 'claude-sonnet-4-5-20250929', _meta: { cacheCreationTokens: 0 } });
+	});
+
+	test('a <synthetic> envelope seen before any real model leaves the model absent', () => {
+		const messages: SessionMessage[] = [
+			makeUser('u1', 'hello'),
+			makeAssistantTextWithUsage('a1', 'notice', { input_tokens: 5, cache_read_input_tokens: 2_000, cache_creation_input_tokens: 0, output_tokens: 7 }, '<synthetic>'),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService);
+
+		assert.strictEqual(turns.length, 1);
+		assert.deepStrictEqual(turns[0].usage, { inputTokens: 5, outputTokens: 7, cacheReadTokens: 2_000, _meta: { cacheCreationTokens: 0 } });
+	});
+
+	test('a later real model supersedes the previously recorded one', () => {
+		const messages: SessionMessage[] = [
+			makeUser('u1', 'hello'),
+			makeAssistantTextWithUsage('a1', 'world', { input_tokens: 10, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 0, output_tokens: 50 }, 'claude-sonnet-4-5-20250929'),
+			makeAssistantTextWithUsage('a2', 'more', { input_tokens: 12, cache_read_input_tokens: 3_000, cache_creation_input_tokens: 0, output_tokens: 60 }, 'claude-opus-4-6'),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService);
+
+		assert.strictEqual(turns.length, 1);
+		assert.strictEqual(turns[0].usage?.model, 'claude-opus-4-6');
 	});
 
 	test('restores turn timing from persisted message timestamps', () => {
@@ -371,6 +457,133 @@ suite('claudeReplayMapper', () => {
 		assert.strictEqual(turns[0].message.text, 'what model are you');
 		assert.strictEqual(turns[1].id, 'u2');
 		assert.strictEqual(turns[1].message.text, 'how about now');
+	});
+
+	test('harness-injected task notifications never render as user turns; shared envelopes keep the genuine text', () => {
+		// The harness appends background-task notifications as `user`
+		// envelopes: a `[SYSTEM NOTIFICATION - NOT USER INPUT]` preamble
+		// followed by a `<task-notification>…</task-notification>` block.
+		// A notification queued while the user types can share an envelope
+		// with the genuine prompt, so stripping (not envelope-dropping) is
+		// required to keep that prompt.
+		const notification = '[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.\n<task-notification>\n<task-id>abc123</task-id>\n<status>stopped</status>\n<summary>No completion record was found.</summary>\n</task-notification>\n';
+		const messages: SessionMessage[] = [
+			makeUser('u1', 'start the work'),
+			makeAssistantText('a1', 'working'),
+			{
+				type: 'user',
+				uuid: 'notif-only',
+				session_id: 'sess-1',
+				parent_tool_use_id: null,
+				parent_agent_id: null,
+				message: { role: 'user', content: notification },
+			},
+			{
+				type: 'user',
+				uuid: 'notif-plus-prompt',
+				session_id: 'sess-1',
+				parent_tool_use_id: null,
+				parent_agent_id: null,
+				message: { role: 'user', content: `${notification}修掉` },
+			},
+			makeAssistantText('a2', 'on it'),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService);
+
+		assert.strictEqual(turns.length, 2, 'notification-only envelope must NOT start a turn');
+		assert.strictEqual(turns[0].id, 'u1');
+		assert.strictEqual(turns[0].message.text, 'start the work');
+		assert.strictEqual(turns[1].id, 'notif-plus-prompt');
+		assert.strictEqual(turns[1].message.text, '修掉', 'genuine text sharing the envelope survives the strip');
+	});
+
+	test('host instructions persisted by the UserPromptSubmit hook never render as user text', () => {
+		// The SDK persists the hook's `additionalContext` — the joined host
+		// instructions — as a leading `text` block of every user envelope,
+		// structurally indistinguishable from what the user typed. The history
+		// read hands the send's instruction strings back so replay can take
+		// them out again (`IAgentChatContext.hostInstructions`).
+		const instructionA = 'You are a coding agent inside Fumie, an agent-first desktop coding environment.';
+		const instructionB = 'When you produce something the user will want to open, record it once with add_artifact.';
+		const hostInstructions = [instructionA, instructionB];
+		const injectedBlock = `${instructionA}\n\n${instructionB}`;
+		const messages: SessionMessage[] = [
+			{
+				type: 'user', uuid: 'u1', session_id: 'sess-1', parent_tool_use_id: null, parent_agent_id: null,
+				message: { role: 'user', content: [{ type: 'text', text: injectedBlock }, { type: 'text', text: 'ACP Agent 这个名字我完全不知道' }] },
+			},
+			makeAssistantText('a1', 'it means Agent Client Protocol'),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService, hostInstructions);
+
+		assert.strictEqual(turns.length, 1);
+		assert.strictEqual(turns[0].id, 'u1');
+		assert.strictEqual(turns[0].message.text, 'ACP Agent 这个名字我完全不知道', 'only the typed text survives');
+	});
+
+	test('host instructions the host no longer sends survive as ordinary text (honest failure)', () => {
+		const messages: SessionMessage[] = [
+			{
+				type: 'user', uuid: 'u1', session_id: 'sess-1', parent_tool_use_id: null, parent_agent_id: null,
+				message: { role: 'user', content: [{ type: 'text', text: 'A stale instruction from an older host.' }, { type: 'text', text: 'hello' }] },
+			},
+			makeAssistantText('a1', 'hi'),
+		];
+
+		const withUnrelated = mapSessionMessagesToTurns(messages, session, logService, ['A different instruction.']);
+		assert.strictEqual(withUnrelated[0].message.text, 'A stale instruction from an older host.\nhello', 'unrecognised text is never guessed away');
+
+		const withNone = mapSessionMessagesToTurns(messages, session, logService);
+		assert.strictEqual(withNone[0].message.text, 'A stale instruction from an older host.\nhello', 'omitted instructions strip nothing');
+	});
+
+	test('image blocks replay as embedded attachments; host system-reminder blocks never render', () => {
+		// The prompt resolver flattens image attachments into bare image blocks
+		// and renders attachment references as a `<system-reminder>` text block;
+		// replay must reconstitute the former as attachments and drop the latter.
+		const messages: SessionMessage[] = [
+			{
+				type: 'user', uuid: 'u1', session_id: 'sess-1', parent_tool_use_id: null, parent_agent_id: null,
+				message: {
+					role: 'user', content: [
+						{ type: 'text', text: '看看这两张图' },
+						{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aWmg' } },
+						{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'aWmh' } },
+						{ type: 'text', text: '<system-reminder>\nThe user provided the following references:\n- /tmp/pasted.txt\n</system-reminder>' },
+					],
+				},
+			},
+			makeAssistantText('a1', 'looking'),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService);
+
+		assert.strictEqual(turns.length, 1);
+		assert.strictEqual(turns[0].message.text, '看看这两张图', 'reminder block must not render as user text');
+		const attachments = turns[0].message.attachments;
+		assert.strictEqual(attachments?.length, 2);
+		assert.deepStrictEqual(attachments.map(a => [a.displayKind, a.type === MessageAttachmentKind.EmbeddedResource ? a.contentType : undefined, a.type === MessageAttachmentKind.EmbeddedResource ? a.data : undefined]), [
+			['image', 'image/png', 'aWmg'],
+			['image', 'image/jpeg', 'aWmh'],
+		]);
+	});
+
+	test('an image-only user envelope still opens a turn', () => {
+		const messages: SessionMessage[] = [
+			{
+				type: 'user', uuid: 'u1', session_id: 'sess-1', parent_tool_use_id: null, parent_agent_id: null,
+				message: { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aWmg' } }] },
+			},
+			makeAssistantText('a1', 'nice screenshot'),
+		];
+
+		const turns = mapSessionMessagesToTurns(messages, session, logService);
+
+		assert.strictEqual(turns.length, 1);
+		assert.strictEqual(turns[0].message.text, '');
+		assert.strictEqual(turns[0].message.attachments?.length, 1);
 	});
 
 	test('Fixture 10: prompt-less subagent transcript (inner messages) maps to one turn', () => {

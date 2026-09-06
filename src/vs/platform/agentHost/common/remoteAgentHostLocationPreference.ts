@@ -36,4 +36,11 @@ export interface IRemoteAgentHostLocationPreferenceService {
 
 	/** Store the preference for `hostKey`. */
 	setPreference(hostKey: string, preference: RemoteAgentHostLocationPreference): void;
+
+	/**
+	 * Drop the stored preference for `hostKey`. Needed to fully forget a host:
+	 * a preference left behind outlives everything else about it and silently
+	 * decides where its agents run if the same key ever comes back.
+	 */
+	clearPreference(hostKey: string): void;
 }

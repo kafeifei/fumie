@@ -4,9 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { AiAgentEnvValue, AiAgentEnvVar } from '../../../chat/common/aiAgentEnv.js';
+import { withoutModelProviderEnvironment } from '../modelProviderEnvironment.js';
 
 export function createCopilotCliEnvironment(environment: NodeJS.ProcessEnv = process.env): Record<string, string | undefined> {
-	const env: Record<string, string | undefined> = Object.assign({}, environment, { ELECTRON_RUN_AS_NODE: '1' });
+	const env: Record<string, string | undefined> = Object.assign(withoutModelProviderEnvironment(environment), { ELECTRON_RUN_AS_NODE: '1' });
 	delete env['NODE_OPTIONS'];
 	delete env['VSCODE_INSPECTOR_OPTIONS'];
 	delete env['VSCODE_ESM_ENTRYPOINT'];

@@ -8,6 +8,7 @@ import { DeferredPromise } from '../../../../base/common/async.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { StopWatch } from '../../../../base/common/stopwatch.js';
 import { ILogService } from '../../../log/common/log.js';
+import type { PendingMessage } from '../../common/state/sessionState.js';
 import type { IAgentHostClientTelemetryContext } from '../../common/agentHostTelemetry.js';
 
 /**
@@ -27,7 +28,8 @@ export interface IPendingSdkMessage {
 	readonly clientContext?: IAgentHostClientTelemetryContext;
 	readonly stopWatch: StopWatch;
 	readonly deferred: DeferredPromise<void>;
-	readonly steeringPendingId?: string;
+	/** Present when this entry must be promoted from pending UI into its own protocol turn. */
+	readonly steeringMessage?: PendingMessage;
 }
 
 /**
@@ -44,8 +46,9 @@ export interface IPendingSdkMessage {
  *     the consumer loop on every `result` message).
  *   • {@link failAll} rejects every pending deferred and clears both
  *     lists; used by abort and crash fan-out.
- *   • {@link resetForRebind} re-creates the parked deferred for a fresh
- *     Query binding (the queue itself survives across rebinds).
+ *   • {@link resetForRebind} retires the previous Query's iterator and
+ *     creates a parked deferred for the fresh Query binding (the queue
+ *     itself survives across rebinds).
  */
 export class ClaudePromptQueue extends Disposable {
 
@@ -60,34 +63,37 @@ export class ClaudePromptQueue extends Disposable {
 	 */
 	private _popped: IPendingSdkMessage[] = [];
 	private _pendingPromptDeferred = new DeferredPromise<void>();
+	private _generation = 0;
 
 	readonly iterable: AsyncIterable<SDKUserMessage> = {
-		[Symbol.asyncIterator]: () => ({
-			next: async () => {
-				while (true) {
-					if (this._getAbortSignal().aborted) {
-						return { done: true, value: undefined };
-					}
-					if (this._toYield.length > 0) {
-						const entry = this._toYield.shift()!;
-						this._yielded.push(entry);
-						this._logService.info(`[Claude:${this._sessionId}] queue yielded sdkUuid=${entry.sdkUuid} turnId=${entry.turnId}${entry.steeringPendingId ? ` steeringPendingId=${entry.steeringPendingId}` : ''}`);
-						if (entry.steeringPendingId) {
-							this._onSteeringYielded(entry.steeringPendingId);
+		[Symbol.asyncIterator]: () => {
+			const generation = this._generation;
+			return {
+				next: async () => {
+					while (true) {
+						if (generation !== this._generation || this._getAbortSignal().aborted) {
+							return { done: true, value: undefined };
 						}
-						return { done: false, value: entry.sdkMessage };
+						if (this._toYield.length > 0) {
+							const entry = this._toYield.shift()!;
+							this._yielded.push(entry);
+							this._logService.info(`[Claude:${this._sessionId}] queue yielded sdkUuid=${entry.sdkUuid} turnId=${entry.turnId}${entry.steeringMessage ? ` steeringPendingId=${entry.steeringMessage.id}` : ''}`);
+							return { done: false, value: entry.sdkMessage };
+						}
+						const waiter = this._pendingPromptDeferred;
+						await waiter.p;
+						if (this._pendingPromptDeferred === waiter) {
+							this._pendingPromptDeferred = new DeferredPromise<void>();
+						}
 					}
-					await this._pendingPromptDeferred.p;
-					this._pendingPromptDeferred = new DeferredPromise<void>();
-				}
-			},
-		}),
+				},
+			};
+		},
 	};
 
 	constructor(
 		private readonly _sessionId: string,
 		private readonly _getAbortSignal: () => AbortSignal,
-		private readonly _onSteeringYielded: (pendingId: string) => void,
 		@ILogService private readonly _logService: ILogService,
 	) {
 		super();
@@ -97,6 +103,22 @@ export class ClaudePromptQueue extends Disposable {
 	get isEmpty(): boolean {
 		return this._toYield.length === 0 && this._yielded.length === 0;
 	}
+
+	/**
+	 * The steering message queued directly behind the in-flight head, if any.
+	 * Its presence is what makes the head's `result` an intermediate provider
+	 * boundary rather than the end of the request (CONTEXT.md M10): only a
+	 * steering entry preempts the request in front of it. An ordinary queued
+	 * send waits its turn, so the head's result stays terminal for the head.
+	 * `undefined` with nothing in flight — there is no request to preempt.
+	 */
+	get steeringSuccessor(): PendingMessage | undefined {
+		if (this._yielded.length === 0) {
+			return undefined;
+		}
+		return (this._yielded[1] ?? this._toYield[0])?.steeringMessage;
+	}
+
 	/**
 	 * Push an entry. Resolves with the entry's deferred (which the
 	 * consumer settles on `result` via {@link settleHead}).
@@ -108,10 +130,10 @@ export class ClaudePromptQueue extends Disposable {
 	}
 
 	/**
-	 * Most-recent in-flight or queued entry, used by steering to inherit
-	 * its parent's `turnId`. Prefers the in-flight head over the latest
-	 * queued entry (matches CONTEXT.md M10: steering folds into the
-	 * in-progress protocol Turn).
+	 * Current in-flight entry, falling back to the latest queued entry before
+	 * the SDK starts pulling prompts. After an intermediate `result` settles
+	 * the old head, this becomes the steering entry whose pending message is
+	 * promoted into a fresh protocol turn.
 	 */
 	peekParent(): IPendingSdkMessage | undefined {
 		return this._yielded[0] ?? this._toYield[this._toYield.length - 1];
@@ -166,8 +188,11 @@ export class ClaudePromptQueue extends Disposable {
 		this._pendingPromptDeferred.complete();
 	}
 
-	/** Re-create the parked deferred for a fresh Query binding. */
+	/** Retire the old Query's iterator and create a parked deferred for the fresh Query binding. */
 	resetForRebind(): void {
+		const staleWaiter = this._pendingPromptDeferred;
+		this._generation++;
 		this._pendingPromptDeferred = new DeferredPromise<void>();
+		staleWaiter.complete();
 	}
 }

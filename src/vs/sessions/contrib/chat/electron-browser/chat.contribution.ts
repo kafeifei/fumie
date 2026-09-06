@@ -20,15 +20,17 @@ import { SessionsView, SessionsViewId as SessionsListViewId } from '../../sessio
 import { ISessionsSetUpService } from '../../../browser/sessionsSetUpService.js';
 import { ISessionsPartService } from '../../../services/sessions/browser/sessionsPartService.js';
 import { SessionStatus } from '../../../services/sessions/common/session.js';
-import { SessionsCopilotConfigSlashSubmitHandlerContribution } from '../browser/copilotConfigSlashSubmitHandler.js';
 import { AgentsWindowOpenSource, isAgentsWindowOpenSource } from '../../../../platform/window/common/window.js';
 import { IStorageService, StorageScope } from '../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { TOTAL_SESSIONS_KEY } from '../../sessions/browser/sessionsLifecycleTracker.js';
 import { ISessionsWindowOpenViewState, SessionsWindowOpenTelemetry, SessionsWindowSessionStartTelemetry } from '../../sessions/browser/sessionsWindowOpenTelemetry.js';
 import { INewSessionComposerService, NewSessionWorkspacePreselectionSource } from '../browser/newSessionComposerService.js';
-import { ChatPetAchievementIds } from '../../../../workbench/contrib/chat/browser/chatPetAchievements.js';
-import { IChatPetService } from '../../../../workbench/contrib/chat/browser/chatPetService.js';
+import { RevealLocalFileLinkOpenerContribution } from './revealLocalFileLinkOpener.js';
+
+// Desktop override for the composer's attach picker: goes straight to Electron's
+// `showOpenDialog` instead of the browser default's `<input type="file">`.
+import './composerFilePicker.js';
 
 class SelectAgentsFolderContribution extends Disposable implements IWorkbenchContribution {
 
@@ -226,18 +228,11 @@ class SelectAgentsFolderContribution extends Disposable implements IWorkbenchCon
 	}
 }
 
-class ChatPetAgentsWindowAchievementContribution implements IWorkbenchContribution {
-
-	static readonly ID = 'sessions.contrib.chatPetAgentsWindowAchievement';
-
-	constructor(@IChatPetService chatPetService: IChatPetService) {
-		chatPetService.unlockAchievement(ChatPetAchievementIds.AgentsWindowOpened);
-	}
-}
-
 registerWorkbenchContribution2(SelectAgentsFolderContribution.ID, SelectAgentsFolderContribution, WorkbenchPhase.BlockStartup);
-registerWorkbenchContribution2(SessionsCopilotConfigSlashSubmitHandlerContribution.ID, SessionsCopilotConfigSlashSubmitHandlerContribution, WorkbenchPhase.AfterRestored);
-registerWorkbenchContribution2(ChatPetAgentsWindowAchievementContribution.ID, ChatPetAgentsWindowAchievementContribution, WorkbenchPhase.AfterRestored);
+// Register in the same phase as the upstream WorkbenchOpenerContribution. This
+// module is imported later, so openerService's newest-first ordering puts the
+// narrower markdown opener ahead of the upstream workspace-directory opener.
+registerWorkbenchContribution2(RevealLocalFileLinkOpenerContribution.ID, RevealLocalFileLinkOpenerContribution, WorkbenchPhase.Eventually);
 
 // Renderer-side BYOK language-model handler that backs the node agent host's
 // OpenAI proxy, mirroring the registration in the workbench's

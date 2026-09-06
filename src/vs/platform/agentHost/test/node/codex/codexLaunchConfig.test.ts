@@ -11,7 +11,7 @@ suite('CodexLaunchConfig', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
 
 	test('adds the Copilot proxy and enforces telemetry overrides after extra arguments', () => {
-		const config = buildCodexLaunchConfig({ PATH: '/bin', OPENAI_API_KEY: 'personal' }, { baseUrl: 'http://127.0.0.1:1234', nonce: 'nonce' }, ['--log-level=debug', '-c', 'analytics.enabled=true']);
+		const config = buildCodexLaunchConfig({ PATH: '/bin', OPENAI_API_KEY: 'personal', ANTHROPIC_BASE_URL: 'https://wrong.example', GEMINI_API_KEY: 'wrong' }, { baseUrl: 'http://127.0.0.1:1234', nonce: 'nonce' }, ['--log-level=debug', '-c', 'analytics.enabled=true']);
 		assert.deepStrictEqual(config.env, { PATH: '/bin', OPENAI_API_KEY: 'nonce', AI_AGENT: 'github_copilot_vscode_agent' });
 		assert.ok(config.args.includes('model_providers.vscode-proxy.name="VS Code Proxy"'));
 		assert.ok(!config.args.some(argument => argument.startsWith('model_provider=')));
@@ -28,6 +28,40 @@ suite('CodexLaunchConfig', () => {
 			'-c', 'otel.exporter="none"',
 			'-c', 'otel.metrics_exporter="none"',
 		]);
+	});
+
+	test('adds one additive provider per BYOK vendor, keyed to its own loopback token', () => {
+		const config = buildCodexLaunchConfig({}, { baseUrl: 'http://127.0.0.1:1234', nonce: 'nonce' }, [], undefined, {
+			token: 'byok-nonce.codex',
+			providers: [{ vendor: 'customendpoint', baseUrl: 'http://127.0.0.1:4321/v/customendpoint' }],
+		});
+		assert.deepStrictEqual({
+			// The Copilot proxy's own key is untouched — the two binds mint
+			// separate nonces.
+			openaiKey: config.env.OPENAI_API_KEY,
+			byokKey: config.env.VSCODE_BYOK_API_KEY,
+			overrides: config.args.filter(argument => argument.startsWith('model_providers.customendpoint.')),
+		}, {
+			openaiKey: 'nonce',
+			byokKey: 'byok-nonce.codex',
+			overrides: [
+				'model_providers.customendpoint.name="customendpoint"',
+				// No `/v1`: codex appends `/responses` to this base itself.
+				'model_providers.customendpoint.base_url="http://127.0.0.1:4321/v/customendpoint"',
+				'model_providers.customendpoint.wire_api="responses"',
+				'model_providers.customendpoint.env_key="VSCODE_BYOK_API_KEY"',
+				'model_providers.customendpoint.requires_openai_auth=false',
+				'model_providers.customendpoint.supports_websockets=false',
+			],
+		});
+	});
+
+	test('no BYOK vendors leaves the launch exactly as the Copilot-only one', () => {
+		const config = buildCodexLaunchConfig({}, { baseUrl: 'http://127.0.0.1:1234', nonce: 'nonce' }, [], undefined, { token: 'unused', providers: [] });
+		assert.deepStrictEqual({
+			byokKey: config.env.VSCODE_BYOK_API_KEY,
+			providerOverrides: config.args.filter(argument => argument.startsWith('model_providers.') && !argument.startsWith('model_providers.vscode-proxy.')),
+		}, { byokKey: undefined, providerOverrides: [] });
 	});
 
 	test('routes traces to loopback and logs/metrics directly to the external sink', () => {
@@ -63,6 +97,12 @@ suite('CodexLaunchConfig', () => {
 		assert.deepStrictEqual(buildCodexResumeParams('openai', 'thread-a', {}, undefined, {}, undefined, true), {
 			threadId: 'thread-a',
 			modelProvider: 'openai',
+			config: { 'features.image_generation': true },
+		});
+		assert.deepStrictEqual(buildCodexResumeParams('openai', 'thread-fast', {}, undefined, {}, undefined, true, 'priority'), {
+			threadId: 'thread-fast',
+			modelProvider: 'openai',
+			serviceTier: 'priority',
 			config: { 'features.image_generation': true },
 		});
 		assert.deepStrictEqual(buildCodexResumeParams('vscode-proxy', 'thread-b', { GitHub: { url: 'https://api.githubcopilot.com/mcp/' } }), {

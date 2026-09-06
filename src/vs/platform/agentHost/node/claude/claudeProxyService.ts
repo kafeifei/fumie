@@ -66,10 +66,15 @@ export interface IClaudeProxyHandle extends ILoopbackProxyHandle {
  *   the user's own credentials (`ANTHROPIC_API_KEY`, or a subscription OAuth
  *   token in `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`); no proxy is
  *   involved. The SDK's bundled `claude` CLI runs the turn.
+ * - `byok`: a model the user configured through a renderer BYOK provider (a
+ *   custom gateway, say). `messages` traffic goes through Fumie's
+ *   wire-transparent provider proxy. The proxy reads only the model routing id
+ *   and otherwise forwards the native Messages request and stream unchanged.
  */
 export type ClaudeTransport =
 	| { readonly kind: 'proxy'; readonly handle: IClaudeProxyHandle }
-	| { readonly kind: 'native' };
+	| { readonly kind: 'native' }
+	| { readonly kind: 'byok'; readonly vendor: string; readonly baseUrl: string; readonly nonce: string };
 
 /**
  * A per-request credits report. CAPI returns the actual billed credits

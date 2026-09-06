@@ -143,6 +143,15 @@ export interface IAgentChatMetadata {
 /** A provider chat ready to be registered as an Agent Host session. */
 export interface IAgentDiscoveredChat extends IAgentChatMetadata {
 	readonly external: boolean;
+	/**
+	 * The provider asserts this chat is one of its own internally-driven
+	 * sessions and must NOT be listed as a discovered external chat: the
+	 * orchestrator undoes any registration a previous build's discovery made
+	 * for it. Registration bookkeeping only — no provider data is touched, and
+	 * a chat the orchestrator does not hold (or holds under any other
+	 * provenance) is left exactly as it is.
+	 */
+	readonly retract?: boolean;
 }
 
 /** Returns the candidate session URI keys already present in the host registry. */
@@ -220,11 +229,49 @@ export type IAgentTurnDiagnosticSnapshot = {
 	readonly state: 'missingChat' | 'missingTurn';
 };
 
+/**
+ * Well-known id of the "Allow in this Session" confirmation option. The host
+ * offers it on every standard tool confirmation and adds the tool to the
+ * session's allow list when it comes back; providers whose SDK has its own
+ * session-scoped grant match on it in
+ * {@link IAgent.respondToPermissionRequest} so the user's choice reaches the
+ * SDK too, instead of arriving there as a plain one-shot accept.
+ */
+export const AGENT_ALLOW_SESSION_OPTION_ID = 'allow-session' as const;
+
 /** Well-known agent provider id for the Claude agent-host backend. */
 export const CLAUDE_AGENT_PROVIDER_ID = 'claude' as const;
 
 /** Well-known agent provider id for the Codex agent-host backend. */
 export const CODEX_AGENT_PROVIDER_ID = 'codex' as const;
+
+/** Well-known agent provider id for the Kimi agent-host backend. */
+export const KIMI_AGENT_PROVIDER_ID = 'kimi' as const;
+
+/** Well-known agent provider id for the DeepSeek agent-host backend. */
+export const DEEPSEEK_AGENT_PROVIDER_ID = 'deepseek' as const;
+
+/** Well-known agent provider id for the Pi agent-host backend. */
+export const PI_AGENT_PROVIDER_ID = 'pi' as const;
+
+/** Well-known agent provider id for the opencode agent-host backend. */
+export const OPENCODE_AGENT_PROVIDER_ID = 'opencode' as const;
+
+/**
+ * Well-known agent provider ids for the Agent Client Protocol backend.
+ *
+ * One id per catalog agent, not one shared `acp` id. A session type is keyed on
+ * its provider id, so a shared id can only ever produce a single picker row —
+ * and a row standing for several agents cannot name any of them, which is what
+ * left it reading "ACP Agent". Each agent owning an id is what makes the picker
+ * say "Claude (ACPv1)" and start the one it named, and is what lets the next
+ * catalog agent arrive as its own row.
+ *
+ * The `acp-` prefix is the shared part: it keeps the ids sorted together and
+ * lets one product allowlist entry and one enablement toggle still cover the
+ * whole connector.
+ */
+export const ACP_CLAUDE_AGENT_PROVIDER_ID = 'acp-claude' as const;
 
 /**
  * Static capability facts an agent backend advertises about itself. Each flag
@@ -705,6 +752,15 @@ export interface IAgentChats {
 	 */
 	createChat(chat: URI, context: AgentChatOperationContext, options?: IAgentCreateChatOptions): Promise<IAgentCreateChatResult | void>;
 
+	/**
+	 * Permanently delete the addressed chat's durable SDK backing. A cold
+	 * backing is addressed by the opaque `providerData` receipt without first
+	 * resuming or materializing its transcript. Implementations must retain
+	 * their receipt and routing state when deletion fails so the operation can
+	 * be retried; an already-missing backing is success.
+	 */
+	deleteChat(chat: URI, context?: AgentChatOperationContext, providerData?: string): Promise<void>;
+
 	/** Dispose the addressed chat and free its backing. */
 	disposeChat(chat: URI, context: AgentChatOperationContext): Promise<void>;
 
@@ -760,6 +816,13 @@ export type IAgentSessionConfigCompletionsParams = IAgentChatConfigCompletionsPa
 export interface IAgentModelInfo {
 	readonly provider: AgentProvider;
 	readonly id: string;
+	/**
+	 * The undecorated model id this agent's runtime reports in usage and
+	 * transcripts, when {@link id} carries a decoration (a provider
+	 * qualification, a BYOK vendor route) that the runtime never echoes back.
+	 * Published to clients as `SessionModelInfo.underlyingModelId`.
+	 */
+	readonly underlyingModelId?: string;
 	readonly name: string;
 	readonly maxContextWindow?: number;
 	readonly maxOutputTokens?: number;
@@ -1120,8 +1183,16 @@ export interface IAgent {
 	/** Complete a client tool call on its host-resolved provider chat. */
 	onClientToolCallComplete(chat: URI, toolCallId: string, result: ToolCallResult, context?: IAgentChatContext): void;
 
-	/** Respond to a pending permission request from the SDK. */
-	respondToPermissionRequest(requestId: string, approved: boolean): void;
+	/**
+	 * Respond to a pending permission request from the SDK.
+	 *
+	 * `selectedOptionId` is the confirmation option the user actually picked
+	 * (see {@link AGENT_ALLOW_SESSION_OPTION_ID}), so a provider whose SDK can
+	 * express a wider grant than "this once" can honour it. Omitted when the
+	 * client offered no options, and providers without such a decision may
+	 * ignore it — the boolean alone still means a plain one-shot answer.
+	 */
+	respondToPermissionRequest(requestId: string, approved: boolean, selectedOptionId?: string): void;
 
 	/** Respond to a pending user input request from the SDK's ask_user tool. */
 	respondToUserInputRequest(requestId: string, response: ChatInputResponseKind, answers?: Record<string, ChatInputAnswer>): void;
@@ -1237,8 +1308,12 @@ export interface IAgent {
 
 	// ---- Provider lifecycle -------------------------------------------------
 
-	/** Optional lifecycle hook for providers whose resources react to archived state. */
-	onArchivedChanged?(session: URI, isArchived: boolean): Promise<void>;
+	/**
+	 * Generate a short title for a session from the user's first prompt, using the session's own backend/model.
+	 * MUST NOT touch the user's session transcript or turns; MUST NOT write the harness's own session metadata.
+	 * Return undefined on any failure; never throw. Honour the cancellation token.
+	 */
+	generateTitle(session: URI, request: { readonly prompt: string; readonly modelId?: string }, token: CancellationToken): Promise<string | undefined>;
 
 	shutdown(): Promise<void>;
 

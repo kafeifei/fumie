@@ -1569,44 +1569,54 @@ suite('ChatSubagentContentPart', () => {
 			});
 		});
 
-		test('stops immediately when the parent response becomes terminal', () => {
-			const onDidChange = disposables.add(new Emitter<ChatResponseModelChangeReason>());
-			let isComplete = false;
-			const baseContext = createMockRenderContext(false);
-			const baseElement = baseContext.element as IChatResponseViewModel;
-			const context: IChatContentPartRenderContext = {
-				...baseContext,
-				element: {
-					...baseElement,
-					model: {
-						...baseElement.model,
-						onDidChange: onDidChange.event,
-					} as IChatResponseViewModel['model'],
-					get isComplete() { return isComplete; },
-					get isCanceled() { return false; },
-					setVote: () => { },
-				},
-			};
-			const toolSpecificData: IChatSubagentToolInvocationData = {
-				kind: 'subagent',
-				isActive: true,
-				description: 'Working on task',
-				chatResource: 'ahp-chat://subagent/test/tool-call',
-				startedAt: Date.now() - 5000,
-			};
-			const part = createPart(createMockToolInvocation({ toolSpecificData }), context);
+		test('a running subagent outlives a completed parent response but not a cancelled one', () => {
+			const endTurn = (terminal: 'complete' | 'cancel') => {
+				const onDidChange = disposables.add(new Emitter<ChatResponseModelChangeReason>());
+				let isComplete = false;
+				let isCanceled = false;
+				const baseContext = createMockRenderContext(false);
+				const baseElement = baseContext.element as IChatResponseViewModel;
+				const context: IChatContentPartRenderContext = {
+					...baseContext,
+					element: {
+						...baseElement,
+						model: {
+							...baseElement.model,
+							onDidChange: onDidChange.event,
+						} as IChatResponseViewModel['model'],
+						get isComplete() { return isComplete; },
+						get isCanceled() { return isCanceled; },
+						setVote: () => { },
+					},
+				};
+				const toolSpecificData: IChatSubagentToolInvocationData = {
+					kind: 'subagent',
+					isActive: true,
+					description: 'Working on task',
+					chatResource: 'ahp-chat://subagent/test/tool-call',
+					startedAt: Date.now() - 5000,
+				};
+				const part = createPart(createMockToolInvocation({ toolSpecificData }), context);
 
-			isComplete = true;
-			onDidChange.fire({ reason: 'completedRequest' });
+				isComplete = true;
+				isCanceled = terminal === 'cancel';
+				onDidChange.fire({ reason: 'completedRequest' });
+
+				return {
+					isActive: part.getIsActive(),
+					toolIsActive: toolSpecificData.isActive,
+					hasDuration: typeof toolSpecificData.duration === 'number' && toolSpecificData.duration >= 5000,
+				};
+			};
 
 			assert.deepStrictEqual({
-				isActive: part.getIsActive(),
-				toolIsActive: toolSpecificData.isActive,
-				hasDuration: typeof toolSpecificData.duration === 'number' && toolSpecificData.duration >= 5000,
+				completed: endTurn('complete'),
+				cancelled: endTurn('cancel'),
 			}, {
-				isActive: false,
-				toolIsActive: false,
-				hasDuration: true,
+				// The subagent keeps working in the background, so it keeps its pill.
+				completed: { isActive: true, toolIsActive: true, hasDuration: false },
+				// Cancelling the turn stops the subagent too.
+				cancelled: { isActive: false, toolIsActive: false, hasDuration: true },
 			});
 		});
 

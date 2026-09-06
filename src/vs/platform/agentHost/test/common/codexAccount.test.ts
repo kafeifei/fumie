@@ -17,7 +17,10 @@ suite('Codex account metadata', () => {
 				[CODEX_ACCOUNT_META_KEY]: {
 					status: 'signedIn',
 					email: 'person@example.com',
-					rateLimit: { usedPercent: 42.4, windowDurationMins: 10080, resetsAt: 1234 },
+					rateLimit: {
+						primary: { usedPercent: 21, windowDurationMins: 300, resetsAt: 1200 },
+						secondary: { usedPercent: 42.4, windowDurationMins: 10080, resetsAt: 1234 },
+					},
 				},
 			},
 		}), {
@@ -25,21 +28,37 @@ suite('Codex account metadata', () => {
 			email: 'person@example.com',
 			planType: undefined,
 			requiresOpenaiAuth: undefined,
-			rateLimit: { usedPercent: 42.4, windowDurationMins: 10080, resetsAt: 1234 },
+			rateLimit: {
+				primary: { usedPercent: 21, windowDurationMins: 300, resetsAt: 1200 },
+				secondary: { usedPercent: 42.4, windowDurationMins: 10080, resetsAt: 1234 },
+			},
 			authUrl: undefined,
 			authUrlNonce: undefined,
 		});
 	});
 
-	test('drops malformed rate-limit metadata', () => {
+	test('drops malformed rate-limit windows without losing the usable one', () => {
 		const account = readCodexAccountInfo({
 			agents: [],
 			_meta: {
-				[CODEX_ACCOUNT_META_KEY]: { status: 'signedIn', rateLimit: { usedPercent: 101 } },
+				[CODEX_ACCOUNT_META_KEY]: {
+					status: 'signedIn',
+					rateLimit: {
+						primary: { usedPercent: 101 },
+						secondary: { usedPercent: 42.4, windowDurationMins: 10080, resetsAt: 1234 },
+					},
+				},
 			},
 		});
 		assert.strictEqual(account.status, 'signedIn');
-		assert.strictEqual(account.rateLimit, undefined);
+		assert.deepStrictEqual(account.rateLimit, { secondary: { usedPercent: 42.4, windowDurationMins: 10080, resetsAt: 1234 } });
+
+		assert.strictEqual(readCodexAccountInfo({
+			agents: [],
+			_meta: {
+				[CODEX_ACCOUNT_META_KEY]: { status: 'signedIn', rateLimit: { primary: { usedPercent: 101 } } },
+			},
+		}).rateLimit, undefined);
 	});
 
 	test('reads the downloading account state', () => {

@@ -30,6 +30,21 @@ export function isSessionAttachmentPath(sessionDataService: ISessionDataService,
 	return extUriBiasedIgnorePathCase.isEqualOrParent(fileUri, attachmentsDir);
 }
 
+/**
+ * Subdirectory under a session's data directory that serves as the hidden,
+ * session-exclusive execution root of a workspace-less session. The host
+ * creates it before the provider materializes the session so the harness runs
+ * in a stable, persistent cwd instead of a per-process temp folder; it is
+ * removed together with the rest of the session data on delete and never
+ * surfaces in the session catalog or public session metadata.
+ */
+export const SESSION_WORKSPACELESS_ROOT_DIRNAME = 'workspace';
+
+/** Resolves the hidden execution root of a workspace-less session. */
+export function getSessionWorkspacelessRoot(sessionDataService: ISessionDataService, session: URI): URI {
+	return URI.joinPath(sessionDataService.getSessionDataDir(session), SESSION_WORKSPACELESS_ROOT_DIRNAME);
+}
+
 // ---- File-edit types ----------------------------------------------------
 
 /**

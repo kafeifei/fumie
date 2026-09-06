@@ -15,6 +15,7 @@ import { ILanguageModelsProviderGroup } from '../../common/languageModelsConfigu
 
 export class NullLanguageModelsService implements ILanguageModelsService {
 	_serviceBrand: undefined;
+	readonly whenReady = Promise.resolve();
 
 	registerLanguageModelProvider(vendor: string, provider: ILanguageModelChatProvider): IDisposable {
 		return Disposable.None;
@@ -59,6 +60,10 @@ export class NullLanguageModelsService implements ILanguageModelsService {
 
 	getLanguageModelGroups(vendor: string): ILanguageModelsGroup[] {
 		return [];
+	}
+
+	async resolveLanguageModelProviderGroup(): Promise<undefined> {
+		return undefined;
 	}
 
 	hasResolvedVendor(vendor: string): boolean {

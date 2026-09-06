@@ -13,6 +13,8 @@ import {
 	PendingGatewaySelection,
 	TunnelAgentHostConnector,
 	parseTunnelInfo,
+	toTunnelInfos,
+	tunnelListRequestOptions,
 	type ITunnelRelayClient,
 	type ITunnelRelayClientFactory,
 	type ITunnelRelayClientSession,
@@ -27,7 +29,9 @@ import {
 	type ITunnelGatewaySelection,
 	type ITunnelGatewaySelectionSession,
 	type ITunnelInfo,
+	type ITunnelListOptions,
 	type ITunnelRelayMessage,
+	type ITunnelUserLimit,
 } from '../common/tunnelAgentHost.js';
 import type { ITunnelDuplexStream, ITunnelMessageSocket, ITunnelSocketCloseEvent } from '../common/tunnelMessageSocket.js';
 
@@ -187,31 +191,24 @@ export class TunnelAgentHostMainService extends Disposable implements ITunnelAge
 		this.onDidRelayClose = this._connector.onDidRelayClose;
 	}
 
-	async listTunnels(token: string, authProvider: 'github' | 'microsoft', additionalTunnelNames?: string[]): Promise<ITunnelInfo[]> {
+	async listTunnels(token: string, authProvider: 'github' | 'microsoft', options?: ITunnelListOptions): Promise<ITunnelInfo[]> {
 		const client = await this._createManagementClient(token, authProvider);
-		const results: ITunnelInfo[] = [];
-		const seen = new Set<string>();
+		const includeAllTunnels = options?.includeAllTunnels;
+		// Deliberately not caught: an enumeration that failed used to come back
+		// as an empty account, which reads as "you have no tunnels" to every
+		// caller — including the one page whose job is to say why hosting an
+		// address failed. Every caller already handles a rejection.
+		const results = toTunnelInfos(
+			await client.listTunnels(undefined, undefined, tunnelListRequestOptions(includeAllTunnels)),
+			includeAllTunnels,
+		);
+		const seen = new Set(results.map(info => info.tunnelId));
 
-		try {
-			const tunnels = await client.listTunnels(undefined, undefined, {
-				labels: [TUNNEL_LAUNCHER_LABEL],
-				requireAllLabels: true,
-				includePorts: true,
-				tokenScopes: ['connect'],
-			});
-			for (const tunnel of tunnels) {
-				const info = parseTunnelInfo(tunnel);
-				if (info && info.protocolVersion >= TUNNEL_MIN_PROTOCOL_VERSION) {
-					results.push(info);
-					seen.add(info.tunnelId);
-				}
-			}
-		} catch (err) {
-			this._logService.error(`${LOG_PREFIX} Failed to enumerate tunnels`, err);
-		}
-
-		if (additionalTunnelNames) {
-			for (const tunnelName of additionalTunnelNames) {
+		// A name the user configured by hand is one they mean to connect to,
+		// so it keeps the agent-host filter regardless of the option above —
+		// which an account-wide listing has already covered anyway.
+		if (options?.additionalTunnelNames) {
+			for (const tunnelName of options.additionalTunnelNames) {
 				try {
 					const [tunnel] = await client.listTunnels(undefined, undefined, {
 						labels: [tunnelName, TUNNEL_LAUNCHER_LABEL],
@@ -235,6 +232,15 @@ export class TunnelAgentHostMainService extends Disposable implements ITunnelAge
 
 		this._logService.info(`${LOG_PREFIX} Found ${results.length} tunnel(s) with agent host support`);
 		return results;
+	}
+
+	async listUserLimits(token: string, authProvider: 'github' | 'microsoft'): Promise<ITunnelUserLimit[]> {
+		const client = await this._createManagementClient(token, authProvider);
+		// Mapped rather than forwarded whole: the SDK's rate status also
+		// carries period and reset fields, and only the three below have a
+		// meaning on the other side of the IPC boundary.
+		const limits = await client.listUserLimits();
+		return limits.map(limit => ({ name: limit.name, current: limit.current, limit: limit.limit }));
 	}
 
 	async deleteTunnel(token: string, authProvider: 'github' | 'microsoft', tunnelId: string, clusterId: string): Promise<void> {

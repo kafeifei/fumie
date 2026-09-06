@@ -22,7 +22,7 @@ import type { Implementation } from '../../common/state/protocol/common/commands
 import { ActionType, type ActionEnvelope, type IRootConfigChangedAction, type SessionAction, type TerminalAction, type ClientAnnotationsAction, type ProgressParams } from '../../common/state/sessionActions.js';
 import { PROTOCOL_VERSION } from '../../common/state/protocol/version/registry.js';
 import { isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResponse, JSON_RPC_INTERNAL_ERROR, JsonRpcErrorCodes, ProtocolError, AhpErrorCodes, AHP_UNSUPPORTED_PROTOCOL_VERSION, AHP_SESSION_NOT_FOUND, type AhpNotification, type InitializeResult, type ProtocolMessage, type ReconnectResult, type ResourceListResult, type ResourceWriteParams, type ResourceWriteResult, type IStateSnapshot } from '../../common/state/sessionProtocol.js';
-import { MessageKind, ResponsePartKind, SessionStatus, ChangesetStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, buildChatUri, buildDefaultChatUri, readSessionExternal, readSessionWorkspaceless, withSessionExternal, withSessionWorkspaceless, type SessionSummary } from '../../common/state/sessionState.js';
+import { MessageKind, ResponsePartKind, ROOT_STATE_URI, SessionStatus, ChangesetStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, buildChatUri, buildDefaultChatUri, readSessionExternal, readSessionWorkspaceless, withSessionExternal, withSessionWorkspaceless, type SessionSummary } from '../../common/state/sessionState.js';
 import type { SessionAddedParams, SessionSummaryChangedParams } from '../../common/state/protocol/notifications.js';
 import type { IProtocolServer, IProtocolTransport } from '../../common/state/sessionTransport.js';
 import { ProtocolServerHandler } from '../../node/protocolServerHandler.js';
@@ -148,6 +148,7 @@ class MockAgentService implements IAgentService {
 	readonly readErrors = new Map<string, Error>();
 	readonly listedSessions: IAgentSessionMetadata[] = [];
 	readonly createSessionConfigs: (IAgentCreateSessionConfig | undefined)[] = [];
+	readonly archivedSessions: { session: URI; isArchived: boolean; preserveChanges?: boolean }[] = [];
 	managedSettingsDiagnostics: readonly IAgentHostManagedSettingsDiagnostics[] = [];
 	readonly getSessionStateFileCalls: string[] = [];
 	readonly collectDebugLogsCalls: { session: string | undefined; chat: string | undefined; kind: 'archive' | 'directory' }[] = [];
@@ -199,6 +200,9 @@ class MockAgentService implements IAgentService {
 	async completions(_params: CompletionsParams): Promise<CompletionsResult> { return { items: [] }; }
 	async getCompletionTriggerCharacters(): Promise<readonly string[]> { return []; }
 	async disposeSession(_session: URI): Promise<void> { }
+	async setSessionArchived(session: URI, isArchived: boolean, preserveChanges?: boolean): Promise<void> {
+		this.archivedSessions.push({ session, isArchived, ...(preserveChanges === true ? { preserveChanges: true } : {}) });
+	}
 	readonly createdChats: { session: string; chat: string; options?: IAgentCreateChatOptions }[] = [];
 	readonly disposedChats: { session: string; chat: string }[] = [];
 	async createChat(session: URI, chat: URI, options?: IAgentCreateChatOptions): Promise<void> {
@@ -325,6 +329,7 @@ suite('ProtocolServerHandler', () => {
 	let fileSystemProvider: AgentHostFileSystemProvider;
 	let logService: CountingLogService;
 	let telemetryService: TestTelemetryService;
+	let beforeHandshake: ((clientId: string) => Promise<void> | undefined) | undefined;
 	let agentHostTelemetryService: AgentHostTelemetryService;
 	let clientConnections: AgentHostClientConnectionService;
 
@@ -368,6 +373,7 @@ suite('ProtocolServerHandler', () => {
 		managedSettingsService = disposables.add(new AgentHostManagedSettingsService());
 		logService = new CountingLogService();
 		telemetryService = new TestTelemetryService();
+		beforeHandshake = undefined;
 		agentHostTelemetryService = disposables.add(new AgentHostTelemetryService(telemetryService));
 		clientConnections = disposables.add(new AgentHostClientConnectionService());
 		disposables.add(agentService);
@@ -375,7 +381,7 @@ suite('ProtocolServerHandler', () => {
 			agentService,
 			stateManager,
 			server,
-			{ hostLaunchKind: AgentHostLaunchKind.VSCodeMainProcess, defaultDirectory: URI.file('/home/testuser').toString() },
+			{ hostLaunchKind: AgentHostLaunchKind.VSCodeMainProcess, defaultDirectory: URI.file('/home/testuser').toString(), beforeHandshake: clientId => beforeHandshake?.(clientId) },
 			disposables.add(fileSystemProvider = new AgentHostFileSystemProvider()),
 			logService,
 			agentHostTelemetryService,
@@ -400,6 +406,22 @@ suite('ProtocolServerHandler', () => {
 		const result = resp.result as InitializeResult;
 		assert.strictEqual(result.protocolVersion, PROTOCOL_VERSION);
 		assert.strictEqual(result.serverSeq, stateManager.serverSeq);
+	});
+
+	test('handshake waits for its initialization barrier before publishing root state', async () => {
+		const ready = new DeferredPromise<void>();
+		beforeHandshake = clientId => clientId === 'client-waiting' ? ready.p : undefined;
+		const transport = connectClient('client-waiting');
+
+		assert.strictEqual(findResponse(transport.sent, 1), undefined);
+		stateManager.dispatchServerAction(ROOT_STATE_URI, { type: ActionType.RootAgentsChanged, agents: [] });
+		ready.complete();
+		await ready.p;
+		await Promise.resolve();
+
+		const response = findResponse(transport.sent, 1) as { result?: InitializeResult } | undefined;
+		assert.ok(response?.result);
+		assert.strictEqual(response.result.serverSeq, stateManager.serverSeq);
 	});
 
 	test('applies telemetry disablement before reporting the client connection', () => {
@@ -970,6 +992,27 @@ suite('ProtocolServerHandler', () => {
 		assert.strictEqual(findNotifications(transportB.sent, 'action').length, 0);
 	});
 
+	test('cold-session catalog actions reach root subscribers without restoring the session', () => {
+		const rootClient = connectClient('client-root', [ROOT_STATE_URI]);
+		const unrelatedClient = connectClient('client-unrelated');
+		rootClient.sent.length = 0;
+		unrelatedClient.sent.length = 0;
+
+		stateManager.dispatchServerAction(sessionUri, {
+			type: ActionType.SessionIsArchivedChanged,
+			isArchived: true,
+		});
+
+		const received = findNotifications(rootClient.sent, 'action').map(notification => notification.params as ActionEnvelope);
+		assert.deepStrictEqual({
+			root: received.map(envelope => ({ channel: envelope.channel, action: envelope.action })),
+			unrelated: findNotifications(unrelatedClient.sent, 'action').length,
+		}, {
+			root: [{ channel: sessionUri, action: { type: ActionType.SessionIsArchivedChanged, isArchived: true } }],
+			unrelated: 0,
+		});
+	});
+
 	test('changeset actions are scoped to subscribed changeset URIs', () => {
 		const changesetUri = `${sessionUri}/changeset/session`;
 		stateManager.createSession(makeSessionSummary());
@@ -1380,6 +1423,22 @@ suite('ProtocolServerHandler', () => {
 		});
 	});
 
+	test('createSession hands the client-selected model to the agent service', async () => {
+		const transport = connectClient('client-create-model');
+		transport.sent.length = 0;
+		const responsePromise = waitForResponse(transport, 2);
+
+		// The provider derives the session's transport from the model, so a
+		// model dropped here leaves a remote client on the host's default —
+		// which is the wrong one whenever the user picked a BYOK row.
+		const newSession = URI.parse('copilot:///created-session-with-model').toString();
+		const model = { id: 'customendpoint/Example/claude-fable-5', config: { thinkingLevel: 'high' } };
+		transport.simulateMessage(request(2, 'createSession', { channel: newSession, model }));
+		await responsePromise;
+
+		assert.deepStrictEqual(agentService.createSessionConfigs.at(-1)?.model, model);
+	});
+
 	test('whenIdle waits for in-flight protocol requests after disposal', async () => {
 		const transport = connectClient('client-drain');
 		agentService.createSessionBarrier = new DeferredPromise<void>();
@@ -1621,6 +1680,24 @@ suite('ProtocolServerHandler', () => {
 				result: null,
 				disposed: [{ session: sessionUri, chat: peerChat }],
 				inCatalog: false,
+			});
+		});
+
+		test('setSessionArchived forwards to the agent service', async () => {
+			stateManager.createSession(makeSessionSummary());
+			const transport = connectClient('client-archive');
+			transport.sent.length = 0;
+			const responsePromise = waitForResponse(transport, 2);
+
+			transport.simulateMessage(request(2, 'setSessionArchived', { channel: sessionUri, isArchived: true, preserveChanges: true }));
+			const resp = await responsePromise;
+
+			assert.deepStrictEqual({
+				result: (resp as { result: null }).result,
+				archived: agentService.archivedSessions.map(entry => ({ session: entry.session.toString(), isArchived: entry.isArchived, preserveChanges: entry.preserveChanges })),
+			}, {
+				result: null,
+				archived: [{ session: sessionUri, isArchived: true, preserveChanges: true }],
 			});
 		});
 	});

@@ -14,7 +14,7 @@ import { IInstantiationService } from '../../../../../../platform/instantiation/
 import { WorkbenchButtonBar } from '../../../../../../platform/actions/browser/buttonbar.js';
 import { IContextKeyService } from '../../../../../../platform/contextkey/common/contextkey.js';
 import { getActionBarActions } from '../../../../../../platform/actions/browser/menuEntryActionViewItem.js';
-import { formatCopilotCredits } from '../../../common/chatService/chatService.js';
+import { formatCopilotCredits, type IChatUsageModelTotal } from '../../../common/chatService/chatService.js';
 import type { IChatWidget } from '../../chat.js';
 
 const $ = dom.$;
@@ -35,6 +35,10 @@ export interface IChatContextUsageData {
 	outputBufferPercentage?: number;
 	promptTokenDetails?: readonly IChatContextUsagePromptTokenDetail[];
 	sessionCost?: number;
+	/** Prompt-cache read hits of the most recent model call, when reported. */
+	cachedPromptTokens?: number;
+	/** Whole-turn token totals per model, when the provider reports them. */
+	modelTotals?: readonly IChatUsageModelTotal[];
 }
 
 /**
@@ -54,7 +58,9 @@ export class ChatContextUsageDetails extends Disposable {
 	private readonly outputBufferFill: HTMLElement;
 	private readonly outputBufferLegend: HTMLElement;
 	private readonly tokenDetailsContainer: HTMLElement;
+	private readonly callBreakdownContainer: HTMLElement;
 	private readonly warningMessage: HTMLElement;
+	private readonly noDataMessage: HTMLElement;
 	private readonly actionsSection: HTMLElement;
 
 	constructor(
@@ -107,10 +113,20 @@ export class ChatContextUsageDetails extends Disposable {
 		// Token details container (for category breakdown)
 		this.tokenDetailsContainer = this.domNode.appendChild($('.token-details-container'));
 
+		// Provider-agnostic breakdown: last call's prompt composition and
+		// whole-turn per-model totals. Rendered from data every provider
+		// reports, unlike the category breakdown above (Copilot-only).
+		this.callBreakdownContainer = this.domNode.appendChild($('.token-details-container'));
+
 		// Warning message (shown when usage is high)
 		this.warningMessage = this.domNode.appendChild($('div.description'));
 		this.warningMessage.textContent = localize('qualityWarning', "Quality may decline as limit nears.");
 		this.warningMessage.style.display = 'none';
+
+		// Placeholder hint (shown before the session has reported any usage)
+		this.noDataMessage = this.domNode.appendChild($('div.description'));
+		this.noDataMessage.textContent = localize('noUsageYet', "Token usage appears once the model's first response completes.");
+		this.noDataMessage.style.display = 'none';
 
 		// Actions section with button bar
 		this.actionsSection = this.domNode.appendChild($('.actions-section'));
@@ -133,9 +149,13 @@ export class ChatContextUsageDetails extends Disposable {
 
 		this._register(autorun(reader => {
 			const data = this._dataObservable.read(reader);
-			// Re-render when the usage data changes; keep the last-rendered DOM when data becomes undefined.
+			// `undefined` is a deliberate state — the session has not reported
+			// usage yet (new session, or a turn still in flight) — rendered as
+			// an explicit placeholder rather than keeping stale numbers.
 			if (data) {
 				this._render(data);
+			} else {
+				this._renderPlaceholder();
 			}
 		}));
 	}
@@ -162,8 +182,27 @@ export class ChatContextUsageDetails extends Disposable {
 		});
 	}
 
+	/** Empty state: no usage reported yet. `–` in place of numbers, plus a hint. */
+	private _renderPlaceholder(): void {
+		this.sessionCostSection.style.display = 'none';
+		this.tokenCountLabel.textContent = localize('tokenCountUnknown', "– tokens");
+		this.percentageLabel.textContent = '–';
+		this.progressFill.style.width = '0';
+		this.outputBufferFill.style.width = '0';
+		this.outputBufferFill.style.display = 'none';
+		this.outputBufferLegend.style.display = 'none';
+		this.quotaItem.classList.remove('warning', 'error');
+		dom.clearNode(this.tokenDetailsContainer);
+		this.tokenDetailsContainer.style.display = 'none';
+		dom.clearNode(this.callBreakdownContainer);
+		this.callBreakdownContainer.style.display = 'none';
+		this.warningMessage.style.display = 'none';
+		this.noDataMessage.style.display = '';
+	}
+
 	private _render(data: IChatContextUsageData): void {
 		const { percentage, usedTokens, totalContextWindow, outputBufferPercentage, promptTokenDetails, sessionCost } = data;
+		this.noDataMessage.style.display = 'none';
 
 		// Update session cost — hide section when no cost data is available
 		if (typeof sessionCost === 'number' && sessionCost > 0) {
@@ -210,9 +249,57 @@ export class ChatContextUsageDetails extends Disposable {
 
 		// Render token details breakdown if available
 		this.renderTokenDetails(promptTokenDetails, percentage);
+		this.renderCallBreakdown(data);
 
 		// Show/hide warning message
 		this.warningMessage.style.display = percentage >= 75 ? '' : 'none';
+	}
+
+	/**
+	 * Renders the provider-agnostic breakdown: the last call's prompt
+	 * composition (cached vs fresh) and whole-turn per-model totals.
+	 */
+	private renderCallBreakdown(data: IChatContextUsageData): void {
+		dom.clearNode(this.callBreakdownContainer);
+		const promptTokens = Math.max(0, data.usedTokens - data.completionTokens);
+		const cached = data.cachedPromptTokens;
+		const hasCacheRow = typeof cached === 'number' && cached > 0 && promptTokens > 0;
+		const modelTotals = data.modelTotals?.filter(t => t.inputTokens + t.cachedTokens + t.outputTokens > 0) ?? [];
+		if (!hasCacheRow && modelTotals.length === 0) {
+			this.callBreakdownContainer.style.display = 'none';
+			return;
+		}
+		this.callBreakdownContainer.style.display = '';
+
+		if (hasCacheRow) {
+			const section = this.callBreakdownContainer.appendChild($('.token-category'));
+			section.appendChild($('.token-category-header')).textContent = localize('lastCall', "Last model call");
+			const promptRow = section.appendChild($('.token-detail-item'));
+			promptRow.appendChild($('.token-detail-label')).textContent = localize('lastCallPrompt', "Prompt");
+			promptRow.appendChild($('.token-detail-value')).textContent = localize(
+				'lastCallPromptValue', "{0} ({1}% cached)",
+				this.formatTokenCount(promptTokens, 1),
+				Math.min(100, Math.round((cached / promptTokens) * 100)),
+			);
+			const outputRow = section.appendChild($('.token-detail-item'));
+			outputRow.appendChild($('.token-detail-label')).textContent = localize('lastCallOutput', "Output");
+			outputRow.appendChild($('.token-detail-value')).textContent = this.formatTokenCount(data.completionTokens, 1);
+		}
+
+		if (modelTotals.length > 0) {
+			const section = this.callBreakdownContainer.appendChild($('.token-category'));
+			section.appendChild($('.token-category-header')).textContent = localize('turnTotals', "This turn by model");
+			for (const total of modelTotals) {
+				const row = section.appendChild($('.token-detail-item'));
+				row.appendChild($('.token-detail-label')).textContent = total.model;
+				row.appendChild($('.token-detail-value')).textContent = localize(
+					'turnTotalValue', "in {0} · cached {1} · out {2}",
+					this.formatTokenCount(total.inputTokens, 1),
+					this.formatTokenCount(total.cachedTokens, 1),
+					this.formatTokenCount(total.outputTokens, 1),
+				);
+			}
+		}
 	}
 
 	private formatTokenCount(count: number, decimals: number): string {

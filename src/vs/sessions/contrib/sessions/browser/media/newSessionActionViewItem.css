@@ -3,9 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-/* Compact "New" session button — rendered by NewSessionActionViewItem and shared
-between the sessions sidebar header and the titlebar. Selectors are intentionally
-unscoped so the widget renders identically wherever it is mounted. */
+	/* Compact "New" pill — titlebar. Sidebar uses the full-width primary
+	 * `.agent-sessions-new-agent-button` instead. Selectors are unscoped so
+	 * the widget renders identically wherever the compact pill is mounted. */
 
 .agent-sessions-compact-new-button.monaco-button {
 	display: inline-flex;
@@ -78,4 +78,36 @@ unscoped so the widget renders identically wherever it is mounted. */
 
 .agent-sessions-compact-new-button .new-session-keybinding-hint .monaco-keybinding > .monaco-keybinding-key:last-child {
 	margin-right: 0;
+}
+
+/* Full-width primary "New Agent" button in the sessions sidebar. */
+.agent-sessions-new-agent-button.monaco-button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	width: 100%;
+	height: 28px;
+	padding: 4px 10px;
+	font-size: var(--vscode-agents-fontSize-label1, 12px);
+	font-weight: var(--vscode-agents-fontWeight-semiBold, 600);
+	line-height: 18px;
+	border-radius: var(--vscode-cornerRadius-small);
+	white-space: nowrap;
+}
+
+.agent-sessions-new-agent-button.monaco-button:not(.disabled) {
+	cursor: pointer;
+}
+
+.agent-sessions-new-agent-button.monaco-button:focus {
+	outline-offset: -1px !important;
+}
+
+.agent-sessions-new-agent-button .new-session-button-label {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	white-space: nowrap;
 }

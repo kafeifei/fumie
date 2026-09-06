@@ -51,7 +51,7 @@ import {
 	IAgentHostSocketInfo,
 	IAgentResolveSessionConfigParams,
 	IAgentSessionConfigCompletionsParams,
-	IAgentSessionMetadata,
+	IAgentSessionList,
 	AuthenticateParams,
 	AuthenticateResult,
 	IMcpNotification,
@@ -162,6 +162,16 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 	private readonly _onAgentHostStart = this._register(new Emitter<void>());
 	readonly onAgentHostStart = this._onAgentHostStart.event;
 
+	// Delayed service proxies cache function-valued properties on first access.
+	// Keep these events stable before startup: a getter returning Event.None
+	// would permanently disconnect early subscribers from the protocol client.
+	private readonly _onDidAction = this._register(new Emitter<ActionEnvelope>());
+	readonly onDidAction = this._onDidAction.event;
+	private readonly _onDidNotification = this._register(new Emitter<INotification>());
+	readonly onDidNotification = this._onDidNotification.event;
+	private readonly _onMcpNotification = this._register(new Emitter<IMcpNotification>());
+	readonly onMcpNotification = this._onMcpNotification.event;
+
 	private readonly _authenticationPending: ISettableObservable<boolean> = observableValue('authenticationPending', true);
 	readonly authenticationPending: IObservable<boolean> = this._authenticationPending;
 	private _authenticationSettled = false;
@@ -220,6 +230,9 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 				this.clientId,
 				this._clientInfo,
 			));
+			this._register(this._protocolClient.onDidAction(event => this._onDidAction.fire(event)));
+			this._register(this._protocolClient.onDidNotification(event => this._onDidNotification.fire(event)));
+			this._register(this._protocolClient.onMcpNotification(event => this._onMcpNotification.fire(event)));
 			this._register(this._protocolClient.onDidChangeConnectionState(state => this._handleConnectionState(state)));
 			this._register(this._protocolClient.onDidFatalClose(() => {
 				if (!this._didConnectInitially) {
@@ -350,18 +363,6 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 		return this._protocolClient?.rootState ?? this._noopRootState;
 	}
 
-	get onDidAction(): Event<ActionEnvelope> {
-		return this._protocolClient?.onDidAction ?? Event.None;
-	}
-
-	get onDidNotification(): Event<INotification> {
-		return this._protocolClient?.onDidNotification ?? Event.None;
-	}
-
-	get onMcpNotification(): Event<IMcpNotification> {
-		return this._protocolClient?.onMcpNotification ?? Event.None;
-	}
-
 	getSubscription<T extends StateComponents>(kind: T, resource: URI, owner: string): IReference<IAgentSubscription<ComponentToState[T]>> {
 		return this._requireClient().getSubscription<ComponentToState[T]>(kind, resource, owner);
 	}
@@ -386,7 +387,7 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 		return this._requireClient().authenticate(params);
 	}
 
-	listSessions(): Promise<IAgentSessionMetadata[]> {
+	listSessions(): Promise<IAgentSessionList> {
 		this._startupTelemetry?.sessionListRequested();
 		if (!this._didStartInitialSessionList) {
 			this._didStartInitialSessionList = true;
@@ -439,6 +440,10 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 
 	disposeSession(session: URI): Promise<void> {
 		return this._requireClient().disposeSession(session);
+	}
+
+	setSessionArchived(session: URI, isArchived: boolean, preserveChanges?: boolean): Promise<void> {
+		return this._requireClient().setSessionArchived(session, isArchived, preserveChanges);
 	}
 
 	createChat(session: URI, chat: URI, options?: IAgentCreateChatOptions): Promise<void> {
@@ -572,6 +577,7 @@ export function registerAgentHostClientChannels(
 
 	try {
 		client.registerChannel(AGENT_HOST_CLIENT_BYOK_LM_CHANNEL, instantiationService.createInstance(AgentHostClientByokLmChannel));
+		logService.trace(`${LOG_PREFIX} BYOK reverse channel registered`);
 	} catch (error) {
 		logService.warn(`${LOG_PREFIX} BYOK language-model bridge not registered for this window. ${error instanceof Error ? error.message : String(error)}`);
 		client.registerChannel(AGENT_HOST_CLIENT_BYOK_LM_CHANNEL, new NullAgentHostClientByokLmChannel());

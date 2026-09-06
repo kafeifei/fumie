@@ -49,7 +49,7 @@ import {
 	type SubscribeResult,
 	type ListSessionsResult,
 } from '../common/state/sessionProtocol.js';
-import { isAhpResourceWatchChannel, isAhpRootChannel, ResponsePartKind, SessionStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, buildDefaultChatUri, isAhpChatChannel, parseChatUri, parseRequiredSessionUriFromChatUri, type ISessionWithDefaultChat, type SessionState } from '../common/state/sessionState.js';
+import { isAhpResourceWatchChannel, isAhpRootChannel, ROOT_STATE_URI, ResponsePartKind, SessionStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, buildDefaultChatUri, isAhpChatChannel, parseChatUri, parseRequiredSessionUriFromChatUri, type ISessionWithDefaultChat, type SessionState } from '../common/state/sessionState.js';
 import type { IProtocolServer, IProtocolTransport } from '../common/state/sessionTransport.js';
 import { IAgentHostManagedSettingsService } from './agentHostManagedSettingsService.js';
 import { AgentHostStateManager } from './agentHostStateManager.js';
@@ -64,7 +64,7 @@ import {
 	type IOtlpLogRecord,
 	type OtlpLogLevelName,
 } from '../common/otlp/otlpLogEmitter.js';
-import { isFileResourceRead } from '../common/resourceReadLogging.js';
+import { isFileResourceProbe } from '../common/resourceReadLogging.js';
 import type { Implementation } from '../common/state/protocol/common/commands.js';
 import { AGENT_HOST_CLIENT_CONNECTION_HISTORY_RETENTION, IAgentHostClientConnectionService, type IAgentHostClientConnectionSource } from './agentHostClientConnectionService.js';
 import { AgentHostTelemetryReporter } from './agentHostTelemetryReporter.js';
@@ -110,7 +110,7 @@ function jsonRpcErrorFrom(id: number, err: unknown): JsonRpcResponse {
 }
 
 function shouldLogFailedRequest(method: string, params: unknown, err: unknown): boolean {
-	if (!(err instanceof ProtocolError) || err.code !== AhpErrorCodes.NotFound || !isFileResourceRead(method, params)) {
+	if (!(err instanceof ProtocolError) || err.code !== AhpErrorCodes.NotFound || !isFileResourceProbe(method, params)) {
 		return true;
 	}
 	return false;
@@ -310,6 +310,8 @@ function classifyChannel(channel: string): ChannelSubscription | undefined {
 export interface IProtocolServerConfig {
 	/** Process launcher that owns this agent host. */
 	readonly hostLaunchKind?: AgentHostLaunchKind;
+	/** Optional local transport barrier completed before initialize/reconnect publishes snapshots. */
+	readonly beforeHandshake?: (clientId: string) => Promise<void> | undefined;
 
 	/** Default directory returned to clients during the initialize handshake. */
 	readonly defaultDirectory?: string;
@@ -438,29 +440,51 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
 
 				// Handle initialize/reconnect as requests that set up the client
 				if (!client && msg.method === 'initialize') {
-					try {
-						const result = this._handleInitialize(msg.params, transport, disposables);
-						client = result.client;
-						transport.send(jsonRpcSuccess(msg.id, result.response));
-					} catch (err) {
-						transport.send(jsonRpcErrorFrom(msg.id, err));
+					const respond = () => {
+						if (disposables.isDisposed) {
+							return;
+						}
+						try {
+							const result = this._handleInitialize(msg.params, transport, disposables);
+							client = result.client;
+							transport.send(jsonRpcSuccess(msg.id, result.response));
+						} catch (err) {
+							transport.send(jsonRpcErrorFrom(msg.id, err));
+						}
+					};
+					const barrier = this._config.beforeHandshake?.(msg.params.clientId);
+					if (barrier) {
+						void barrier.then(respond, err => transport.send(jsonRpcErrorFrom(msg.id, err)));
+					} else {
+						respond();
 					}
 					return;
 				}
 				if (!client && msg.method === 'reconnect') {
-					let responsePromise: Promise<unknown>;
-					try {
-						const result = this._handleReconnect(msg.params, transport, disposables);
-						client = result.client;
-						responsePromise = this._trackRequest(result.responsePromise);
-					} catch (err) {
-						transport.send(jsonRpcErrorFrom(msg.id, err));
-						return;
+					const respond = () => {
+						if (disposables.isDisposed) {
+							return;
+						}
+						let responsePromise: Promise<unknown>;
+						try {
+							const result = this._handleReconnect(msg.params, transport, disposables);
+							client = result.client;
+							responsePromise = this._trackRequest(result.responsePromise);
+						} catch (err) {
+							transport.send(jsonRpcErrorFrom(msg.id, err));
+							return;
+						}
+						void responsePromise.then(
+							response => transport.send(jsonRpcSuccess(msg.id, response)),
+							err => transport.send(jsonRpcErrorFrom(msg.id, err)),
+						);
+					};
+					const barrier = this._config.beforeHandshake?.(msg.params.clientId);
+					if (barrier) {
+						void barrier.then(respond, err => transport.send(jsonRpcErrorFrom(msg.id, err)));
+					} else {
+						respond();
 					}
-					responsePromise.then(
-						response => transport.send(jsonRpcSuccess(msg.id, response)),
-						err => transport.send(jsonRpcErrorFrom(msg.id, err)),
-					);
 					return;
 				}
 
@@ -1379,6 +1403,7 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
 				createdSession = await this._agentService.createSession({
 					provider: params.provider,
 					_meta: params._meta,
+					model: params.model,
 					workingDirectories: params.workingDirectories?.map(d => URI.parse(d)),
 					session: URI.parse(params.channel),
 					config: params.config,
@@ -1399,6 +1424,10 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
 		},
 		disposeSession: async (_client, params) => {
 			await this._agentService.disposeSession(URI.parse(params.channel));
+			return null;
+		},
+		setSessionArchived: async (_client, params) => {
+			await this._agentService.setSessionArchived(URI.parse(params.channel), params.isArchived, params.preserveChanges);
 			return null;
 		},
 		createChat: async (_client, params) => {
@@ -1474,7 +1503,10 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
 					...(s._meta !== undefined ? { _meta: s._meta } : {}),
 				} satisfies ListSessionsResult['items'][number];
 			});
-			return { items: this._stateManager.prepareSessionSummariesForListing(items) };
+			return {
+				items: this._stateManager.prepareSessionSummariesForListing(items),
+				providers: sessions.providers ? [...sessions.providers] : undefined,
+			};
 		},
 		resolveSessionConfig: async (_client, params) => {
 			return this._agentService.resolveSessionConfig({
@@ -1903,6 +1935,17 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
 	private _isRelevantToClient(client: IConnectedClient, envelope: ActionEnvelope): boolean {
 		const sub = client.subscriptions.get(envelope.channel);
 		if (sub?.kind === ChannelKind.State || sub?.kind === ChannelKind.ResourceWatch) {
+			return true;
+		}
+		// Title/read/archive are catalog mutations as well as session actions.
+		// A sessions-list client subscribes to the root catalog but deliberately
+		// does not restore every cold session, so exact-channel filtering would
+		// leave its cached row stale. Deliver these compact deltas to every root
+		// subscriber; the client-side provider already routes them by session URI.
+		const catalogAction = envelope.action.type === ActionType.SessionTitleChanged
+			|| envelope.action.type === ActionType.SessionIsReadChanged
+			|| envelope.action.type === ActionType.SessionIsArchivedChanged;
+		if (catalogAction && client.subscriptions.get(ROOT_STATE_URI)?.kind === ChannelKind.State) {
 			return true;
 		}
 		if (!isAhpRootChannel(envelope.channel)) {

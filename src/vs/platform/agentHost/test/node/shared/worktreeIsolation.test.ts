@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { timeout } from '../../../../../base/common/async.js';
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
@@ -14,11 +14,14 @@ import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
 import { GitRefType, IAgentHostGitService, type IAddWorktreeOptions } from '../../../common/agentHostGitService.js';
+import { AgentHostFumieHomeEnvVar } from '../../../common/agentHostProductEnv.js';
 import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { AH_META_IS_ARCHIVED_DB_KEY, AH_META_IS_DONE_DB_KEY, MessageKind, ResponsePartKind, TurnState, type Turn } from '../../../common/state/sessionState.js';
 import { AgentBranchNameGenerator, IAgentBranchNameGenerator } from '../../../node/shared/agentBranchNameGenerator.js';
 import { ICopilotApiService } from '../../../node/shared/copilotApiService.js';
-import { buildWorktreeFailureNotification, normalizeWorktreeFailureDiagnostic, SessionWorkingDirectoryMissingError, WorktreeIsolation, getWorktreeName, getWorktreesRoot } from '../../../node/shared/worktreeIsolation.js';
+import { buildWorktreeFailureNotification, normalizeWorktreeFailureDiagnostic, SessionWorkingDirectoryMissingError, WorktreeArchiveChangesConfirmationRequiredError, WorktreeArchiveUnrecoverableError, WorktreeIsolation, getWorktreeArchiveRef, getWorktreeName, getWorktreesRoot } from '../../../node/shared/worktreeIsolation.js';
+import { FUMIE_WORKTREE_DISK_BUDGET_BYTES_ENV_VAR, WorktreeDiskBudgetExceededError } from '../../../node/worktree/worktreeDiskBudget.js';
+import { getManagedWorktreePath, getManagedWorktreeRepositoryRoot } from '../../../node/worktree/worktreePaths.js';
 import { TestSessionDatabase, createNoopGitService, createSessionDataService } from '../../common/sessionTestHelpers.js';
 
 /**
@@ -48,6 +51,11 @@ suite('WorktreeIsolation', () => {
 	let addWorktreeCalls: IAddWorktreeOptions[];
 	let addExistingCalls: { worktree: URI; branchName: string }[];
 	let removeCalls: { worktree: URI; force: boolean }[];
+	let deleteBranchCalls: { repositoryRoot: URI; branchName: string; force: boolean }[];
+	let archiveRefCommit: string | undefined;
+	let archiveIndexTree: string | undefined;
+	let archiveTree: string | undefined;
+	let archiveRestoreCalls: string[];
 	let copyIncludeCalls: { repositoryRoot: URI; worktree: URI; globs: readonly string[] }[];
 	let copyIncludeError: Error | undefined;
 	let branchName: string;
@@ -62,8 +70,39 @@ suite('WorktreeIsolation', () => {
 		return {
 			...createNoopGitService(),
 			getRepositoryRoot: async () => repoRoot,
-			revParse: async (_root, expr) => expr === 'HEAD' ? headCommit : undefined,
+			getWorktreeRoots: async workingDirectory => existsSync(workingDirectory.fsPath) ? [
+				repoRoot,
+				...addWorktreeCalls.map(call => call.path).filter(worktree => existsSync(worktree.fsPath)),
+				...addExistingCalls.map(call => call.worktree).filter(worktree => existsSync(worktree.fsPath)),
+			] : [],
+			revParse: async (_root, expr) => {
+				const archiveRef = getWorktreeArchiveRef(sessionId);
+				if (expr === 'HEAD' || expr.startsWith('refs/heads/')) {
+					return headCommit;
+				}
+				if (expr === archiveRef) {
+					return archiveRefCommit;
+				}
+				if (expr === `${archiveRef}^` || expr === `${archiveRef}^1`) {
+					return archiveRefCommit ? headCommit : undefined;
+				}
+				if (expr === `${archiveRef}^1^{tree}`) {
+					return archiveRefCommit ? 'base-tree' : undefined;
+				}
+				if (expr === `${archiveRef}^2^{tree}`) {
+					return archiveRefCommit ? archiveIndexTree : undefined;
+				}
+				if (expr === `${archiveRef}^{tree}`) {
+					return archiveRefCommit ? archiveTree : undefined;
+				}
+				return undefined;
+			},
 			getCurrentBranch: async () => 'feature',
+			getCurrentBranchName: async workingDirectory =>
+				addExistingCalls.find(call => call.worktree.toString() === workingDirectory.toString())?.branchName
+				?? addWorktreeCalls.find(call => call.path.toString() === workingDirectory.toString())?.newBranchName
+				?? addWorktreeCalls.find(call => call.path.toString() === workingDirectory.toString())?.commitish
+				?? 'feature',
 			getDefaultBranch: async () => ({ name: 'main', startPoint: 'main' }),
 			getBranches: async () => [
 				{ ref: 'refs/heads/main', name: 'main', kind: GitRefType.Head },
@@ -71,6 +110,40 @@ suite('WorktreeIsolation', () => {
 			],
 			branchExists: async () => branchExists,
 			hasUncommittedChanges: async () => hasUncommittedChanges,
+			captureWorktreeArchiveSnapshot: async () => ({
+				baseCommit: headCommit!,
+				baseTreeOid: 'base-tree',
+				indexTreeOid: hasUncommittedChanges ? archiveIndexTree ?? 'index-tree' : 'base-tree',
+				workingTreeOid: hasUncommittedChanges ? archiveTree ?? 'archive-tree' : 'base-tree',
+			}),
+			commitTree: async (_repositoryRoot, treeOid, _parents, message) => {
+				if (message.includes('index')) {
+					archiveIndexTree = treeOid;
+					return 'archive-index-commit';
+				}
+				archiveTree = treeOid;
+				return 'archive-commit';
+			},
+			commitTreeWithParents: async (_repositoryRoot, treeOid) => {
+				archiveTree = treeOid;
+				return 'archive-commit';
+			},
+			updateRef: async (_repositoryRoot, _ref, oid) => { archiveRefCommit = oid; },
+			deleteRefs: async (_repositoryRoot, refs) => {
+				if (refs.includes(getWorktreeArchiveRef(sessionId))) {
+					archiveRefCommit = undefined;
+					archiveIndexTree = undefined;
+					archiveTree = undefined;
+				}
+			},
+			applyWorktreeArchiveStash: async (_workingDirectory, ref) => {
+				archiveRestoreCalls.push(ref);
+			},
+			restore: async (_workingDirectory, _paths, options) => {
+				if (options?.ref) {
+					archiveRestoreCalls.push(options.ref);
+				}
+			},
 			addWorktree: async (_root, options) => {
 				addWorktreeCalls.push(options);
 				mkdirSync(options.path.fsPath, { recursive: true });
@@ -88,6 +161,10 @@ suite('WorktreeIsolation', () => {
 			removeWorktree: async (_root, worktree, options) => {
 				removeCalls.push({ worktree, force: options?.force === true });
 				rmSync(worktree.fsPath, { recursive: true, force: true });
+			},
+			deleteBranch: async (repositoryRoot, candidate, options) => {
+				deleteBranchCalls.push({ repositoryRoot, branchName: candidate, force: options?.force === true });
+				branchExists = false;
 			},
 		};
 	}
@@ -112,6 +189,11 @@ suite('WorktreeIsolation', () => {
 		addWorktreeCalls = [];
 		addExistingCalls = [];
 		removeCalls = [];
+		deleteBranchCalls = [];
+		archiveRefCommit = undefined;
+		archiveIndexTree = undefined;
+		archiveTree = undefined;
+		archiveRestoreCalls = [];
 		copyIncludeCalls = [];
 		copyIncludeError = undefined;
 		branchName = 'agents/my-feature';
@@ -125,15 +207,17 @@ suite('WorktreeIsolation', () => {
 		rmSync(worktreesRoot.fsPath, { recursive: true, force: true });
 	});
 
-	test('getWorktreesRoot / getWorktreeName derive sibling paths and strip the agents/ prefix', () => {
+	test('getWorktreesRoot / getWorktreeName derive legacy and Fumie-home paths and strip the agents/ prefix', () => {
 		assert.deepStrictEqual({
 			root: getWorktreesRoot(URI.file('/src/vscode')).fsPath,
+			fumieRoot: getWorktreesRoot(URI.file('/src/vscode'), URI.file('/home/user/.fumie')).fsPath,
 			named: getWorktreeName('agents/add-config'),
 			namedFlattened: getWorktreeName('agents/feature/sub-topic'),
 			namedNoPrefix: getWorktreeName('plain-branch'),
 			namedWithBranchPrefix: getWorktreeName('users/alice/agents/add-config', 'users/alice/'),
 		}, {
 			root: URI.file('/src/vscode.worktrees').fsPath,
+			fumieRoot: URI.file('/home/user/.fumie/worktrees/vscode').fsPath,
 			named: 'add-config',
 			namedFlattened: 'feature-sub-topic',
 			namedNoPrefix: 'plain-branch',
@@ -148,6 +232,7 @@ suite('WorktreeIsolation', () => {
 		const repoWorktree = await isolation.resolveIsolationConfig({ workingDirectory: repoRoot, config: undefined });
 		const repoWorktreeSelected = await isolation.resolveIsolationConfig({ workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'feature' } });
 		const repoFolder = await isolation.resolveIsolationConfig({ workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'folder' } });
+		const repoFolderSelected = await isolation.resolveIsolationConfig({ workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'folder', [SessionConfigKey.Branch]: 'main' } });
 		headCommit = undefined; // unborn HEAD (no commits)
 		const noCommits = await isolation.resolveIsolationConfig({ workingDirectory: repoRoot, config: undefined });
 
@@ -156,12 +241,14 @@ suite('WorktreeIsolation', () => {
 			repoWorktree: { enum: repoWorktree.isolationProperty.protocol.enum, value: repoWorktree.isolationValue, branchDefault: repoWorktree.branchDefault, branchReadOnly: repoWorktree.branchProperty?.protocol.readOnly, prefixReadOnly: repoWorktree.worktreeBranchPrefixProperty?.protocol.readOnly, includeFilesReadOnly: repoWorktree.worktreeIncludeFilesProperty?.protocol.readOnly, branchTrackReadOnly: repoWorktree.worktreeBranchTrackProperty?.protocol.readOnly, createNewBranchReadOnly: repoWorktree.worktreeCreateNewBranchProperty?.protocol.readOnly },
 			repoWorktreeSelected: { branchDefault: repoWorktreeSelected.branchDefault, branchValue: repoWorktreeSelected.branchValue, branchEnum: repoWorktreeSelected.branchProperty?.protocol.enum },
 			repoFolder: { value: repoFolder.isolationValue, branchDefault: repoFolder.branchDefault, branchReadOnly: repoFolder.branchProperty?.protocol.readOnly, hasPrefix: !!repoFolder.worktreeBranchPrefixProperty, hasIncludeFiles: !!repoFolder.worktreeIncludeFilesProperty, hasBranchTrack: !!repoFolder.worktreeBranchTrackProperty, hasCreateNewBranch: !!repoFolder.worktreeCreateNewBranchProperty },
+			repoFolderSelected: { branchValue: repoFolderSelected.branchValue, branchDynamic: repoFolderSelected.branchProperty?.protocol.enumDynamic },
 			noCommits: { enum: noCommits.isolationProperty.protocol.enum, value: noCommits.isolationValue, branch: noCommits.branchProperty, prefix: noCommits.worktreeBranchPrefixProperty, includeFiles: noCommits.worktreeIncludeFilesProperty, branchTrack: noCommits.worktreeBranchTrackProperty, createNewBranch: noCommits.worktreeCreateNewBranchProperty },
 		}, {
 			noRepo: { enum: ['folder'], value: 'folder', branch: undefined, prefix: undefined, includeFiles: undefined, branchTrack: undefined, createNewBranch: undefined },
 			repoWorktree: { enum: ['folder', 'worktree'], value: 'worktree', branchDefault: 'main', branchReadOnly: false, prefixReadOnly: true, includeFilesReadOnly: true, branchTrackReadOnly: true, createNewBranchReadOnly: true },
 			repoWorktreeSelected: { branchDefault: 'main', branchValue: 'feature', branchEnum: ['main'] },
-			repoFolder: { value: 'folder', branchDefault: 'feature', branchReadOnly: true, hasPrefix: true, hasIncludeFiles: true, hasBranchTrack: true, hasCreateNewBranch: true },
+			repoFolder: { value: 'folder', branchDefault: 'feature', branchReadOnly: false, hasPrefix: true, hasIncludeFiles: true, hasBranchTrack: true, hasCreateNewBranch: true },
+			repoFolderSelected: { branchValue: 'main', branchDynamic: true },
 			noCommits: { enum: ['folder'], value: 'folder', branch: undefined, prefix: undefined, includeFiles: undefined, branchTrack: undefined, createNewBranch: undefined },
 		});
 	});
@@ -281,6 +368,109 @@ suite('WorktreeIsolation', () => {
 			idempotentReturn: expectedWorktree.toString(),
 			resolvedWorktree: expectedWorktree.toString(),
 		});
+	});
+
+	test('Fumie home creates new sessions at the repository-hash/session path', async () => {
+		const fumieHome = URI.file(mkdtempSync(join(tmpdir(), 'fumie-home-')));
+		const previousFumieHome = process.env[AgentHostFumieHomeEnvVar];
+		process.env[AgentHostFumieHomeEnvVar] = fumieHome.fsPath;
+		try {
+			const isolation = createIsolation(disposables);
+			const worktree = await isolation.resolveWorkingDirectory({
+				sessionUri,
+				sessionId,
+				workingDirectory: repoRoot,
+				config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' },
+				diskBudgetSessions: [{ sessionId, running: true, pinned: false }],
+			});
+			assert.strictEqual(worktree?.toString(), getManagedWorktreePath(fumieHome, repoRoot, sessionId).toString());
+		} finally {
+			if (previousFumieHome === undefined) {
+				delete process.env[AgentHostFumieHomeEnvVar];
+			} else {
+				process.env[AgentHostFumieHomeEnvVar] = previousFumieHome;
+			}
+			rmSync(fumieHome.fsPath, { recursive: true, force: true });
+		}
+	});
+
+	test('the configured total disk budget rejects and rolls back a new worktree that cannot fit', async () => {
+		const fumieHome = URI.file(mkdtempSync(join(tmpdir(), 'fumie-budget-')));
+		const previousFumieHome = process.env[AgentHostFumieHomeEnvVar];
+		const previousBudget = process.env[FUMIE_WORKTREE_DISK_BUDGET_BYTES_ENV_VAR];
+		process.env[AgentHostFumieHomeEnvVar] = fumieHome.fsPath;
+		process.env[FUMIE_WORKTREE_DISK_BUDGET_BYTES_ENV_VAR] = '0';
+		try {
+			const isolation = createIsolation(disposables);
+			await assert.rejects(() => isolation.resolveWorkingDirectory({
+				sessionUri,
+				sessionId,
+				workingDirectory: repoRoot,
+				config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' },
+				diskBudgetSessions: [{ sessionId, running: true, pinned: false }],
+			}), error => error instanceof WorktreeDiskBudgetExceededError);
+			assert.deepStrictEqual({
+				checkoutExists: existsSync(getManagedWorktreePath(fumieHome, repoRoot, sessionId).fsPath),
+				repositoryDirectoryExists: existsSync(getManagedWorktreeRepositoryRoot(fumieHome, repoRoot).fsPath),
+				removeCalls: removeCalls.map(call => call.force),
+				deletedBranches: deleteBranchCalls.map(call => call.branchName),
+				pendingWorktree: isolation.getResolvedWorktree(sessionId),
+			}, {
+				checkoutExists: false,
+				repositoryDirectoryExists: false,
+				removeCalls: [true],
+				deletedBranches: [branchName],
+				pendingWorktree: undefined,
+			});
+		} finally {
+			if (previousFumieHome === undefined) {
+				delete process.env[AgentHostFumieHomeEnvVar];
+			} else {
+				process.env[AgentHostFumieHomeEnvVar] = previousFumieHome;
+			}
+			if (previousBudget === undefined) {
+				delete process.env[FUMIE_WORKTREE_DISK_BUDGET_BYTES_ENV_VAR];
+			} else {
+				process.env[FUMIE_WORKTREE_DISK_BUDGET_BYTES_ENV_VAR] = previousBudget;
+			}
+			rmSync(fumieHome.fsPath, { recursive: true, force: true });
+		}
+	});
+
+	test('resolveOnFirstSend clears pending only after a worktree is materialized', async () => {
+		const gitService = createGitService();
+		const isolation = createIsolation(disposables, { gitService });
+		const request = {
+			sessionUri,
+			sessionId,
+			workingDirectory: repoRoot,
+			config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' },
+		};
+
+		isolation.notePending(sessionId);
+		gitService.getRepositoryRoot = async () => undefined;
+		assert.strictEqual((await isolation.resolveOnFirstSend(request))?.toString(), repoRoot.toString());
+		assert.strictEqual(isolation.isWorkingDirectoryPending(sessionId), true);
+
+		gitService.getRepositoryRoot = async () => repoRoot;
+		await isolation.resolveOnFirstSend(request);
+		assert.strictEqual(isolation.isWorkingDirectoryPending(sessionId), false);
+	});
+
+	test('resolveOnFirstSend keeps pending after creation fails so the first send can retry', async () => {
+		const gitService = createGitService();
+		gitService.addWorktree = async () => { throw new Error('checkout failed'); };
+		const isolation = createIsolation(disposables, { gitService });
+		isolation.notePending(sessionId);
+
+		await assert.rejects(() => isolation.resolveOnFirstSend({
+			sessionUri,
+			sessionId,
+			workingDirectory: repoRoot,
+			config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' },
+		}), /checkout failed/);
+
+		assert.strictEqual(isolation.isWorkingDirectoryPending(sessionId), true);
 	});
 
 	test('resolveWorkingDirectory creates from the primary worktree while copying include files from the selected checkout', async () => {
@@ -519,12 +709,13 @@ suite('WorktreeIsolation', () => {
 		});
 	});
 
-	test('resolveWorkingDirectory copies configured include files and tolerates copy failures', async () => {
+	test('resolveWorkingDirectory rejects include-file bootstrap failures and removes the partial worktree', async () => {
 		const isolation = createIsolation(disposables);
 		const includeFiles = ['.env', '.env.local', 'config/**'];
 		copyIncludeError = new Error('copy failed');
+		isolation.notePending(sessionId);
 
-		const worktree = await isolation.resolveWorkingDirectory({
+		await assert.rejects(() => isolation.resolveOnFirstSend({
 			sessionUri,
 			sessionId,
 			workingDirectory: repoRoot,
@@ -533,25 +724,48 @@ suite('WorktreeIsolation', () => {
 				[SessionConfigKey.Branch]: 'main',
 				[SessionConfigKey.WorktreeIncludeFiles]: includeFiles,
 			},
-		});
+		}), /copy failed/);
 
 		assert.deepStrictEqual({
-			worktree: worktree?.toString(),
 			copyIncludeCalls: copyIncludeCalls.map(call => ({
 				repositoryRoot: call.repositoryRoot.toString(),
 				worktree: call.worktree.toString(),
 				globs: call.globs,
 			})),
-			resolvedWorktree: isolation.getResolvedWorktree(sessionId)?.toString(),
+			removeCalls: removeCalls.map(call => ({ worktree: call.worktree.toString(), force: call.force })),
+			deleteBranchCalls: deleteBranchCalls.map(call => ({ branchName: call.branchName, force: call.force })),
+			resolvedWorktree: isolation.getResolvedWorktree(sessionId),
+			pending: isolation.isWorkingDirectoryPending(sessionId),
+			persistedOwnership: await db.getMetadata('copilot.worktree.ownership'),
 		}, {
-			worktree: URI.joinPath(worktreesRoot, getWorktreeName(branchName)).toString(),
 			copyIncludeCalls: [{
 				repositoryRoot: repoRoot.toString(),
 				worktree: URI.joinPath(worktreesRoot, getWorktreeName(branchName)).toString(),
 				globs: includeFiles,
 			}],
-			resolvedWorktree: URI.joinPath(worktreesRoot, getWorktreeName(branchName)).toString(),
+			removeCalls: [{ worktree: URI.joinPath(worktreesRoot, getWorktreeName(branchName)).toString(), force: true }],
+			deleteBranchCalls: [{ branchName, force: true }],
+			resolvedWorktree: undefined,
+			pending: true,
+			persistedOwnership: undefined,
 		});
+	});
+
+	test('resolveWorkingDirectory ignores legacy node_modules include patterns before creating a worktree', async () => {
+		const isolation = createIsolation(disposables);
+		await isolation.resolveWorkingDirectory({
+			sessionUri,
+			sessionId,
+			workingDirectory: repoRoot,
+			config: {
+				[SessionConfigKey.Isolation]: 'worktree',
+				[SessionConfigKey.Branch]: 'main',
+				[SessionConfigKey.WorktreeIncludeFiles]: ['.env', '**/node_modules/**'],
+			},
+		});
+		assert.strictEqual(addWorktreeCalls.length, 1);
+		assert.deepStrictEqual(copyIncludeCalls.map(call => call.globs), [['.env']]);
+		assert.deepStrictEqual(JSON.parse((await db.getMetadata('copilot.worktree.includeFiles'))!), ['.env']);
 	});
 
 	test('resolveWorkingDirectoryForResume recreates a missing live worktree and preserves an existing directory', async () => {
@@ -576,6 +790,92 @@ suite('WorktreeIsolation', () => {
 			existingWorktreeUsedUnchanged: existingWorktree.toString(),
 			recreatedWorktrees: [{ worktree: missingWorktree.toString(), branchName: 'feature/x' }],
 		});
+	});
+
+	test('live resume recovers a private delta left after archive removal crashed before the catalog commit', async () => {
+		let applied = false;
+		const gitService = createGitService();
+		gitService.captureWorktreeArchiveSnapshot = async () => ({
+			baseCommit: headCommit!,
+			baseTreeOid: 'base-tree',
+			indexTreeOid: applied ? 'index-tree' : 'base-tree',
+			workingTreeOid: applied ? 'archive-tree' : 'base-tree',
+		});
+		gitService.applyWorktreeArchiveStash = async (_workingDirectory, ref) => {
+			archiveRestoreCalls.push(ref);
+			applied = true;
+		};
+		const isolation = createIsolation(disposables, { gitService });
+		const missingWorktree = URI.joinPath(worktreesRoot, 'archive-crash-worktree');
+		await Promise.all([
+			db.setMetadata('copilot.worktree.branchName', branchName),
+			db.setMetadata('copilot.worktree.path', missingWorktree.toString()),
+			db.setMetadata('copilot.worktree.repositoryRoot', repoRoot.toString()),
+			db.setMetadata('copilot.worktree.ownership', 'fumie'),
+		]);
+		hasUncommittedChanges = true;
+		archiveIndexTree = 'index-tree';
+		archiveTree = 'archive-tree';
+		archiveRefCommit = 'archive-commit';
+
+		const restored = await isolation.resolveWorkingDirectoryForResume(sessionUri, sessionId, missingWorktree);
+
+		assert.deepStrictEqual({
+			restored: restored.toString(),
+			archiveRestoreCalls,
+			archiveRefCommit,
+			checkoutExists: existsSync(missingWorktree.fsPath),
+		}, {
+			restored: missingWorktree.toString(),
+			archiveRestoreCalls: [getWorktreeArchiveRef(sessionId)],
+			archiveRefCommit: undefined,
+			checkoutExists: true,
+		});
+	});
+
+	test('resolveWorkingDirectoryForResume rejects a stale directory that Git does not register as the managed worktree', async () => {
+		const isolation = createIsolation(disposables);
+		const staleWorktree = URI.joinPath(worktreesRoot, 'stale-managed-worktree');
+		mkdirSync(staleWorktree.fsPath, { recursive: true });
+		await Promise.all([
+			db.setMetadata('copilot.worktree.branchName', 'feature/x'),
+			db.setMetadata('copilot.worktree.path', staleWorktree.toString()),
+			db.setMetadata('copilot.worktree.repositoryRoot', repoRoot.toString()),
+			db.setMetadata('copilot.worktree.ownership', 'fumie'),
+		]);
+
+		await assert.rejects(
+			() => isolation.resolveWorkingDirectoryForResume(sessionUri, sessionId, staleWorktree),
+			/Git does not register its managed worktree/,
+		);
+	});
+
+	test('resolveWorkingDirectoryForResume accepts a Git-registered real path through a parent symlink alias', async () => {
+		const actualParent = URI.file(mkdtempSync(join(tmpdir(), 'wt-iso-real-')));
+		const aliasParent = URI.file(`${actualParent.fsPath}-alias`);
+		const actualWorktree = URI.joinPath(actualParent, 'managed');
+		const aliasWorktree = URI.joinPath(aliasParent, 'managed');
+		mkdirSync(actualWorktree.fsPath);
+		symlinkSync(actualParent.fsPath, aliasParent.fsPath, process.platform === 'win32' ? 'junction' : 'dir');
+		try {
+			await Promise.all([
+				db.setMetadata('copilot.worktree.branchName', 'feature'),
+				db.setMetadata('copilot.worktree.path', aliasWorktree.toString()),
+				db.setMetadata('copilot.worktree.repositoryRoot', repoRoot.toString()),
+				db.setMetadata('copilot.worktree.ownership', 'fumie'),
+			]);
+			const gitService = createGitService();
+			gitService.getWorktreeRoots = async () => [repoRoot, actualWorktree];
+			const isolation = createIsolation(disposables, { gitService });
+
+			assert.strictEqual(
+				(await isolation.resolveWorkingDirectoryForResume(sessionUri, sessionId, aliasWorktree)).toString(),
+				aliasWorktree.toString(),
+			);
+		} finally {
+			unlinkSync(aliasParent.fsPath);
+			rmSync(actualParent.fsPath, { recursive: true, force: true });
+		}
 	});
 
 	test('resolveWorkingDirectoryForResume recreates a missing live worktree from legacy metadata', async () => {
@@ -829,7 +1129,7 @@ suite('WorktreeIsolation', () => {
 		}, {
 			normalizedLength: 200,
 			kind: ResponsePartKind.SystemNotification,
-			content: `Couldn't create the isolated worktree. This session is continuing in the original folder.\n\n\`\`git-lfs \`filter\` ${'x'.repeat(180)}...\`\``,
+			content: `Couldn't create the isolated worktree. This session hasn't started; retry to try again.\n\n\`\`git-lfs \`filter\` ${'x'.repeat(180)}...\`\``,
 			meta: { kind: 'worktreeCreationFailure', severity: 'warning' },
 		});
 	});
@@ -856,7 +1156,7 @@ suite('WorktreeIsolation', () => {
 		}, {
 			matching: {
 				kind: ResponsePartKind.SystemNotification,
-				content: 'Couldn\'t create the isolated worktree. This session is continuing in the original folder.\n\n`git worktree exited with code 128`',
+				content: 'Couldn\'t create the isolated worktree. This session hasn\'t started; retry to try again.\n\n`git worktree exited with code 128`',
 				_meta: { kind: 'worktreeCreationFailure', severity: 'warning' },
 			},
 			copiedPartCount: 0,
@@ -879,11 +1179,278 @@ suite('WorktreeIsolation', () => {
 			addExistingCalls: addExistingCalls.map(c => ({ worktree: c.worktree.toString(), branchName: c.branchName })),
 			restoredDuringUnarchive,
 		}, {
-			removeCalls: [{ worktree: worktree!.toString(), force: false }],
+			removeCalls: [{ worktree: worktree!.toString(), force: true }],
 			removedDuringArchive: true,
 			addExistingCalls: [{ worktree: worktree!.toString(), branchName }],
 			restoredDuringUnarchive: true,
 		});
+	});
+
+	test('unarchive restores configured environment files before the checkout becomes ready', async () => {
+		const isolation = createIsolation(disposables);
+		const includeFiles = ['.env', 'config/**'];
+		const worktree = await isolation.resolveWorkingDirectory({
+			sessionUri,
+			sessionId,
+			workingDirectory: repoRoot,
+			config: {
+				[SessionConfigKey.Isolation]: 'worktree',
+				[SessionConfigKey.Branch]: 'main',
+				[SessionConfigKey.WorktreeIncludeFiles]: includeFiles,
+			},
+		});
+		await isolation.cleanupWorktreeOnArchive(sessionUri, sessionId);
+		await isolation.recreateWorktreeOnUnarchive(sessionUri, sessionId);
+
+		assert.deepStrictEqual({
+			copyCalls: copyIncludeCalls.map(call => ({ source: call.repositoryRoot.toString(), worktree: call.worktree.toString(), globs: call.globs })),
+			checkoutExists: existsSync(worktree!.fsPath),
+		}, {
+			copyCalls: [
+				{ source: repoRoot.toString(), worktree: worktree!.toString(), globs: includeFiles },
+				{ source: repoRoot.toString(), worktree: worktree!.toString(), globs: includeFiles },
+			],
+			checkoutExists: true,
+		});
+	});
+
+	test('unarchive removes a partial checkout and rejects when environment restore fails', async () => {
+		const isolation = createIsolation(disposables);
+		const worktree = await isolation.resolveWorkingDirectory({
+			sessionUri,
+			sessionId,
+			workingDirectory: repoRoot,
+			config: {
+				[SessionConfigKey.Isolation]: 'worktree',
+				[SessionConfigKey.Branch]: 'main',
+				[SessionConfigKey.WorktreeIncludeFiles]: ['.env'],
+			},
+		});
+		await isolation.cleanupWorktreeOnArchive(sessionUri, sessionId);
+		copyIncludeError = new Error('restore environment failed');
+
+		await assert.rejects(() => isolation.recreateWorktreeOnUnarchive(sessionUri, sessionId), /restore environment failed/);
+		assert.strictEqual(existsSync(worktree!.fsPath), false);
+	});
+
+	test('cleanup on archive stores dirty contents in a private ref without changing the branch', async () => {
+		hasUncommittedChanges = true;
+		const isolation = createIsolation(disposables);
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+
+		await isolation.cleanupWorktreeOnArchive(sessionUri, sessionId);
+
+		assert.deepStrictEqual({
+			archiveRefCommit,
+			archiveTree,
+			branchHead: headCommit,
+			removeCalls: removeCalls.map(call => ({ worktree: call.worktree.toString(), force: call.force })),
+			checkoutExists: existsSync(worktree!.fsPath),
+		}, {
+			archiveRefCommit: 'archive-commit',
+			archiveTree: 'archive-tree',
+			branchHead: 'abc123',
+			removeCalls: [{ worktree: worktree!.toString(), force: true }],
+			checkoutExists: false,
+		});
+	});
+
+	test('legacy dirty archive requires confirmation before creating a ref or removing the checkout', async () => {
+		hasUncommittedChanges = true;
+		const isolation = createIsolation(disposables);
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+
+		await assert.rejects(
+			isolation.cleanupWorktreeOnArchive(sessionUri, sessionId, { preserveChanges: false }),
+			WorktreeArchiveChangesConfirmationRequiredError,
+		);
+
+		assert.deepStrictEqual({
+			archiveRefCommit,
+			removeCalls: removeCalls.length,
+			checkoutExists: existsSync(worktree!.fsPath),
+		}, {
+			archiveRefCommit: undefined,
+			removeCalls: 0,
+			checkoutExists: true,
+		});
+	});
+
+	test('unarchive reapplies and verifies the private delta before consuming its ref', async () => {
+		hasUncommittedChanges = true;
+		let applied = false;
+		const gitService = createGitService();
+		gitService.captureWorktreeArchiveSnapshot = async () => {
+			const dirty = removeCalls.length === 0 || applied;
+			return {
+				baseCommit: headCommit!,
+				baseTreeOid: 'base-tree',
+				indexTreeOid: dirty ? 'index-tree' : 'base-tree',
+				workingTreeOid: dirty ? 'archive-tree' : 'base-tree',
+			};
+		};
+		gitService.applyWorktreeArchiveStash = async (_workingDirectory, ref) => {
+			archiveRestoreCalls.push(ref);
+			applied = true;
+		};
+		const isolation = createIsolation(disposables, { gitService });
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+
+		await isolation.cleanupWorktreeOnArchive(sessionUri, sessionId);
+		assert.strictEqual(archiveRefCommit, 'archive-commit');
+		await isolation.recreateWorktreeOnUnarchive(sessionUri, sessionId);
+
+		assert.deepStrictEqual({
+			archiveRestoreCalls,
+			archiveRefCommit,
+			checkoutExists: existsSync(worktree!.fsPath),
+		}, {
+			archiveRestoreCalls: [getWorktreeArchiveRef(sessionId)],
+			archiveRefCommit: undefined,
+			checkoutExists: true,
+		});
+	});
+
+	test('unarchive consumes a retained private ref without reapplying when the live four-state already matches', async () => {
+		hasUncommittedChanges = true;
+		const isolation = createIsolation(disposables);
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+		archiveIndexTree = 'index-tree';
+		archiveTree = 'archive-tree';
+		archiveRefCommit = 'archive-commit';
+
+		await isolation.recreateWorktreeOnUnarchive(sessionUri, sessionId);
+
+		assert.deepStrictEqual({
+			archiveRestoreCalls,
+			archiveRefCommit,
+			checkoutExists: existsSync(worktree!.fsPath),
+		}, {
+			archiveRestoreCalls: [],
+			archiveRefCommit: undefined,
+			checkoutExists: true,
+		});
+	});
+
+	test('unarchive applies a retained private ref when the checkout is still clean after a crash', async () => {
+		let applied = false;
+		const gitService = createGitService();
+		gitService.captureWorktreeArchiveSnapshot = async () => ({
+			baseCommit: headCommit!,
+			baseTreeOid: 'base-tree',
+			indexTreeOid: applied ? 'index-tree' : 'base-tree',
+			workingTreeOid: applied ? 'archive-tree' : 'base-tree',
+		});
+		gitService.applyWorktreeArchiveStash = async (_workingDirectory, ref) => {
+			archiveRestoreCalls.push(ref);
+			applied = true;
+		};
+		const isolation = createIsolation(disposables, { gitService });
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+		archiveIndexTree = 'index-tree';
+		archiveTree = 'archive-tree';
+		archiveRefCommit = 'archive-commit';
+
+		await isolation.recreateWorktreeOnUnarchive(sessionUri, sessionId);
+
+		assert.deepStrictEqual({
+			archiveRestoreCalls,
+			archiveRefCommit,
+			checkoutExists: existsSync(worktree!.fsPath),
+		}, {
+			archiveRestoreCalls: [getWorktreeArchiveRef(sessionId)],
+			archiveRefCommit: undefined,
+			checkoutExists: true,
+		});
+	});
+
+	test('cleanup on archive rejects snapshot-commit and removal failures without pretending archive cleanup succeeded', async () => {
+		hasUncommittedChanges = true;
+		const commitGitService = createGitService();
+		commitGitService.commitTree = async () => { throw new Error('snapshot commit failed'); };
+		const commitIsolation = createIsolation(disposables, { gitService: commitGitService });
+		const commitWorktree = await commitIsolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+		await assert.rejects(() => commitIsolation.cleanupWorktreeOnArchive(sessionUri, sessionId), /snapshot commit failed/);
+		assert.strictEqual(existsSync(commitWorktree!.fsPath), true);
+		assert.strictEqual(removeCalls.length, 0);
+
+		hasUncommittedChanges = false;
+		const removeGitService = createGitService();
+		removeGitService.removeWorktree = async () => { throw new Error('archive remove failed'); };
+		const secondSessionUri = URI.parse('agent-session://test/s2');
+		const secondDb = new TestSessionDatabase();
+		const removeIsolation = disposables.add(new WorktreeIsolation(
+			{ generateBranchName: async () => 'agents/second' },
+			removeGitService,
+			createNullCopilotApiService(),
+			createSessionDataService(secondDb),
+			new NullLogService(),
+		));
+		const removeWorktree = await removeIsolation.resolveWorkingDirectory({ sessionUri: secondSessionUri, sessionId: 's2', workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+		await assert.rejects(() => removeIsolation.cleanupWorktreeOnArchive(secondSessionUri, 's2'), /archive remove failed/);
+		assert.strictEqual(existsSync(removeWorktree!.fsPath), true);
+	});
+
+	test('final archive snapshot mismatch makes unarchive fail closed with the checkout and private ref intact', async () => {
+		hasUncommittedChanges = true;
+		const gitService = createGitService();
+		let captureCount = 0;
+		gitService.captureWorktreeArchiveSnapshot = async () => ({
+			baseCommit: headCommit!,
+			baseTreeOid: 'base-tree',
+			indexTreeOid: 'index-tree',
+			workingTreeOid: captureCount++ === 0 ? 'archive-tree' : 'changed-after-snapshot',
+		});
+		const isolation = createIsolation(disposables, { gitService });
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+
+		await assert.rejects(
+			isolation.cleanupWorktreeOnArchive(sessionUri, sessionId),
+			/index or working tree changed/,
+		);
+		await assert.rejects(
+			isolation.recreateWorktreeOnUnarchive(sessionUri, sessionId),
+			/retained checkout differs from both the archived changes and the clean archived base/,
+		);
+		assert.deepStrictEqual({
+			checkoutExists: existsSync(worktree!.fsPath),
+			archiveRefCommit,
+			archiveRestoreCalls,
+			removeCalls: removeCalls.length,
+		}, {
+			checkoutExists: true,
+			archiveRefCommit: 'archive-commit',
+			archiveRestoreCalls: [],
+			removeCalls: 0,
+		});
+	});
+
+	test('cleanup on archive retains the checkout when its dirty state cannot be represented by a Git snapshot', async () => {
+		const gitService = createGitService();
+		gitService.captureWorktreeArchiveSnapshot = async () => undefined;
+		const isolation = createIsolation(disposables, { gitService });
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+
+		await assert.rejects(
+			isolation.cleanupWorktreeOnArchive(sessionUri, sessionId),
+			/working-tree delta could not be captured/,
+		);
+		assert.deepStrictEqual({ checkoutExists: existsSync(worktree!.fsPath), removeCalls: removeCalls.length }, { checkoutExists: true, removeCalls: 0 });
+	});
+
+	test('cleanup and restore reject when the preserved Fumie branch is missing', async () => {
+		const isolation = createIsolation(disposables);
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+		branchExists = false;
+
+		await assert.rejects(
+			() => isolation.cleanupWorktreeOnArchive(sessionUri, sessionId),
+			(error: unknown) => error instanceof WorktreeArchiveUnrecoverableError && /preserved branch .* is missing/.test(error.message),
+		);
+		assert.strictEqual(existsSync(worktree!.fsPath), true);
+
+		rmSync(worktree!.fsPath, { recursive: true, force: true });
+		await assert.rejects(() => isolation.recreateWorktreeOnUnarchive(sessionUri, sessionId), /branch .* no longer exists/);
 	});
 
 	test('removeSessionWorktree force-removes a worktree for explicit session deletion', async () => {
@@ -894,11 +1461,102 @@ suite('WorktreeIsolation', () => {
 
 		assert.deepStrictEqual({
 			removeCalls: removeCalls.map(call => ({ worktree: call.worktree.toString(), force: call.force })),
+			deleteBranchCalls: deleteBranchCalls.map(call => ({ branchName: call.branchName, force: call.force })),
 			resolvedWorktree: isolation.getResolvedWorktree(sessionId),
 		}, {
 			removeCalls: [{ worktree: worktree!.toString(), force: true }],
+			deleteBranchCalls: [{ branchName, force: true }],
 			resolvedWorktree: undefined,
 		});
+	});
+
+	test('session deletion preserves an existing user branch when worktreeCreateNewBranch is false', async () => {
+		const isolation = createIsolation(disposables);
+		const worktree = await isolation.resolveWorkingDirectory({
+			sessionUri,
+			sessionId,
+			workingDirectory: repoRoot,
+			config: {
+				[SessionConfigKey.Isolation]: 'worktree',
+				[SessionConfigKey.Branch]: 'feature',
+				[SessionConfigKey.WorktreeCreateNewBranch]: false,
+			},
+		});
+
+		await isolation.removeSessionWorktree(sessionId, await isolation.prepareSessionDeletion(sessionUri, sessionId));
+
+		assert.deepStrictEqual({
+			addWorktreeCalls: addWorktreeCalls.map(call => ({ commitish: call.commitish, newBranchName: call.newBranchName })),
+			branchOwned: await db.getMetadata('copilot.worktree.branchOwned'),
+			checkoutExists: existsSync(worktree!.fsPath),
+			deletedBranches: deleteBranchCalls.map(call => call.branchName),
+		}, {
+			addWorktreeCalls: [{ commitish: 'feature', newBranchName: undefined }],
+			branchOwned: 'false',
+			checkoutExists: false,
+			deletedBranches: [],
+		});
+	});
+
+	test('session deletion removes the empty managed repository directory', async () => {
+		const fumieHome = URI.file(mkdtempSync(join(tmpdir(), 'fumie-delete-')));
+		const previousFumieHome = process.env[AgentHostFumieHomeEnvVar];
+		process.env[AgentHostFumieHomeEnvVar] = fumieHome.fsPath;
+		try {
+			const isolation = createIsolation(disposables);
+			const worktree = await isolation.resolveWorkingDirectory({
+				sessionUri,
+				sessionId,
+				workingDirectory: repoRoot,
+				config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' },
+				diskBudgetSessions: [{ sessionId, running: true, pinned: false }],
+			});
+			const repositoryDirectory = getManagedWorktreeRepositoryRoot(fumieHome, repoRoot);
+
+			await isolation.removeSessionWorktree(sessionId, await isolation.prepareSessionDeletion(sessionUri, sessionId));
+
+			assert.deepStrictEqual({
+				checkoutExists: existsSync(worktree!.fsPath),
+				repositoryDirectoryExists: existsSync(repositoryDirectory.fsPath),
+			}, {
+				checkoutExists: false,
+				repositoryDirectoryExists: false,
+			});
+		} finally {
+			if (previousFumieHome === undefined) {
+				delete process.env[AgentHostFumieHomeEnvVar];
+			} else {
+				process.env[AgentHostFumieHomeEnvVar] = previousFumieHome;
+			}
+			rmSync(fumieHome.fsPath, { recursive: true, force: true });
+		}
+	});
+
+	test('session deletion preserves a Fumie branch once it has been published', async () => {
+		const gitService = createGitService();
+		gitService.hasUpstream = async () => true;
+		const isolation = createIsolation(disposables, { gitService });
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+
+		await isolation.removeSessionWorktree(sessionId, await isolation.prepareSessionDeletion(sessionUri, sessionId));
+
+		assert.deepStrictEqual({ checkoutExists: existsSync(worktree!.fsPath), deletedBranches: deleteBranchCalls }, {
+			checkoutExists: false,
+			deletedBranches: [],
+		});
+	});
+
+	test('archive refuses to remove a checkout that switched away from its Fumie branch', async () => {
+		const gitService = createGitService();
+		gitService.getCurrentBranchName = async () => 'user/other';
+		const isolation = createIsolation(disposables, { gitService });
+		const worktree = await isolation.resolveWorkingDirectory({ sessionUri, sessionId, workingDirectory: repoRoot, config: { [SessionConfigKey.Isolation]: 'worktree', [SessionConfigKey.Branch]: 'main' } });
+
+		await assert.rejects(
+			() => isolation.cleanupWorktreeOnArchive(sessionUri, sessionId),
+			(error: unknown) => error instanceof WorktreeArchiveUnrecoverableError && /switched from the Fumie branch/.test(error.message),
+		);
+		assert.strictEqual(existsSync(worktree!.fsPath), true);
 	});
 
 	test('session deletion removes a persisted worktree after a process restart', async () => {
@@ -908,6 +1566,7 @@ suite('WorktreeIsolation', () => {
 			db.setMetadata('copilot.worktree.branchName', 'feature/x'),
 			db.setMetadata('copilot.worktree.path', worktree.toString()),
 			db.setMetadata('copilot.worktree.repositoryRoot', repoRoot.toString()),
+			db.setMetadata('copilot.worktree.ownership', 'fumie'),
 		]);
 		const isolation = createIsolation(disposables);
 
@@ -916,10 +1575,35 @@ suite('WorktreeIsolation', () => {
 
 		assert.deepStrictEqual({
 			removeCalls: removeCalls.map(call => ({ worktree: call.worktree.toString(), force: call.force })),
+			deletedBranches: deleteBranchCalls.map(call => call.branchName),
 			resolvedWorktree: isolation.getResolvedWorktree(sessionId),
 		}, {
 			removeCalls: [{ worktree: worktree.toString(), force: true }],
+			deletedBranches: ['feature/x'],
 			resolvedWorktree: undefined,
+		});
+	});
+
+	test('legacy metadata under the historical managed root is durably migrated to Fumie ownership', async () => {
+		const worktree = URI.joinPath(worktreesRoot, 'legacy-managed');
+		mkdirSync(worktree.fsPath, { recursive: true });
+		await Promise.all([
+			db.setMetadata('copilot.worktree.branchName', 'agents/legacy-managed'),
+			db.setMetadata('copilot.worktree.path', worktree.toString()),
+			db.setMetadata('copilot.worktree.repositoryRoot', repoRoot.toString()),
+		]);
+		const isolation = createIsolation(disposables);
+
+		await isolation.removeSessionWorktree(sessionId, await isolation.prepareSessionDeletion(sessionUri, sessionId));
+
+		assert.deepStrictEqual({
+			ownership: await db.getMetadata('copilot.worktree.ownership'),
+			removeCalls: removeCalls.map(call => call.worktree.toString()),
+			deletedBranches: deleteBranchCalls.map(call => call.branchName),
+		}, {
+			ownership: 'fumie',
+			removeCalls: [worktree.toString()],
+			deletedBranches: ['agents/legacy-managed'],
 		});
 	});
 
@@ -932,6 +1616,7 @@ suite('WorktreeIsolation', () => {
 			db.setMetadata('copilot.worktree.branchName', 'feature/x'),
 			db.setMetadata('copilot.worktree.path', worktree.toString()),
 			db.setMetadata('copilot.worktree.repositoryRoot', repoRoot.toString()),
+			db.setMetadata('copilot.worktree.ownership', 'fumie'),
 		]);
 
 		const worktreeToRemove = await isolation.prepareSessionDeletion(sessionUri, sessionId);
@@ -944,6 +1629,79 @@ suite('WorktreeIsolation', () => {
 		}, {
 			retryRepositoryRoot: repoRoot.toString(),
 			retryWorktree: worktree.toString(),
+		});
+	});
+
+	test('branch deletion failure rejects and a retry is reconstructed from persisted metadata', async () => {
+		const gitService = createGitService();
+		let deleteAttempts = 0;
+		gitService.deleteBranch = async (_repositoryRoot, candidate) => {
+			deleteAttempts++;
+			if (deleteAttempts === 1) {
+				throw new Error('branch delete failed');
+			}
+			deleteBranchCalls.push({ repositoryRoot: repoRoot, branchName: candidate, force: true });
+			branchExists = false;
+		};
+		const isolation = createIsolation(disposables, { gitService });
+		const worktree = URI.joinPath(worktreesRoot, 'persisted-worktree');
+		mkdirSync(worktree.fsPath, { recursive: true });
+		await Promise.all([
+			db.setMetadata('copilot.worktree.branchName', 'agents/persisted'),
+			db.setMetadata('copilot.worktree.path', worktree.toString()),
+			db.setMetadata('copilot.worktree.repositoryRoot', repoRoot.toString()),
+			db.setMetadata('copilot.worktree.ownership', 'fumie'),
+		]);
+
+		await assert.rejects(async () => isolation.removeSessionWorktree(sessionId, await isolation.prepareSessionDeletion(sessionUri, sessionId)), /branch delete failed/);
+		await isolation.removeSessionWorktree(sessionId, await isolation.prepareSessionDeletion(sessionUri, sessionId));
+
+		assert.deepStrictEqual({ deleteAttempts, removeAttempts: removeCalls.length, deletedBranches: deleteBranchCalls.map(call => call.branchName) }, {
+			deleteAttempts: 2,
+			removeAttempts: 2,
+			deletedBranches: ['agents/persisted'],
+		});
+	});
+
+	test('deletion never removes externally adopted or legacy unknown-ownership worktrees', async () => {
+		const externalWorktree = URI.joinPath(repoRoot, 'user-worktrees', 'external');
+		mkdirSync(externalWorktree.fsPath, { recursive: true });
+		const gitService = createGitService();
+		gitService.getRepositoryRoot = async () => externalWorktree;
+		gitService.getWorktreeRoots = async () => [repoRoot, externalWorktree];
+		gitService.getCurrentBranch = async () => 'user/external';
+		const isolation = createIsolation(disposables, { gitService });
+		await isolation.adoptExistingWorktreeMetadata(sessionUri, externalWorktree);
+		await isolation.removeSessionWorktree(sessionId, await isolation.prepareSessionDeletion(sessionUri, sessionId));
+
+		const legacySessionUri = URI.parse('agent-session://test/legacy');
+		const legacyDb = new TestSessionDatabase();
+		await Promise.all([
+			legacyDb.setMetadata('copilot.worktree.branchName', 'agents/legacy'),
+			legacyDb.setMetadata('copilot.worktree.path', externalWorktree.toString()),
+			legacyDb.setMetadata('copilot.worktree.repositoryRoot', repoRoot.toString()),
+		]);
+		const legacyIsolation = disposables.add(new WorktreeIsolation(
+			{ generateBranchName: async () => 'agents/unused' },
+			createGitService(),
+			createNullCopilotApiService(),
+			createSessionDataService(legacyDb),
+			new NullLogService(),
+		));
+		await legacyIsolation.removeSessionWorktree('legacy', await legacyIsolation.prepareSessionDeletion(legacySessionUri, 'legacy'));
+
+		assert.deepStrictEqual({
+			externalOwnership: await db.getMetadata('copilot.worktree.ownership'),
+			legacyOwnership: await legacyDb.getMetadata('copilot.worktree.ownership'),
+			checkoutExists: existsSync(externalWorktree.fsPath),
+			removeCalls: removeCalls.length,
+			deleteBranchCalls: deleteBranchCalls.length,
+		}, {
+			externalOwnership: 'external',
+			legacyOwnership: undefined,
+			checkoutExists: true,
+			removeCalls: 0,
+			deleteBranchCalls: 0,
 		});
 	});
 });

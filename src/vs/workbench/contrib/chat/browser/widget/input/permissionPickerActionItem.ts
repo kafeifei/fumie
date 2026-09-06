@@ -75,8 +75,8 @@ export interface IPermissionPickerDelegate {
 /** Default level set offered when a delegate does not specify {@link IPermissionPickerDelegate.availableLevels}. */
 const DEFAULT_PERMISSION_LEVELS: readonly ChatPermissionLevel[] = [
 	ChatPermissionLevel.Default,
+	ChatPermissionLevel.Assisted,
 	ChatPermissionLevel.AutoApprove,
-	ChatPermissionLevel.Autopilot,
 ];
 
 interface IPermissionLevelMeta {
@@ -95,21 +95,21 @@ function getPermissionLevelMeta(level: ChatPermissionLevel): IPermissionLevelMet
 		case ChatPermissionLevel.Assisted:
 			return {
 				id: 'chat.permissions.assisted',
-				label: localize('permissions.assisted', "Assisted permissions"),
-				shortLabel: localize('permissions.assisted.label', "Assisted permissions"),
-				detail: localize('permissions.assisted.subtext', "Evaluates risk before running tools"),
+				label: localize('permissions.assisted', "Auto-Review"),
+				shortLabel: localize('permissions.assisted.label', "Auto-Review"),
+				detail: localize('permissions.assisted.subtext', "Review tool calls automatically"),
 				icon: ThemeIcon.fromId(Codicon.sparkle.id),
-				description: localize('permissions.assisted.description', "An LLM judge evaluates each tool call. Tools it doesn't approve require your approval."),
+				description: localize('permissions.assisted.description', "Reviews each tool call and asks when uncertain."),
 				elevated: true,
 			};
 		case ChatPermissionLevel.AutoApprove:
 			return {
 				id: 'chat.permissions.autoApprove',
-				label: localize('permissions.autoApprove', "Allow all"),
-				shortLabel: localize('permissions.autoApprove.label', "Allow all"),
-				detail: localize('permissions.autoApprove.subtext', "Runs tool calls without asking"),
+				label: localize('permissions.autoApprove', "Full Access"),
+				shortLabel: localize('permissions.autoApprove.label', "Full Access"),
+				detail: localize('permissions.autoApprove.subtext', "Run tools without asking"),
 				icon: ThemeIcon.fromId(Codicon.warning.id),
-				description: localize('permissions.autoApprove.description', "Auto-approve all tool calls and retry on errors"),
+				description: localize('permissions.autoApprove.description', "Run tool calls without approval"),
 				elevated: true,
 			};
 		case ChatPermissionLevel.Autopilot:
@@ -126,11 +126,11 @@ function getPermissionLevelMeta(level: ChatPermissionLevel): IPermissionLevelMet
 		default:
 			return {
 				id: 'chat.permissions.default',
-				label: localize('permissions.default', "Default permissions"),
-				shortLabel: localize('permissions.default.label', "Default permissions"),
-				detail: localize('permissions.default.subtext', "Asks when approval settings don't apply"),
+				label: localize('permissions.default', "Default Permissions"),
+				shortLabel: localize('permissions.default.label', "Default Permissions"),
+				detail: localize('permissions.default.subtext', "Ask when needed"),
 				icon: ThemeIcon.fromId(Codicon.shield.id),
-				description: localize('permissions.default.description', "Use configured approval settings"),
+				description: localize('permissions.default.description', "Use approval rules and ask when needed"),
 				elevated: false,
 			};
 	}
@@ -379,7 +379,7 @@ export class PermissionPickerActionItem extends ChatInputPickerActionViewItem {
 				label = this.delegate.sandboxTogglePresentation === 'standalone'
 					? localize('permissions.sandboxed.label', "{0} (sandboxed)", label)
 					: level === ChatPermissionLevel.Default
-						? localize('permissions.defaultSandboxed.label', "Default permissions (sandboxed)")
+						? localize('permissions.defaultSandboxed.label', "Default Permissions (Sandboxed)")
 						: label;
 			}
 		}

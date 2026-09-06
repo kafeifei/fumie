@@ -19,6 +19,21 @@ suite('CodexModelSelection', () => {
 		});
 	});
 
+	test('a BYOK id stays intact behind the shared native provider; a bare id stays on the Copilot proxy', () => {
+		assert.deepStrictEqual(
+			[
+				// allow-any-unicode-next-line
+				parseCodexModelSelection({ id: 'customendpoint/Example/codex/gpt-5.6-sol' }),
+				parseCodexModelSelection({ id: 'gpt-5.6-sol' }),
+			],
+			[
+				// allow-any-unicode-next-line
+				{ modelProvider: 'fumie-provider', modelId: 'customendpoint/Example/codex/gpt-5.6-sol' },
+				{ modelProvider: 'vscode-proxy', modelId: 'gpt-5.6-sol' },
+			],
+		);
+	});
+
 	test('does not collide when display names match', () => {
 		assert.notStrictEqual(
 			toCodexModelSelectionId('vscode-proxy', 'gpt-5.6-sol'),

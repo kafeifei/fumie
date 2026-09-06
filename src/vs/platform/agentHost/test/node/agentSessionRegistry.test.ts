@@ -36,12 +36,16 @@ class TestAgentHostDatabase implements IAgentHostDatabase {
 		}
 		const { provider, startTime, source } = sessionOptions;
 		const existing = this.sessions.get(session);
-		const inserted = { session, provider, startTime, external: source === 'discovery', source };
-		this.sessions.set(session, source === 'explicit'
-			? { ...inserted, startTime: existing?.startTime ?? startTime }
-			: existing && source === 'discovery'
-				? { ...existing, external: true, source: 'discovery' }
-				: existing ?? inserted);
+		const inserted: IAgentHostDatabaseSession = { session, provider, startTime, external: source === 'discovery', source };
+		if (!existing) {
+			this.sessions.set(session, inserted);
+		} else if (source === 'explicit') {
+			this.sessions.set(session, { ...existing, provider, external: false, source: 'explicit' });
+		} else if (source === 'restore') {
+			this.sessions.set(session, { ...existing, external: false, source: existing.source === 'explicit' ? 'explicit' : 'restore' });
+		} else if (existing.source !== 'explicit') {
+			this.sessions.set(session, { ...existing, external: true, source: 'discovery' });
+		}
 		if (!registerOptions.checkTombstone) {
 			this._tombstones.delete(session);
 		}
@@ -233,6 +237,19 @@ suite('AgentSessionRegistry', () => {
 		});
 	});
 
+	test('migration cannot reassign a registered session identity', async () => {
+		const testDatabase = new TestAgentHostDatabase();
+		database = testDatabase;
+		testDatabase.sessions.set(a.toString(), { session: a.toString(), provider: 'copilot', startTime: 1, external: undefined, source: 'explicit' });
+		const registry = createRegistry();
+
+		await assert.rejects(
+			registry.list(async entry => ({ ...entry, provider: 'claude', external: false })),
+			/Session migration cannot change the identity/,
+		);
+		assert.deepStrictEqual(testDatabase.externalUpdates, []);
+	});
+
 	test('get reads only the requested session', async () => {
 		const testDatabase = new TestAgentHostDatabase();
 		database = testDatabase;
@@ -263,12 +280,11 @@ suite('AgentSessionRegistry', () => {
 
 	test('register / list / tombstone', async () => {
 		const registry = createRegistry();
-		assert.strictEqual(await registry.isEmpty(), true);
+		assert.deepStrictEqual(await registry.list(), []);
 
 		await registerExplicit(registry, a, 'copilot', 100);
 		await registerExplicit(registry, b, 'claude', 200);
 
-		assert.strictEqual(await registry.isEmpty(), false);
 		assert.deepStrictEqual(
 			(await list(registry)).map(s => ({ session: s.session.toString(), provider: s.provider, startTime: s.startTime, external: s.external })).sort((x, y) => x.session.localeCompare(y.session)),
 			[
@@ -281,13 +297,14 @@ suite('AgentSessionRegistry', () => {
 		assert.deepStrictEqual((await list(registry)).map(s => s.session.toString()), [b.toString()]);
 	});
 
-	test('register preserves the first-observed startTime', async () => {
+	test('register preserves the first-observed harness and startTime', async () => {
 		const registry = createRegistry();
 		await registerExplicit(registry, a, 'copilot', 100);
 		await registerExplicit(registry, a, 'copilot', 999);
+		await assert.rejects(registerExplicit(registry, a, 'claude', 999), /Cannot reassign session/);
 
 		const [entry] = await list(registry);
-		assert.strictEqual(entry.startTime, 100);
+		assert.deepStrictEqual({ provider: entry.provider, startTime: entry.startTime }, { provider: 'copilot', startTime: 100 });
 	});
 
 	test('register and tombstone preserve submission order', async () => {
@@ -360,11 +377,10 @@ suite('AgentSessionRegistry', () => {
 		})), [{ external: false, source: 'explicit', startTime: 100 }]);
 	});
 
-	test('backfill marker gates the one-time provider seed', async () => {
+	test('legacy global backfill marker is durable for compatibility', async () => {
 		const registry = createRegistry();
 		assert.strictEqual(await registry.isBackfilled(), false);
 
-		// Simulate a one-time backfill: merge sessions, then set the marker.
 		await registerExplicit(registry, a, 'copilot', 100);
 		await registerExplicit(registry, b, 'claude', 200);
 		await registry.markBackfilled();
@@ -372,7 +388,6 @@ suite('AgentSessionRegistry', () => {
 		assert.strictEqual(await registry.isBackfilled(), true);
 		assert.deepStrictEqual((await list(registry)).map(s => s.session.toString()).sort(), [a.toString(), b.toString()].sort());
 
-		// The marker persists across instances so the seed never runs twice.
 		const second = createRegistry();
 		assert.strictEqual(await second.isBackfilled(), true);
 	});
@@ -385,17 +400,17 @@ suite('AgentSessionRegistry', () => {
 		await registerExplicit(registry, a, 'copilot', 100);
 		await registry.markProviderBackfilled('copilot');
 
-		// Only the swept provider is marked — a provider that hasn't had its own
-		// sweep run yet (e.g. because it registered later) is still pending,
-		// unlike the legacy global marker which covered every provider at once.
 		assert.strictEqual(await registry.isProviderBackfilled('copilot'), true);
 		assert.strictEqual(await registry.isProviderBackfilled('claude'), false);
 
-		// The marker persists across instances.
 		const second = createRegistry();
 		assert.deepStrictEqual(
-			{ copilot: await second.isProviderBackfilled('copilot'), claude: await second.isProviderBackfilled('claude') },
-			{ copilot: true, claude: false },
+			{
+				global: await second.isBackfilled(),
+				copilot: await second.isProviderBackfilled('copilot'),
+				claude: await second.isProviderBackfilled('claude'),
+			},
+			{ global: false, copilot: true, claude: false },
 		);
 	});
 
@@ -426,36 +441,6 @@ suite('AgentSessionRegistry', () => {
 		assert.deepStrictEqual(await list(registry), []);
 	});
 
-	test('markBackfilled persistence failure can be retried', async () => {
-		await database.close();
-		database = new TestAgentHostDatabase();
-		const registry = createRegistry();
-		(database as TestAgentHostDatabase).failNextWrite();
-
-		await assert.rejects(registry.markBackfilled(), /write failed/);
-		assert.strictEqual(await registry.isBackfilled(), false);
-
-		await registry.markBackfilled();
-		assert.strictEqual(await registry.isBackfilled(), true);
-	});
-
-	test('markProviderBackfilled persistence failure can be retried without affecting other providers', async () => {
-		await database.close();
-		database = new TestAgentHostDatabase();
-		const registry = createRegistry();
-		await registry.markProviderBackfilled('claude');
-		(database as TestAgentHostDatabase).failNextWrite();
-
-		await assert.rejects(registry.markProviderBackfilled('copilot'), /write failed/);
-		assert.deepStrictEqual(
-			{ copilot: await registry.isProviderBackfilled('copilot'), claude: await registry.isProviderBackfilled('claude') },
-			{ copilot: false, claude: true },
-		);
-
-		await registry.markProviderBackfilled('copilot');
-		assert.strictEqual(await registry.isProviderBackfilled('copilot'), true);
-	});
-
 	test('read failure can be retried without losing persisted sessions', async () => {
 		await database.close();
 		database = new TestAgentHostDatabase();
@@ -464,9 +449,10 @@ suite('AgentSessionRegistry', () => {
 		const second = createRegistry();
 		(database as TestAgentHostDatabase).failNextRead();
 
+		await assert.rejects(registerExplicit(second, b, 'claude', 200), /read failed/);
 		await registerExplicit(second, b, 'claude', 200);
+		(database as TestAgentHostDatabase).failNextRead();
 		await assert.rejects(list(second), /read failed/);
-		await registerExplicit(second, b, 'claude', 200);
 
 		assert.deepStrictEqual(
 			(await list(second)).map(entry => entry.session.toString()).sort(),
@@ -510,7 +496,7 @@ suite('AgentSessionRegistry', () => {
 		assert.strictEqual(await registry.isTombstoned(a), false);
 	});
 
-	test('discovery declines to register (or resurrect) a tombstoned session', async () => {
+	test('restore and discovery decline to resurrect a tombstoned session', async () => {
 		const registry = createRegistry();
 		await registerExplicit(registry, a, 'copilot', 100);
 		await registry.tombstone(a);
@@ -518,8 +504,8 @@ suite('AgentSessionRegistry', () => {
 
 		// Unlike `register`, a revival attempt (backfill, restore) must not
 		// resurrect an explicitly-deleted session.
-		const registered = await registerDiscovered(registry, a, 'copilot', 200);
-		assert.strictEqual(registered, false);
+		assert.strictEqual(await registerRestored(registry, a, 'copilot', 200), false);
+		assert.strictEqual(await registerDiscovered(registry, a, 'copilot', 300), false);
 		assert.deepStrictEqual(await list(registry), []);
 		assert.strictEqual(await registry.isTombstoned(a), true, 'the tombstone must remain in place');
 	});

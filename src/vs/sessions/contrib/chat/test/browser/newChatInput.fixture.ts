@@ -4,6 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as dom from '../../../../../base/browser/dom.js';
+import { IMenuService } from '../../../../../platform/actions/common/actions.js';
+import { MenuService } from '../../../../../platform/actions/common/menuService.js';
+import { IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
+import { ContextKeyService } from '../../../../../platform/contextkey/browser/contextKeyService.js';
 import { Event } from '../../../../../base/common/event.js';
 import { observableValue } from '../../../../../base/common/observable.js';
 import { mock } from '../../../../../base/test/common/mock.js';
@@ -27,6 +31,8 @@ import { IVoiceInputModeService, VoiceInputMode } from '../../../../../workbench
 import { ITtsPlaybackService } from '../../../../../workbench/contrib/chat/browser/voiceClient/ttsPlaybackService.js';
 import { IMicCaptureService } from '../../../../../workbench/contrib/chat/browser/voiceClient/micCaptureService.js';
 import { URI } from '../../../../../base/common/uri.js';
+import { Codicon } from '../../../../../base/common/codicons.js';
+import { SessionTypeAuthRequirement } from '../../../../services/sessions/common/session.js';
 import { ChatInputNoticeVariant, ChatInputNoticeWidget } from '../../../../../workbench/contrib/chat/browser/widget/input/chatInputNoticeWidget.js';
 import { chatInputStackClass, chatInputStackSlotClass, ChatInputStackSlot, setChatInputStackSlot } from '../../../../../workbench/contrib/chat/browser/widget/input/chatInputStack.js';
 
@@ -39,6 +45,8 @@ import '../../browser/media/chatWidget.css';
 import '../../../../browser/media/style.css';
 
 interface NewChatInputFixtureOptions {
+	readonly width?: number;
+	readonly withAgentPicker?: boolean;
 	readonly value?: string;
 	readonly selection?: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number };
 	/** Docks the sub-session tip above the composer. */
@@ -54,11 +62,17 @@ interface NewChatInputFixtureOptions {
 async function renderNewChatInput(context: ComponentFixtureContext, fixtureOptions: NewChatInputFixtureOptions = {}): Promise<void> {
 	const { container, disposableStore } = context;
 	const { value, selection, subSessionTip } = fixtureOptions;
+	const sessionTypes = fixtureOptions.withAgentPicker ? ['opencode', 'claude'].map(id => ({
+		providerId: 'fixture-provider',
+		sessionType: { id, label: id, icon: Codicon.terminal, authRequirement: SessionTypeAuthRequirement.None },
+	})) : [];
 
 	const instantiationService = createEditorServices(disposableStore, {
 		colorTheme: context.theme,
 		additionalServices: (reg) => {
 			registerChatFixtureServices(reg);
+			reg.define(IMenuService, MenuService);
+			reg.define(IContextKeyService, ContextKeyService);
 			reg.defineInstance(IQuickInputService, new class extends mock<IQuickInputService>() {
 				override readonly onShow = Event.None;
 				override readonly onHide = Event.None;
@@ -66,7 +80,8 @@ async function renderNewChatInput(context: ComponentFixtureContext, fixtureOptio
 			reg.defineInstance(ISearchService, new class extends mock<ISearchService>() { }());
 			reg.defineInstance(ISessionsManagementService, new class extends mock<ISessionsManagementService>() {
 				override readonly onDidChangeSessionTypes = Event.None;
-				override getSessionTypesForFolder() { return []; }
+				override getAllProviderSessionTypes() { return sessionTypes; }
+				override getSessionTypesForFolder() { return sessionTypes; }
 			}());
 			reg.defineInstance(ISessionsService, new class extends mock<ISessionsService>() {
 				override readonly activeSession = observableValue<IActiveSession | undefined>('activeSession', undefined);
@@ -131,7 +146,7 @@ async function renderNewChatInput(context: ComponentFixtureContext, fixtureOptio
 		},
 	});
 
-	container.style.width = '600px';
+	container.style.width = `${fixtureOptions.width ?? 600}px`;
 	container.style.height = '160px';
 	container.classList.add('monaco-workbench', 'agent-sessions-workbench');
 
@@ -168,6 +183,11 @@ async function renderNewChatInput(context: ComponentFixtureContext, fixtureOptio
 	}));
 
 	widget.render(content, container);
+	if (fixtureOptions.withAgentPicker) {
+		widget.sessionTypePicker.setFolderSource(observableValue('fixtureFolder', URI.file('/fixture')), {
+			initialPick: { providerId: 'fixture-provider', sessionTypeId: 'opencode' },
+		});
+	}
 
 	// The widget lays out its editor on the input container's `animationend`; in the
 	// fixture there is no animation, so seed the value and lay out explicitly.
@@ -186,6 +206,8 @@ async function renderNewChatInput(context: ComponentFixtureContext, fixtureOptio
 }
 
 export default defineThemedFixtureGroup({ path: 'sessions/chat/newInput/' }, {
+	AgentControls: defineComponentFixture({ render: context => renderNewChatInput(context, { withAgentPicker: true }) }),
+	AgentControlsNarrow: defineComponentFixture({ render: context => renderNewChatInput(context, { withAgentPicker: true, width: 330 }) }),
 	Default: defineComponentFixture({ render: context => renderNewChatInput(context, { value: 'What are you building?' }) }),
 	// Partial multi-line selection so the reverse-rounded selection corners are
 	// rendered. These cut-out pieces use `.monaco-editor-background`, which the

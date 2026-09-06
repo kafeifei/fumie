@@ -15,6 +15,8 @@ import {
 	ToolResultContentType,
 	TurnState,
 	MessageKind,
+	MessageAttachmentKind,
+	type MessageAttachment,
 	type ResponsePart,
 	type ToolCallCancelledState,
 	type ToolCallCompletedState,
@@ -48,10 +50,11 @@ export function mapSessionMessagesToTurns(
 	messages: readonly SessionMessage[],
 	session: URI,
 	logService: ILogService,
+	hostInstructions?: readonly string[],
 ): readonly Turn[] {
 	const builder = new ReplayBuilder(session, logService);
 	for (const msg of messages) {
-		const parsed = parseSessionMessage(msg);
+		const parsed = parseSessionMessage(msg, hostInstructions);
 		if (parsed === undefined) {
 			continue;
 		}
@@ -114,6 +117,7 @@ export function resolveForkAnchorUuid(messages: readonly SessionMessage[], turnI
 // #region Parsed message union — narrow-at-the-seam adapter
 
 interface UserTextBlock { readonly type: 'text'; readonly text: string }
+interface UserImageBlock { readonly type: 'image'; readonly mediaType: string; readonly data: string }
 interface UserToolResultBlock { readonly type: 'tool_result'; readonly tool_use_id: string; readonly content: unknown; readonly is_error: boolean }
 interface AssistantBlock { readonly type: string; readonly text?: string; readonly thinking?: string; readonly id?: string; readonly name?: string; readonly input?: unknown }
 
@@ -127,15 +131,15 @@ interface AssistantBlock { readonly type: string; readonly text?: string; readon
  * stateful reduction (the {@link ReplayBuilder}) — see CONTEXT M7.
  */
 type ParsedSessionMessage =
-	| { readonly kind: 'user-text'; readonly uuid: string; readonly text: string; readonly timestamp?: string }
+	| { readonly kind: 'user-text'; readonly uuid: string; readonly text: string; readonly attachments?: readonly MessageAttachment[]; readonly timestamp?: string }
 	| { readonly kind: 'user-tool-results'; readonly uuid: string; readonly results: readonly UserToolResultBlock[]; readonly timestamp?: string }
-	| { readonly kind: 'assistant'; readonly uuid: string; readonly blocks: readonly AssistantBlock[]; readonly isInner: boolean; readonly timestamp?: string }
+	| { readonly kind: 'assistant'; readonly uuid: string; readonly blocks: readonly AssistantBlock[]; readonly isInner: boolean; readonly timestamp?: string; readonly usage?: ReplayCallUsage; readonly model?: string }
 	| { readonly kind: 'system-notification'; readonly uuid: string; readonly subtype: string; readonly text: string; readonly timestamp?: string };
 
-function parseSessionMessage(msg: SessionMessage): ParsedSessionMessage | undefined {
+function parseSessionMessage(msg: SessionMessage, hostInstructions?: readonly string[]): ParsedSessionMessage | undefined {
 	const timestamp = readTimestamp(msg);
 	switch (msg.type) {
-		case 'user': return parseUserMessage(msg, timestamp);
+		case 'user': return parseUserMessage(msg, timestamp, hostInstructions);
 		case 'assistant': return parseAssistantMessage(msg, timestamp);
 		case 'system': return parseSystemMessage(msg, timestamp);
 		default: return undefined;
@@ -150,7 +154,7 @@ function readTimestamp(msg: SessionMessage & { readonly timestamp?: unknown }): 
 	return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : undefined;
 }
 
-function parseUserMessage(msg: SessionMessage, timestamp: string | undefined): ParsedSessionMessage | undefined {
+function parseUserMessage(msg: SessionMessage, timestamp: string | undefined, hostInstructions: readonly string[] | undefined): ParsedSessionMessage | undefined {
 	const content = readUserContent(msg.message);
 	if (content === undefined) {
 		return undefined;
@@ -159,16 +163,32 @@ function parseUserMessage(msg: SessionMessage, timestamp: string | undefined): P
 		return undefined;
 	}
 	if (typeof content === 'string') {
-		return { kind: 'user-text', uuid: msg.uuid, text: content, timestamp };
+		const text = stripInjectedNotifications(stripHostInstructions(content, hostInstructions));
+		return text ? { kind: 'user-text', uuid: msg.uuid, text, timestamp } : undefined;
 	}
-	const textBlocks = content.filter((b): b is UserTextBlock => b.type === 'text');
-	if (textBlocks.length === 0) {
+	const texts = content
+		.filter((b): b is UserTextBlock => b.type === 'text' && !HOST_REMINDER_BLOCK_PATTERN.test(b.text))
+		.map(b => stripInjectedNotifications(stripHostInstructions(b.text, hostInstructions)))
+		.filter(text => text.length > 0);
+	// The prompt resolver flattens image attachments (pasted or file-backed)
+	// into bare image blocks, discarding label and origin; an embedded
+	// attachment is what the bytes can still faithfully reconstitute.
+	const attachments = content
+		.filter((b): b is UserImageBlock => b.type === 'image')
+		.map((b, i): MessageAttachment => ({
+			type: MessageAttachmentKind.EmbeddedResource,
+			label: i === 0 ? localize('claude.replay.imageAttachment', "Image") : localize('claude.replay.imageAttachmentN', "Image {0}", i + 1),
+			displayKind: 'image',
+			contentType: b.mediaType,
+			data: b.data,
+		}));
+	if (texts.length === 0 && attachments.length === 0) {
 		const results = content.filter((b): b is UserToolResultBlock => b.type === 'tool_result');
 		return results.length > 0 ? { kind: 'user-tool-results', uuid: msg.uuid, results, timestamp } : undefined;
 	}
 	// Mixed or text-only: text wins — matches prior behavior where tool_results
 	// in a text-bearing envelope are dropped (they should already have been delivered).
-	return { kind: 'user-text', uuid: msg.uuid, text: textBlocks.map(b => b.text).join('\n'), timestamp };
+	return { kind: 'user-text', uuid: msg.uuid, text: texts.join('\n'), ...(attachments.length > 0 ? { attachments } : {}), timestamp };
 }
 
 function parseAssistantMessage(msg: SessionMessage, timestamp: string | undefined): ParsedSessionMessage | undefined {
@@ -180,7 +200,54 @@ function parseAssistantMessage(msg: SessionMessage, timestamp: string | undefine
 	// `parent_tool_use_id` on every envelope and have no synthetic spawning
 	// user prompt, so they legitimately open with an assistant message —
 	// `isInner` lets the builder synthesize a turn instead of dropping it.
-	return { kind: 'assistant', uuid: msg.uuid, blocks, isInner: msg.parent_tool_use_id !== null, timestamp };
+	const isInner = msg.parent_tool_use_id !== null;
+	const usage = isInner ? undefined : readAssistantUsage(msg.message);
+	return {
+		kind: 'assistant', uuid: msg.uuid, blocks, isInner, timestamp,
+		...(usage ? { usage } : {}),
+		...(usage ? { model: readAssistantModel(msg.message) } : {}),
+	};
+}
+
+/** One replayed main-loop call's usage, mirroring the live mapper's `IMainLoopCallUsage`. */
+interface ReplayCallUsage {
+	readonly inputTokens: number;
+	readonly cacheReadTokens: number;
+	readonly cacheCreationTokens: number;
+	readonly outputTokens: number;
+}
+
+/**
+ * Reads a replayed assistant envelope's per-call usage. An all-zero block
+ * (synthetic error notices carry one) returns `undefined` so it cannot wipe
+ * the last real occupancy.
+ */
+function readAssistantUsage(raw: unknown): ReplayCallUsage | undefined {
+	if (raw === null || typeof raw !== 'object') {
+		return undefined;
+	}
+	const usage = (raw as { usage?: unknown }).usage;
+	if (usage === null || typeof usage !== 'object') {
+		return undefined;
+	}
+	const u = usage as Record<string, unknown>;
+	const num = (v: unknown): number => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0;
+	const parsed: ReplayCallUsage = {
+		inputTokens: num(u['input_tokens']),
+		cacheReadTokens: num(u['cache_read_input_tokens']),
+		cacheCreationTokens: num(u['cache_creation_input_tokens']),
+		outputTokens: num(u['output_tokens']),
+	};
+	const occupancy = parsed.inputTokens + parsed.cacheReadTokens + parsed.cacheCreationTokens;
+	return occupancy > 0 ? parsed : undefined;
+}
+
+function readAssistantModel(raw: unknown): string | undefined {
+	if (raw === null || typeof raw !== 'object') {
+		return undefined;
+	}
+	const model = (raw as { model?: unknown }).model;
+	return typeof model === 'string' && model.length > 0 && model !== '<synthetic>' ? model : undefined;
 }
 
 function parseSystemMessage(msg: SessionMessage, timestamp: string | undefined): ParsedSessionMessage | undefined {
@@ -222,6 +289,62 @@ const ALLOWED_SYSTEM_SUBTYPES: ReadonlySet<string> = new Set([
 const CLI_ECHO_MARKER_PATTERN = /^<(command-name|command-message|command-args|local-command-stdout|local-command-stderr|local-command-caveat)>/;
 
 /**
+ * Harness-injected background-task notifications. The Claude Code harness
+ * appends these to the conversation as `type: 'user'` envelopes (a
+ * `[SYSTEM NOTIFICATION - NOT USER INPUT]` preamble followed by a
+ * `<task-notification>…</task-notification>` block); the workbench must not
+ * render them as user turns. Unlike CLI echoes they can share an envelope
+ * with genuine user input (notifications queued while the user types are
+ * delivered together), so they are stripped from the text rather than the
+ * envelope being dropped — an envelope left with no text at all is then
+ * dropped by the caller.
+ */
+const INJECTED_NOTIFICATION_PATTERN = /(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][\s\S]*?)?<task-notification>[\s\S]*?<\/task-notification>\s*/g;
+
+/**
+ * Host- or harness-generated `<system-reminder>` blocks riding a user
+ * envelope — the prompt resolver's attachment-reference list, the Claude
+ * harness's own context reminders. They are self-contained text blocks that
+ * BEGIN with the tag; genuinely user-typed text never does (the same
+ * shape-is-the-discriminator trade-off as {@link CLI_ECHO_MARKER_PATTERN}).
+ * Dropped at the block level so replay shows only what the user typed.
+ */
+const HOST_REMINDER_BLOCK_PATTERN = /^<system-reminder>/;
+
+function stripInjectedNotifications(text: string): string {
+	return text.replace(INJECTED_NOTIFICATION_PATTERN, '').trim();
+}
+
+/**
+ * Removes host-injected instructions from a replayed user message.
+ *
+ * The host attaches per-operation instructions to a send on the explicit
+ * promise that they reach the model "without persisting as user content"
+ * (`IAgentChatContext.hostInstructions`). This provider delivers them through
+ * the SDK's `UserPromptSubmit` hook (`claudeSdkOptions`), but the SDK persists
+ * the hook's `additionalContext` as a leading `text` block of the user
+ * envelope — structurally indistinguishable from what the user typed — so a
+ * replayed chat would show the host's instructions to the user, in their own
+ * voice, on every turn. The history read carries the same strings the send
+ * injected (see `AgentService._getChatMessages`), and taking them back out
+ * here is what keeps the host's promise.
+ *
+ * Only text the host itself supplied is removed, so this can never eat
+ * something the user typed: an instruction the host has since stopped sending
+ * simply is not recognised and survives as ordinary text — the honest failure.
+ * Mirrors `stripAcpHostInstructions`, which keeps the same promise for ACP.
+ */
+function stripHostInstructions(text: string, instructions: readonly string[] | undefined): string {
+	let result = text;
+	for (const instruction of instructions ?? []) {
+		if (instruction) {
+			result = result.split(instruction).join('');
+		}
+	}
+	return result;
+}
+
+/**
  * Stand-in prompt for a turn whose user message is not present in the
  * transcript slice we were handed. This happens when the SDK truncates a
  * large transcript (it returns only the bytes after the last compact
@@ -236,6 +359,7 @@ export function missingPromptPlaceholder(): string {
 interface InProgressTurn {
 	readonly id: string;
 	readonly userText: string;
+	readonly attachments?: readonly MessageAttachment[];
 	readonly startedAt?: string;
 	lastResponseAt?: string;
 	readonly responseParts: ResponsePart[];
@@ -269,6 +393,15 @@ class ReplayBuilder {
 	 */
 	private readonly _toolUses = new Map<string, { readonly turnId: string; readonly parsedInput: Record<string, unknown> | undefined; readonly isClientTool: boolean }>();
 
+	/**
+	 * Usage of the most recent top-level assistant envelope. Its prompt-side
+	 * fields describe one API call's full prompt — the session's context
+	 * occupancy at that point — so each closed turn carries the latest value
+	 * (mirrors the live mapper's `recordMainLoopUsage`). Not reset between
+	 * turns: occupancy only changes when another call is made.
+	 */
+	private _lastCallUsage: { readonly usage: ReplayCallUsage; readonly model?: string } | undefined;
+
 	/** Turns opened from a leading assistant envelope because the prompt was missing. Reported once by {@link finish}. */
 	private _recoveredPromptlessTurns = 0;
 
@@ -284,6 +417,7 @@ class ReplayBuilder {
 				this._active = {
 					id: msg.uuid,
 					userText: msg.text,
+					attachments: msg.attachments,
 					startedAt: msg.timestamp,
 					responseParts: [],
 					pendingToolUseIds: new Set(),
@@ -332,6 +466,18 @@ class ReplayBuilder {
 	}
 
 	private _consumeAssistant(msg: ParsedSessionMessage & { kind: 'assistant' }): void {
+		if (msg.usage) {
+			// The occupancy always comes from this envelope, but the model does
+			// NOT: `readAssistantModel` filters the SDK's `<synthetic>` sentinel
+			// (and any other unusable value) to `undefined`, and such an envelope
+			// can still carry real non-zero usage. Overwriting the model with
+			// `undefined` there would erase the only model id the replay ever saw,
+			// and the context gauge has no other way to find its denominator —
+			// replayed usage carries no `_meta.modelContextWindow`, so the client
+			// resolves the window by looking the model id up in the catalog.
+			// Keep the last real model until a later envelope names another one.
+			this._lastCallUsage = { usage: msg.usage, model: msg.model ?? this._lastCallUsage?.model };
+		}
 		if (this._active === undefined) {
 			// Two ways a transcript legitimately opens with an assistant
 			// envelope:
@@ -500,13 +646,28 @@ class ReplayBuilder {
 		const duration = startedAt !== undefined && endedAt !== undefined && Number.isFinite(startedAt) && Number.isFinite(endedAt)
 			? Math.max(0, endedAt - startedAt)
 			: undefined;
+		// Rebuild the turn's usage from the latest replayed main-loop call so
+		// the context-usage gauge survives a session reopen. The transcript's
+		// `message.usage` carries the same three input-side counters the live
+		// SDK reports, so they are transcribed into the same protocol counters —
+		// cache creation into `_meta.cacheCreationTokens`, matching the live
+		// mapper — and the client folds occupancy the same way for both paths.
+		// Whole-turn totals and the SDK-reported window are result-envelope data
+		// the transcript does not carry, so they stay absent.
+		const lastCall = this._lastCallUsage;
 		const turn: Turn = {
 			id: a.id,
 			startedAt: a.startedAt,
 			duration,
-			message: { text: a.userText, origin: { kind: MessageKind.User } },
+			message: { text: a.userText, origin: { kind: MessageKind.User }, ...(a.attachments?.length ? { attachments: [...a.attachments] } : {}) },
 			responseParts: a.responseParts,
-			usage: undefined,
+			usage: lastCall ? {
+				inputTokens: lastCall.usage.inputTokens,
+				outputTokens: lastCall.usage.outputTokens,
+				cacheReadTokens: lastCall.usage.cacheReadTokens,
+				_meta: { cacheCreationTokens: lastCall.usage.cacheCreationTokens },
+				...(lastCall.model ? { model: lastCall.model } : {}),
+			} : undefined,
 			state,
 		};
 		this._turns.push(turn);
@@ -524,7 +685,7 @@ class ReplayBuilder {
  * caller drops the message — matches the production extension's parser
  * semantics per CONTEXT M7 glossary.
  */
-function readUserContent(raw: unknown): string | ReadonlyArray<UserTextBlock | UserToolResultBlock> | undefined {
+function readUserContent(raw: unknown): string | ReadonlyArray<UserTextBlock | UserImageBlock | UserToolResultBlock> | undefined {
 	if (raw === null || typeof raw !== 'object') {
 		return undefined;
 	}
@@ -535,14 +696,19 @@ function readUserContent(raw: unknown): string | ReadonlyArray<UserTextBlock | U
 	if (!Array.isArray(content) || content.length === 0) {
 		return undefined;
 	}
-	const out: (UserTextBlock | UserToolResultBlock)[] = [];
+	const out: (UserTextBlock | UserImageBlock | UserToolResultBlock)[] = [];
 	for (const block of content) {
 		if (block === null || typeof block !== 'object') {
 			continue;
 		}
-		const b = block as { type?: unknown; text?: unknown; tool_use_id?: unknown; content?: unknown; is_error?: unknown };
+		const b = block as { type?: unknown; text?: unknown; source?: unknown; tool_use_id?: unknown; content?: unknown; is_error?: unknown };
 		if (b.type === 'text' && typeof b.text === 'string') {
 			out.push({ type: 'text', text: b.text });
+		} else if (b.type === 'image') {
+			const source = (b.source ?? undefined) as { type?: unknown; media_type?: unknown; data?: unknown } | undefined;
+			if (source?.type === 'base64' && typeof source.media_type === 'string' && typeof source.data === 'string') {
+				out.push({ type: 'image', mediaType: source.media_type, data: source.data });
+			}
 		} else if (b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
 			out.push({ type: 'tool_result', tool_use_id: b.tool_use_id, content: b.content, is_error: b.is_error === true });
 		}
@@ -641,7 +807,7 @@ function safeStringify(v: unknown): string | undefined {
  * Checks the first text fragment only; mixed messages where the first
  * content block is a real prompt are NOT filtered.
  */
-function isCliEchoContent(content: string | ReadonlyArray<UserTextBlock | UserToolResultBlock>): boolean {
+function isCliEchoContent(content: string | ReadonlyArray<UserTextBlock | UserImageBlock | UserToolResultBlock>): boolean {
 	if (typeof content === 'string') {
 		return CLI_ECHO_MARKER_PATTERN.test(content);
 	}

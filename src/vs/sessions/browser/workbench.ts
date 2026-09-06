@@ -21,6 +21,7 @@ import { Part } from '../../workbench/browser/part.js';
 import { Direction, ISerializableView, ISerializedGrid, ISerializedLeafNode, ISerializedNode, IViewSize, Orientation, SerializableGrid } from '../../base/browser/ui/grid/grid.js';
 import { IEditorGroupsService } from '../../workbench/services/editor/common/editorGroupsService.js';
 import { IEditorService } from '../../workbench/services/editor/common/editorService.js';
+import { isAgentsEmbeddedBrowserEditor } from '../common/agentsEmbeddedBrowser.js';
 import { IPaneCompositePartService } from '../../workbench/services/panecomposite/browser/panecomposite.js';
 import { IViewDescriptorService, ViewContainerLocation } from '../../workbench/common/views.js';
 import { ILogService } from '../../platform/log/common/log.js';
@@ -38,6 +39,8 @@ import { IHostService } from '../../workbench/services/host/browser/host.js';
 import { IDialogService } from '../../platform/dialogs/common/dialogs.js';
 import { INotificationService } from '../../platform/notification/common/notification.js';
 import { NotificationService } from '../../workbench/services/notification/common/notificationService.js';
+import { NotificationChangeType } from '../../workbench/common/notifications.js';
+import Severity from '../../base/common/severity.js';
 import { IHoverService, WorkbenchHoverDelegate } from '../../platform/hover/browser/hover.js';
 import { setHoverDelegateFactory } from '../../base/browser/ui/hover/hoverDelegateFactory.js';
 import { setBaseLayerHoverDelegate } from '../../base/browser/ui/hover/hoverDelegate2.js';
@@ -1019,6 +1022,7 @@ export class Workbench extends Disposable implements IAgentWorkbenchLayoutServic
 		const notificationsToasts = this._register(instantiationService.createInstance(NotificationsToasts, this.mainContainer, notificationService.model));
 		this._register(instantiationService.createInstance(NotificationsAlerts, notificationService.model));
 		const notificationsStatus = this._register(instantiationService.createInstance(NotificationsStatus, notificationService.model));
+		this._register(this.logRaisedNotifications(notificationService));
 
 		// Visibility
 		this._register(notificationsCenter.onDidChangeVisibility(() => {
@@ -1042,6 +1046,33 @@ export class Workbench extends Disposable implements IAgentWorkbenchLayoutServic
 				Event.any(notificationsToasts.onDidChangeVisibility, notificationsCenter.onDidChangeVisibility),
 				() => notificationsToasts.isVisible || notificationsCenter.isVisible
 			)
+		});
+	}
+
+	/**
+	 * Write every notification down as it is raised.
+	 *
+	 * A toast reaches the screen and then leaves it — three at a time at most,
+	 * purged on a timer — and on a phone that is the whole of it: there is no
+	 * console to check afterwards, and the client page builds the log it can
+	 * hand back out of this process's log stream. Without this, a message the
+	 * user only half-saw leaves no trace anywhere.
+	 *
+	 * The severity is kept so the line reads the same way the toast did. This
+	 * cannot loop: nothing here raises a notification.
+	 */
+	private logRaisedNotifications(notificationService: NotificationService): IDisposable {
+		return notificationService.model.onDidChangeNotification(e => {
+			if (e.kind !== NotificationChangeType.ADD) {
+				return;
+			}
+			const source = e.item.source ? ` (${e.item.source})` : '';
+			const line = `[notification]${source} ${e.item.message.raw}`;
+			switch (e.item.severity) {
+				case Severity.Error: this.logService.error(line); break;
+				case Severity.Warning: this.logService.warn(line); break;
+				default: this.logService.info(line); break;
+			}
 		});
 	}
 
@@ -1259,6 +1290,11 @@ export class Workbench extends Disposable implements IAgentWorkbenchLayoutServic
 
 	protected revealEditorOnOpen(e: IEditorWillOpenEvent): void {
 		if (this._editorPartAutoVisibilitySuppressionCount > 0) {
+			return;
+		}
+
+		// Integrated / Simple Browser must not steal the Agents center.
+		if (isAgentsEmbeddedBrowserEditor(e.editor)) {
 			return;
 		}
 

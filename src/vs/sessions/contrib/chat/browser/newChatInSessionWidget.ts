@@ -76,6 +76,7 @@ export class NewChatInSessionWidget extends Disposable {
 			petHostPreferred: _options.petHostPreferred,
 			supportsBackground: true,
 			voiceRoutesWhileSessionActive: true,
+			renderSessionTypePickerInControls: false,
 		}));
 	}
 

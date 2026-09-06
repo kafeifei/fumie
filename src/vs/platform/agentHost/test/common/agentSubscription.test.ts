@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { DeferredPromise } from '../../../../base/common/async.js';
 import { DisposableStore } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -668,7 +669,7 @@ suite('AgentSubscriptionManager', () => {
 			return { resource: key, state: makeSessionState(key), fromSeq: 0 };
 		}
 		return { resource: key, state: makeTerminalState(), fromSeq: 0 };
-	}): AgentSubscriptionManager {
+	}, releaseGraceMs = 0, maxIdleSubscriptions = 64): AgentSubscriptionManager {
 		return disposables.add(new AgentSubscriptionManager(
 			'c1',
 			() => ++seq,
@@ -677,6 +678,8 @@ suite('AgentSubscriptionManager', () => {
 			(resource) => {
 				unsubscribedResources.push(resource.toString());
 			},
+			releaseGraceMs,
+			maxIdleSubscriptions,
 		));
 	}
 
@@ -737,6 +740,164 @@ suite('AgentSubscriptionManager', () => {
 
 		ref.dispose();
 		assert.ok(unsubscribedResources.includes(sessionUri));
+	});
+
+	test('sequential readers share an in-flight subscription after the first reference is released', async () => {
+		const subscribe = new DeferredPromise<{ resource: string; state: SessionState; fromSeq: number }>();
+		const mgr = createManager(resource => {
+			subscribedResources.push(resource.toString());
+			return subscribe.p;
+		});
+		const uri = URI.parse(sessionUri);
+
+		const first = mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'first');
+		first.dispose();
+		const second = mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'second');
+
+		assert.strictEqual(second.object, first.object);
+		assert.deepStrictEqual({ subscribedResources, unsubscribedResources }, {
+			subscribedResources: [sessionUri],
+			unsubscribedResources: [],
+		});
+
+		await subscribe.complete({ resource: sessionUri, state: makeSessionState(sessionUri), fromSeq: 0 });
+		assert.strictEqual((second.object.value as SessionState).title, 'Test');
+
+		second.dispose();
+		assert.deepStrictEqual(unsubscribedResources, [sessionUri]);
+	});
+
+	test('an unreferenced in-flight subscription is released as soon as the subscribe settles', async () => {
+		const subscribe = new DeferredPromise<{ resource: string; state: SessionState; fromSeq: number }>();
+		const mgr = createManager(() => subscribe.p);
+		const uri = URI.parse(sessionUri);
+
+		const ref = mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'test');
+		ref.dispose();
+		assert.strictEqual(unsubscribedResources.length, 0);
+
+		await subscribe.complete({ resource: sessionUri, state: makeSessionState(sessionUri), fromSeq: 0 });
+		assert.deepStrictEqual(unsubscribedResources, [sessionUri]);
+		assert.strictEqual(mgr.getSubscriptionUnmanaged<SessionState>(uri), undefined);
+	});
+
+	test('settled subscription is reused across a transient 23-reader burst', async () => {
+		const mgr = createManager(undefined, 30);
+		const uri = URI.parse(sessionUri);
+		const first = mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'first');
+		await new Promise(r => setTimeout(r, 0));
+		const subscription = first.object;
+		first.dispose();
+
+		for (let i = 0; i < 23; i++) {
+			const ref = mgr.getSubscription<SessionState>(StateComponents.Session, uri, `reader-${i}`);
+			assert.strictEqual(ref.object, subscription);
+			ref.dispose();
+		}
+
+		assert.deepStrictEqual({ subscribedResources, unsubscribedResources }, {
+			subscribedResources: [sessionUri],
+			unsubscribedResources: [],
+		});
+
+		await new Promise(r => setTimeout(r, 50));
+		assert.deepStrictEqual(unsubscribedResources, [sessionUri]);
+		assert.strictEqual(mgr.getSubscriptionUnmanaged<SessionState>(uri), undefined);
+	});
+
+	test('release grace cache evicts the oldest idle subscription at its entry bound', async () => {
+		const mgr = createManager(undefined, 1_000, 2);
+		const uris = ['copilot:/one', 'copilot:/two', 'copilot:/three'].map(value => URI.parse(value));
+		const refs = uris.map(uri => mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'test'));
+		await new Promise(r => setTimeout(r, 0));
+
+		for (const ref of refs) {
+			ref.dispose();
+		}
+
+		assert.deepStrictEqual(unsubscribedResources, ['copilot:/one']);
+		assert.strictEqual(mgr.getSubscriptionUnmanaged<SessionState>(uris[0]), undefined);
+		assert.ok(mgr.getSubscriptionUnmanaged<SessionState>(uris[1]));
+		assert.ok(mgr.getSubscriptionUnmanaged<SessionState>(uris[2]));
+	});
+
+	test('release while waiting for tracked create prevents a ghost subscribe', async () => {
+		const create = new DeferredPromise<void>();
+		let subscribeCalls = 0;
+		const mgr = createManager(async resource => {
+			subscribeCalls++;
+			return { resource: resource.toString(), state: makeSessionState(resource.toString()), fromSeq: 0 };
+		});
+		const uri = URI.parse(sessionUri);
+		mgr.trackSessionCreate(uri, create.p);
+
+		const ref = mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'test');
+		ref.dispose();
+		await create.complete();
+		await new Promise(r => setTimeout(r, 0));
+
+		assert.deepStrictEqual({ subscribeCalls, unsubscribedResources }, { subscribeCalls: 0, unsubscribedResources: [] });
+	});
+
+	test('manager dispose waits for an in-flight subscribe before unsubscribing once', async () => {
+		const subscribe = new DeferredPromise<{ resource: string; state: SessionState; fromSeq: number }>();
+		const mgr = createManager(() => subscribe.p);
+		const uri = URI.parse(sessionUri);
+		const ref = mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'test');
+
+		disposables.delete(mgr);
+		mgr.dispose();
+		assert.strictEqual(unsubscribedResources.length, 0);
+
+		await subscribe.complete({ resource: sessionUri, state: makeSessionState(sessionUri), fromSeq: 0 });
+		assert.deepStrictEqual(unsubscribedResources, [sessionUri]);
+
+		ref.dispose();
+		mgr.dispose();
+		assert.deepStrictEqual(unsubscribedResources, [sessionUri]);
+	});
+
+	test('missing reconnect state does not replace an in-flight subscribe out of wire order', async () => {
+		const subscribe = new DeferredPromise<{ resource: string; state: SessionState; fromSeq: number }>();
+		const mgr = createManager(resource => {
+			subscribedResources.push(resource.toString());
+			return subscribe.p;
+		});
+		const uri = URI.parse(sessionUri);
+		const first = mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'first');
+
+		mgr.markSubscriptionsMissing([uri]);
+		const second = mgr.getSubscription<SessionState>(StateComponents.Session, uri, 'second');
+
+		assert.strictEqual(second.object, first.object);
+		assert.deepStrictEqual({ subscribedResources, unsubscribedResources }, {
+			subscribedResources: [sessionUri],
+			unsubscribedResources: [],
+		});
+
+		await subscribe.complete({ resource: sessionUri, state: makeSessionState(sessionUri), fromSeq: 0 });
+		assert.strictEqual((second.object.value as SessionState).title, 'Test');
+
+		first.dispose();
+		second.dispose();
+		assert.deepStrictEqual(unsubscribedResources, [sessionUri]);
+	});
+
+	test('disposed manager rejects acquisitions and ignores tracked creates', async () => {
+		const mgr = createManager();
+		disposables.deleteAndLeak(mgr);
+		mgr.dispose();
+
+		mgr.trackSessionCreate(URI.parse(sessionUri), Promise.resolve());
+		assert.throws(
+			() => mgr.getSubscription<SessionState>(StateComponents.Session, URI.parse(sessionUri), 'late'),
+			/AgentSubscriptionManager is disposed/,
+		);
+		await new Promise(r => setTimeout(r, 0));
+		assert.deepStrictEqual({ subscribedResources, unsubscribedResources }, {
+			subscribedResources: [],
+			unsubscribedResources: [],
+		});
 	});
 
 	test('receiveEnvelope routes to root and all active subscriptions', async () => {

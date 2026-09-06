@@ -9,6 +9,7 @@ import { RemoteAgentHostConnectionStatus } from '../../platform/agentHost/common
 import { isSSHHostKeyDeniedError } from '../../platform/agentHost/common/sshRemoteAgentHost.js';
 import { PROTOCOL_VERSION } from '../../platform/agentHost/common/state/protocol/version/registry.js';
 import { ITelemetryService } from '../../platform/telemetry/common/telemetry.js';
+import type { AgentHostFilterScope } from '../services/agentHostFilter/common/agentHostFilter.js';
 import { LOCAL_AGENT_HOST_PROVIDER_ID, REMOTE_AGENT_HOST_PROVIDER_PREFIX } from './agentHostSessionsProvider.js';
 
 /** Bounded provider categories emitted by Agents window telemetry. */
@@ -121,6 +122,24 @@ export function logChangesViewViewModeChange(telemetryService: ITelemetryService
 	telemetryService.publicLog2<ChangesViewViewModeChangeEvent, ChangesViewViewModeChangeClassification>('vscodeAgents.changesView/viewModeChange', { mode });
 }
 
+// --- Sessions list machine filter ---
+
+type SessionsMachineFilterChangeEvent = {
+	scopeKind: string;
+	hostCount: number;
+};
+
+type SessionsMachineFilterChangeClassification = {
+	owner: 'osortega';
+	comment: 'Tracks when the user scopes the sessions list to a different machine from the list header dropdown.';
+	scopeKind: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The machine scope now in effect (all, local or host). The host itself is never reported: its identifier, address and label name a user machine.' };
+	hostCount: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; isMeasurement: true; comment: 'Number of remote hosts known at the time of the switch.' };
+};
+
+export function logSessionsMachineFilterChange(telemetryService: ITelemetryService, data: { scopeKind: AgentHostFilterScope['kind']; hostCount: number }): void {
+	telemetryService.publicLog2<SessionsMachineFilterChangeEvent, SessionsMachineFilterChangeClassification>('vscodeAgents.sessionsList/machineFilterChange', data);
+}
+
 // --- Shared multi-root topology helpers ---
 
 /**
@@ -214,6 +233,8 @@ export type TunnelConnectErrorCategory =
 export type TunnelConnectFailureReason =
 	| 'hostOffline'
 	| 'maxAttemptsReached'
+	| 'connectFailed'
+	| 'connectionLost'
 	| 'auth'
 	| 'authExpired';
 

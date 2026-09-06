@@ -29,17 +29,12 @@ export class AgentServiceCallbackAdapter implements IAgentServiceCallbackBinder 
 	private callbacks: IAgentServiceCallbacks | undefined;
 
 	readonly sessionServerToolAccessor: ISessionServerToolAccessor = {
-		isActiveAgentTitleGenerationEnabled: () => this.value.sessionServerToolAccessor.isActiveAgentTitleGenerationEnabled(),
 		listSessions: () => this.value.sessionServerToolAccessor.listSessions(),
-		getSession: session => this.value.sessionServerToolAccessor.getSession(session),
 		createSession: config => this.value.sessionServerToolAccessor.createSession(config),
 		getModels: () => this.value.sessionServerToolAccessor.getModels(),
 		getCreationDefaults: source => this.value.sessionServerToolAccessor.getCreationDefaults(source),
 		startPrompt: (session, chat, prompt) => this.value.sessionServerToolAccessor.startPrompt(session, chat, prompt),
 		createChat: (session, chat, options) => this.value.sessionServerToolAccessor.createChat(session, chat, options),
-		renameChat: (session, chat, title) => this.value.sessionServerToolAccessor.renameChat(session, chat, title),
-		reportToolError: (toolName, error) => this.value.sessionServerToolAccessor.reportToolError(toolName, error),
-		deleteSession: session => this.value.sessionServerToolAccessor.deleteSession(session),
 		getChatContext: (session, chatId) => this.value.sessionServerToolAccessor.getChatContext(session, chatId),
 		getSessionSpawnDepth: session => this.value.sessionServerToolAccessor.getSessionSpawnDepth(session),
 		setSessionSpawnDepth: (session, depth) => this.value.sessionServerToolAccessor.setSessionSpawnDepth(session, depth),

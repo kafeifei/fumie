@@ -84,11 +84,12 @@ cleared — they survive multi-session mode.
 
 Skipped entirely on mobile web (`isWeb && isMobile`) to avoid disruptive auto-expand on narrow viewports.
 
-> **Docked detail panel (experimental).** With `sessions.layout.singlePaneDetailPanel` enabled, the auxiliary
-> bar is docked inside the editor part rather than being a grid column (see
-> [Editor presentation](LAYOUT.md#editor-presentation)).
+> **Docked detail panel.** Fumie enables `sessions.layout.singlePaneDetailPanel` by default. With it enabled, the auxiliary
+> bar is docked inside the editor part rather than being a grid column (see [LAYOUT.md](LAYOUT.md) §5).
 > `SinglePaneExistingSessionStrategy` persists one shared Existing Session Editor/Details profile
 > (via `SinglePaneVisibilityProfileStore`) under `sessions.singlePane.sidePaneVisibility`.
+> The initial Existing profile is detail-only, and restored Empty Files / empty Changes content is
+> collapsed back to that composition; opening a real file or a non-empty diff reveals Editor.
 > New Sessions do not apply or capture an Editor
 > profile; submitting preserves Editor visibility and seeds the Existing profile. `SinglePaneQuickChatStrategy`
 > shares the Existing profile's overall side-pane visibility when Quick Chat has a saved editor

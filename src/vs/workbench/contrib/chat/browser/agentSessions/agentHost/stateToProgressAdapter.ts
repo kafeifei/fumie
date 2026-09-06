@@ -13,7 +13,7 @@ import { Schemas } from '../../../../../../base/common/network.js';
 import { posix, win32 } from '../../../../../../base/common/path.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { generateUuid } from '../../../../../../base/common/uuid.js';
-import { buildSubagentChatUri, isMessageHiddenFromTranscript, MessageKind, ToolCallCancellationReason, ToolCallContributorKind, ToolCallRiskAssessmentStatus, ToolCallStatus, TurnState, ResponsePartKind, getInlineToolInput, getToolFileEdits, getToolOutputText, getToolSubagentContent, hasReportedUsage, readUsageInfoMeta, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, type ActiveTurn, type ChatInputAnswer, type ChatInputRequest, type ICompletedToolCall, type InputRequestResponsePart, type Message, type TerminalCommandResult, type ToolCallPendingConfirmationState, type ToolCallState, type ToolResultSubagentContent, type Turn, FileEditKind, ToolResultContentType, type ToolResultContent, type UsageInfo, type UsageInfoMeta } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+import { buildSubagentChatUri, isMessageHiddenFromTranscript, MessageKind, ToolCallCancellationReason, ToolCallContributorKind, ToolCallRiskAssessmentStatus, ToolCallStatus, TurnState, ResponsePartKind, getInlineToolInput, getToolFileEdits, getToolOutputText, getToolSubagentContent, getToolTodoListContent, hasReportedUsage, readUsageInfoMeta, usageOccupancyTokens, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, type ActiveTurn, type ChatInputAnswer, type ChatInputRequest, type ICompletedToolCall, type InputRequestResponsePart, type Message, type TerminalCommandResult, type ToolCallPendingConfirmationState, type ToolCallState, type ToolResultSubagentContent, type Turn, FileEditKind, ToolResultContentType, type ToolResultContent, type UsageInfo, type UsageInfoMeta } from '../../../../../../platform/agentHost/common/state/sessionState.js';
 import type { ChatInputRequestWithPlanReview, IAgentHostPlanReview } from '../../../../../../platform/agentHost/common/agentHostPlanReview.js';
 import { getToolKind } from '../../../../../../platform/agentHost/common/state/sessionReducers.js';
 import { readToolCallMeta } from '../../../../../../platform/agentHost/common/meta/agentToolCallMeta.js';
@@ -21,7 +21,6 @@ import { getChatErrorDetailsFromMeta, IChatErrorContext } from '../../../common/
 import { AGENT_HOST_SCHEME, createAgentHostResourceUriMapper, type IAgentHostResourceUriMapper, toAgentHostUri } from '../../../../../../platform/agentHost/common/agentHostUri.js';
 import { AgentHostElementAttachmentDisplayKind, getElementAttachmentCorrelationId } from '../../../../../../platform/agentHost/common/meta/agentElementAttachments.js';
 import { AgentHostAutoReplyAnswer } from '../../../../../../platform/agentHost/common/agentHostSchema.js';
-import { SessionServerToolName } from '../../../../../../platform/agentHost/common/serverToolNames.js';
 import { getAgentFeedbackAttachmentMetadata, isAgentFeedbackAnnotationsAttachment, isAgentFeedbackAttachment } from '../../../../../../platform/agentHost/common/meta/agentFeedbackAttachments.js';
 import { getBrowserViewAttachmentMetadata, isBrowserViewAttachment } from '../../../../../../platform/agentHost/common/meta/browserViewAttachments.js';
 import { readAgentMessageDelegationMeta } from '../../../../../../platform/agentHost/common/meta/agentMessageDelegationMeta.js';
@@ -29,7 +28,8 @@ import { AgentSystemNotificationKind, AgentSystemNotificationSeverity, readAgent
 import { isViewUnreviewedCommentsTool, isAddCommentTool } from '../../../../../../platform/agentHost/common/meta/agentFeedbackAnnotations.js';
 import { AGENT_HOST_SESSION_LINK_SCHEME, isCreateChatTool, isCreateSessionTool, isSendMessageTool, parseOpenSessionLinkChatId, parseOpenSessionLinkUri } from '../../../../../../platform/agentHost/common/openSessionLink.js';
 import { parsePartialToolInputForDisplay } from '../../../../../../platform/agentHost/common/partialToolInput.js';
-import { MessageAttachmentKind, type FileEdit, type MessageAttachment, type StringOrMarkdown, type TextRange } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
+import { MessageAttachmentKind, type FileEdit, type MessageAttachment, type SessionModelInfo, type StringOrMarkdown, type TextRange } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
+import { resolveAgentModelByRawId } from '../../../../../../platform/agentHost/common/agentModelSource.js';
 import { normalizeFileEdit } from '../../../../../../platform/agentHost/common/fileEditDiff.js';
 import { AgentSession } from '../../../../../../platform/agentHost/common/agentService.js';
 import product from '../../../../../../platform/product/common/product.js';
@@ -73,7 +73,8 @@ function shouldHideCompletedAgentHostAskUserTool(toolCall: ToolCallState): boole
 }
 
 function isRenameChatTool(toolCall: ToolCallState): boolean {
-	return toolCall.toolName === SessionServerToolName.RenameChat || toolCall.toolName.endsWith(`__${SessionServerToolName.RenameChat}`);
+	const legacyRenameChatToolName = 'RenameChat';
+	return toolCall.toolName === legacyRenameChatToolName || toolCall.toolName.endsWith(`__${legacyRenameChatToolName}`);
 }
 
 function isAutomaticTitleRename(toolCall: ToolCallState): boolean {
@@ -521,22 +522,45 @@ export function getTerminalContent(content: ToolResultContent[] | undefined): Ex
  * items (so the input picker shows the model that ran), while the details
  * flow onto response history items (so the response footer shows the model
  * and any usage metadata).
+ *
+ * Every entry point takes an optional `turnModelId` — the model *this* turn was
+ * dispatched with ({@link Message.model}) — for a turn whose usage names no
+ * model of its own. It is per turn on purpose: a session-wide fallback would
+ * relabel every earlier turn of a session the user switched models in with the
+ * model of the last one, which is not a vaguer answer but a wrong one.
  */
 export interface TurnModelLookup {
 	/** Returns the chat-layer namespaced model id for a raw AHP model id. */
-	toLanguageModelId(rawModelId: string | undefined): string | undefined;
+	toLanguageModelId(rawModelId: string | undefined, turnModelId?: string): string | undefined;
 	/** Returns the registered display name for a raw AHP model id. */
 	toModelDisplayName?(rawModelId: string): string | undefined;
 	/** Returns the human-readable response details, or undefined if unknown. */
-	toResponseDetails(rawModelId: string | undefined, usage: UsageInfo | undefined): string | undefined;
+	toResponseDetails(rawModelId: string | undefined, usage: UsageInfo | undefined, turnModelId?: string): string | undefined;
 	/** Returns the Auto model routing part carried by this usage report, if any. */
 	toAutoModeResolution?(usage: UsageInfo | undefined): IChatAutoModeResolutionPart | undefined;
+	/**
+	 * Returns the context-window dimensions the agent published for a raw AHP
+	 * model id, for usage reports that carry none of their own. See
+	 * {@link usageInfoToChatUsage}.
+	 */
+	toModelContextWindow?(rawModelId: string | undefined, turnModelId?: string): IChatUsage['modelContextWindow'];
 }
+
+/**
+ * Which claim about a turn produced the model its footer would name.
+ *
+ * `reported` is the model the turn's own usage names; `turn` is the model that
+ * turn was submitted with; `session` is the session's current selection, which
+ * is a fact about the newest turn and about no earlier one.
+ */
+export type TurnResponseModelProvenance = 'reported' | 'turn' | 'session';
 
 /** Minimal model metadata needed to render a turn's response footer (kept small for unit testing). */
 export interface ITurnResponseModel {
 	readonly name: string;
 	readonly pricing?: string;
+	/** Defaults to `reported` — the turn named this model itself. */
+	readonly resolvedFrom?: TurnResponseModelProvenance;
 }
 
 /**
@@ -544,13 +568,22 @@ export interface ITurnResponseModel {
  * `model` is the resolved model; `billedModelId` is the turn's `usage.model` when it didn't resolve to a
  * registered model (e.g. an "Auto" pick billed as `raptor-mini`), shown inline as `Auto (raptor-mini)`.
  * Returns `undefined` when the model is unknown.
+ *
+ * It also returns `undefined` for a model that is *known* but not attributable
+ * to this turn: the footer reads as a statement about this response, and a
+ * session-wide selection says nothing about a turn that ran before it was made.
+ * Naming it there puts another turn's model under this one's timestamp, silently
+ * and as fact — which is worse than the blank stat that replaces it, since the
+ * timestamp still renders either way. A `billedModelId` rescues that case: with
+ * the id the turn actually reported shown beside it, the picked model is offered
+ * as context rather than asserted ("Auto (raptor-mini)").
  */
 export function formatTurnResponseDetails(
 	model: ITurnResponseModel | undefined,
 	billedModelId: string | undefined,
 	usage: UsageInfo | undefined,
 ): string | undefined {
-	if (!model) {
+	if (!model || (model.resolvedFrom === 'session' && billedModelId === undefined)) {
 		return undefined;
 	}
 	const displayName = formatTurnModelName(model, billedModelId);
@@ -562,7 +595,7 @@ export function formatTurnResponseDetails(
 			: localize('agentHost.responseDetails.credits', "{0} credits", formatted);
 		return [displayName, creditDetails].join(' • ');
 	}
-	return [displayName, model.pricing].filter(Boolean).join(' · ');
+	return [displayName, model.pricing].filter(Boolean).join(' • ');
 }
 
 /** Converts an agent-host Auto routing result into the shared chat UI part. */
@@ -592,25 +625,91 @@ function formatTurnModelName(model: ITurnResponseModel, billedModelId: string | 
 	return model.name;
 }
 
-export function usageInfoToChatUsage(usage: UsageInfo | undefined, modelDisplayNameResolver?: (rawModelId: string) => string | undefined): IChatUsage | undefined {
+/**
+ * `modelContextWindowResolver` supplies the gauge denominator for usage that
+ * reports none of its own. Only the turn events an agent emits live carry
+ * `modelContextWindow`, and not every agent fills it in even then; a turn
+ * replayed from a transcript never does, because the transcript has no such
+ * field to replay. The window is a fact about the model the agent already
+ * published (`SessionModelInfo.maxContextWindow`), so it is read from there,
+ * keyed by the model this usage names.
+ *
+ * That keying is the whole difficulty: `usage.model` is the bare id the agent's
+ * runtime ran, while the same model may be published under a decorated id (a
+ * provider qualification, a BYOK vendor route). The resolver must translate
+ * between the two — via `SessionModelInfo.underlyingModelId` — or a replayed
+ * turn's model matches nothing and the gauge stays blank until the next live
+ * turn, however complete the catalog is.
+ */
+export function usageInfoToChatUsage(usage: UsageInfo | undefined, modelDisplayNameResolver?: (rawModelId: string) => string | undefined, modelContextWindowResolver?: (rawModelId: string | undefined) => IChatUsage['modelContextWindow']): IChatUsage | undefined {
 	// Shared with the host's restore path, so "this turn has usage worth
 	// showing" cannot drift between the two.
 	if (!hasReportedUsage(usage)) {
 		return undefined;
 	}
-	const turnTokenTotals = readUsageInfoMeta(usage).turnTokenTotals;
+	const meta = readUsageInfoMeta(usage);
 	return {
 		kind: 'usage',
-		promptTokens: usage?.inputTokens ?? 0,
+		// Occupancy is derived in exactly one place, and this is the call to it.
+		// Mappers transcribe the upstream numbers 1:1 and never pre-fold; when
+		// they did, every provider drifted its own way.
+		promptTokens: usageOccupancyTokens(usage),
 		completionTokens: usage?.outputTokens ?? 0,
+		// The popup's "of which cached" row wants the cache-read share alone,
+		// not the folded total.
+		cachedPromptTokens: usage?.cacheReadTokens,
 		copilotCredits: getCopilotCredits(usage),
 		sessionCopilotCredits: getSessionCopilotCredits(usage),
 		promptTokenDetails: contextAttributionToPromptTokenDetails(usage),
-		modelTotals: turnTokenTotals?.map(total => ({
+		modelContextWindow: meta.modelContextWindow ?? modelContextWindowResolver?.(usage?.model),
+		modelTotals: meta.turnTokenTotals?.map(total => ({
 			...total,
 			model: modelDisplayNameResolver?.(total.model) ?? total.model,
 		})),
 	};
+}
+
+/**
+ * The window {@link usageInfoToChatUsage}'s resolver answers with: the
+ * dimensions an agent published for a model it reports as having run, read from
+ * its own model list rather than from the language-model catalog. Which window a
+ * model has is a fact the agent states in root state, and root state is already
+ * there when a session's history is rebuilt.
+ *
+ * `rawModelIds` are tried in order — the model this usage names, then the
+ * session's own — and the first that *names a model* wins, window or no window:
+ * falling through a model that simply published no window would report some
+ * other model's denominator. A reported id that names nothing at all (a model
+ * dropped from the catalog since, or one this agent never published) is what the
+ * later ids are for.
+ *
+ * The ids an agent publishes may be decorated — a provider qualification, a BYOK
+ * vendor route — while its runtime keeps reporting the bare model, which is why
+ * the two are resolved through {@link resolveAgentModelByRawId} rather than
+ * compared literally. That is also why an id several rows answer to names none
+ * of them: the reported id is then no better than the session's own, which is
+ * the next one tried.
+ */
+export function agentModelContextWindow(models: readonly SessionModelInfo[] | undefined, ...rawModelIds: readonly (string | undefined)[]): IChatUsage['modelContextWindow'] {
+	if (!models) {
+		return undefined;
+	}
+	for (const rawModelId of rawModelIds) {
+		const model = rawModelId ? resolveAgentModelByRawId(models, rawModelId) : undefined;
+		if (!model) {
+			continue;
+		}
+		const totalTokens = model.maxContextWindow;
+		if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens <= 0) {
+			return undefined;
+		}
+		const maxOutputTokens = model.maxOutputTokens;
+		return {
+			totalTokens,
+			...(typeof maxOutputTokens === 'number' && Number.isFinite(maxOutputTokens) && maxOutputTokens > 0 ? { maxOutputTokens } : {}),
+		};
+	}
+	return undefined;
 }
 
 function getSessionCopilotCredits(usage: UsageInfo | undefined): number | undefined {
@@ -620,15 +719,23 @@ function getSessionCopilotCredits(usage: UsageInfo | undefined): number | undefi
 		: undefined;
 }
 
+/**
+ * The turn's Copilot credits, read only from the one key that states them in a
+ * known unit: `copilotUsage.totalNanoAiu`, nano-AIU, which divides into credits.
+ *
+ * `_meta.cost` is deliberately not a fallback. It is an open bag whose unit no
+ * producer agrees on — the Copilot harness forwards its SDK's per-call `cost`
+ * verbatim, which is a currency amount, while the key is documented as a credit
+ * count — so rendering it through the credit formatter labelled a raw number
+ * "N credits" whatever it actually measured. A number with the wrong unit on it
+ * is worse than no number, so a turn that reports only `cost` now reports no
+ * credits at all; surfacing it as its own (currency) stat is a separate change
+ * that needs the producers to state the unit first.
+ */
 function getCopilotCredits(usage: UsageInfo | undefined): number | undefined {
-	const meta = readUsageInfoMeta(usage);
-	const totalNanoAiu = meta?.copilotUsage?.totalNanoAiu;
-	if (typeof totalNanoAiu === 'number' && totalNanoAiu >= 0) {
-		return totalNanoAiu / 1_000_000_000;
-	}
-	const cost = meta?.cost;
-	return typeof cost === 'number' && cost >= 0
-		? cost
+	const totalNanoAiu = readUsageInfoMeta(usage).copilotUsage?.totalNanoAiu;
+	return typeof totalNanoAiu === 'number' && totalNanoAiu >= 0
+		? totalNanoAiu / 1_000_000_000
 		: undefined;
 }
 
@@ -851,16 +958,21 @@ export function usageInfoToQuotas(usage: UsageInfo | undefined): IAgentHostQuota
  * Converts completed turns from the protocol state into session history items.
  *
  * Per turn, prefers `turn.usage?.model` so each request/response pair shows
- * the model that actually ran, even if the user changed models mid-session.
- * The `lookup` callback is responsible for any session-level fallback (e.g.
- * `summary.model?.id` when usage hasn't reported a model yet).
+ * the model that actually ran, even if the user changed models mid-session, and
+ * falls back to the model that turn was dispatched with (`turn.message.model`) —
+ * an older session, or a turn replayed from a transcript that carries no usage.
+ * Both are facts about this turn: nothing here may borrow another turn's model,
+ * which on a session the user switched models in would relabel its whole past.
+ * This is the same order the live completion path uses, so a turn does not
+ * change model when the session is reopened.
  */
 export function turnsToHistory(backendSession: URI, turns: readonly Turn[], participantId: string, connectionAuthority: string, lookup?: TurnModelLookup, errorContext?: IChatErrorContext, terminalCommandPrefix?: string, resourceUris: IAgentHostResourceUriMapper = createAgentHostResourceUriMapper(connectionAuthority)): IChatSessionHistoryItem[] {
 	const history: IChatSessionHistoryItem[] = [];
 	for (const turn of turns) {
 		const rawModelId = turn.usage?.model;
-		const modelId = lookup?.toLanguageModelId(rawModelId);
-		const details = lookup?.toResponseDetails(rawModelId, turn.usage);
+		const turnModelId = turn.message.model?.id;
+		const modelId = lookup?.toLanguageModelId(rawModelId, turnModelId);
+		const details = lookup?.toResponseDetails(rawModelId, turn.usage, turnModelId);
 
 		// Request
 		const variableData = messageToVariableData(turn.message, connectionAuthority);
@@ -895,7 +1007,12 @@ export function turnsToHistory(backendSession: URI, turns: readonly Turn[], part
 			parts.push(autoModeResolution);
 		}
 
-		const usage = usageInfoToChatUsage(turn.usage, lookup?.toModelDisplayName);
+		const contextWindow = lookup?.toModelContextWindow;
+		const usage = usageInfoToChatUsage(
+			turn.usage,
+			lookup?.toModelDisplayName,
+			contextWindow && (raw => contextWindow(raw, turnModelId)),
+		);
 		if (usage) {
 			parts.push(usage);
 		}
@@ -1270,7 +1387,7 @@ function textRangeToIRange(range: TextRange): IRange {
  */
 export function activeTurnToProgress(sessionResource: URI, activeTurn: ActiveTurn, connectionAuthority: string, mcpServerAuthority = sessionResource.authority, toolInvocationOptions?: IAgentHostToolInvocationOptions, lookup?: TurnModelLookup, resourceUris: IAgentHostResourceUriMapper = createAgentHostResourceUriMapper(connectionAuthority)): IChatProgress[] {
 	const parts: IChatProgress[] = [];
-	const usage = usageInfoToChatUsage(activeTurn.usage, lookup?.toModelDisplayName);
+	const usage = usageInfoToChatUsage(activeTurn.usage, lookup?.toModelDisplayName, lookup?.toModelContextWindow);
 	if (usage) {
 		parts.push(usage);
 	}
@@ -1750,6 +1867,31 @@ export function completedToolCallToSerialized(tc: ICompletedToolCall, subAgentIn
 				agentName: subagentContent?.agentName ?? getSubagentAgentName(tc),
 				result: resultText,
 				chatResource: getSubagentChatResource(tc, subagentContent, sessionResource),
+			},
+		};
+	}
+
+	// Check for todo-list content
+	const todoContent = tc.status === ToolCallStatus.Completed ? getToolTodoListContent(tc) : undefined;
+	if (todoContent) {
+		const pastTenseMsg = isSuccess
+			? stringOrMarkdownToString(tc.pastTenseMessage, connectionAuthority) ?? invocationMsg
+			: invocationMsg;
+		return {
+			kind: 'toolInvocationSerialized',
+			toolCallId: tc.toolCallId,
+			toolId: tc.toolName,
+			source: ToolDataSource.Internal,
+			invocationMessage: invocationMsg,
+			originMessage: undefined,
+			pastTenseMessage: pastTenseMsg,
+			isConfirmed: completedToolCallConfirmedReason(tc),
+			isComplete: true,
+			presentation: undefined,
+			subAgentInvocationId: subAgentInvocationId,
+			toolSpecificData: {
+				kind: 'todoList',
+				todoList: todoContent.todos,
 			},
 		};
 	}
@@ -2325,7 +2467,15 @@ export function toolCallStateToInvocation(tc: ToolCallState, subAgentInvocationI
 	} else if (getToolKind(tc) === 'search') {
 		invocation.toolSpecificData = { kind: 'search' };
 	} else if (tc.status !== ToolCallStatus.Streaming) {
-		invocation.toolSpecificData = buildMcpAppToolInputData(tc, sessionResource);
+		// Todo-list tool: surface the structured checklist from the todo content
+		// block so the renderer shows an interactive todo card instead of a
+		// text blob. The content arrives with the tool result.
+		const todoContent = (tc.status === ToolCallStatus.Running || tc.status === ToolCallStatus.Completed)
+			? getToolTodoListContent(tc)
+			: undefined;
+		invocation.toolSpecificData = todoContent
+			? { kind: 'todoList', todoList: todoContent.todos }
+			: buildMcpAppToolInputData(tc, sessionResource);
 	}
 
 	return invocation;
@@ -2618,6 +2768,14 @@ export function finalizeToolInvocation(invocation: ChatToolInvocation, tc: ToolC
 				duration: invocation.toolSpecificData.duration,
 				chatResource: invocation.toolSpecificData.chatResource ?? getSubagentChatResource(tc, undefined, backendSession),
 			};
+		}
+		const todoContent = getToolTodoListContent(tc);
+		if (todoContent) {
+			invocation.toolSpecificData = {
+				kind: 'todoList',
+				todoList: todoContent.todos,
+			};
+			invocation.notifyToolSpecificDataChanged();
 		}
 	}
 

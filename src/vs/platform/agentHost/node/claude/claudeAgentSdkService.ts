@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { AnyZodRawShape, ForkSessionOptions, ForkSessionResult, GetSessionMessagesOptions, GetSubagentMessagesOptions, InferShape, ListSessionsOptions, ListSubagentsOptions, McpSdkServerConfigWithInstance, Options, Query, SDKSessionInfo, SDKUserMessage, SdkMcpToolDefinition, SessionMessage, SessionMutationOptions, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
+import type { AnyZodRawShape, ForkSessionOptions, ForkSessionResult, GetSessionInfoOptions, GetSessionMessagesOptions, GetSubagentMessagesOptions, InferShape, ListSessionsOptions, ListSubagentsOptions, McpSdkServerConfigWithInstance, Options, Query, SDKSessionInfo, SDKUserMessage, SdkMcpToolDefinition, SessionMessage, SessionMutationOptions, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { pathToFileURL } from 'url';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
@@ -52,8 +52,8 @@ export const IClaudeAgentSdkService = createDecorator<IClaudeAgentSdkService>('c
 export interface IClaudeAgentSdkService {
 	readonly _serviceBrand: undefined;
 
-	listSessions(): Promise<readonly SDKSessionInfo[]>;
-	getSessionInfo(sessionId: string): Promise<SDKSessionInfo | undefined>;
+	listSessions(options?: ListSessionsOptions): Promise<readonly SDKSessionInfo[]>;
+	getSessionInfo(sessionId: string, options?: GetSessionInfoOptions): Promise<SDKSessionInfo | undefined>;
 	startup(params: { options: Options; initializeTimeoutMs?: number }): Promise<WarmQuery>;
 	/**
 	 * 1:1 with the SDK's top-level `query` export. Returns a `Query` whose
@@ -113,7 +113,7 @@ export interface IClaudeAgentSdkService {
  */
 export interface IClaudeSdkBindings {
 	listSessions(options?: ListSessionsOptions): Promise<SDKSessionInfo[]>;
-	getSessionInfo(sessionId: string): Promise<SDKSessionInfo | undefined>;
+	getSessionInfo(sessionId: string, options?: GetSessionInfoOptions): Promise<SDKSessionInfo | undefined>;
 	startup(params: { options: Options; initializeTimeoutMs?: number }): Promise<WarmQuery>;
 	query(params: { prompt: string | AsyncIterable<SDKUserMessage>; options?: Options }): Query;
 	getSessionMessages(sessionId: string, options?: GetSessionMessagesOptions): Promise<SessionMessage[]>;
@@ -163,9 +163,9 @@ export class ClaudeAgentSdkService implements IClaudeAgentSdkService {
 		}
 	}
 
-	async listSessions(): Promise<readonly SDKSessionInfo[]> {
+	async listSessions(options?: ListSessionsOptions): Promise<readonly SDKSessionInfo[]> {
 		const sdk = await this._getSdk();
-		return sdk.listSessions(undefined);
+		return sdk.listSessions(options);
 	}
 
 	async canLoadWithoutDownload(): Promise<boolean> {
@@ -185,9 +185,9 @@ export class ClaudeAgentSdkService implements IClaudeAgentSdkService {
 		}
 	}
 
-	async getSessionInfo(sessionId: string): Promise<SDKSessionInfo | undefined> {
+	async getSessionInfo(sessionId: string, options?: GetSessionInfoOptions): Promise<SDKSessionInfo | undefined> {
 		const sdk = await this._getSdk();
-		return sdk.getSessionInfo(sessionId);
+		return sdk.getSessionInfo(sessionId, options);
 	}
 
 	async startup(params: { options: Options; initializeTimeoutMs?: number }): Promise<WarmQuery> {

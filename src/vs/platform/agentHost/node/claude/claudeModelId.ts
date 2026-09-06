@@ -196,3 +196,84 @@ function extractValidSuffix(name: string, modifiers: string): string {
 	}
 	return '';
 }
+
+/**
+ * The context-window limits a model catalog publishes for one model.
+ *
+ * `maxContextWindow` is the load-bearing half: it is the denominator the
+ * context-usage gauge divides a turn's occupancy by. `maxOutputTokens` is
+ * carried alongside it only where the source documents it — an omitted value
+ * is exactly what the caller would have published without this fallback.
+ */
+export interface IClaudeModelLimits {
+	readonly maxContextWindow: number;
+	readonly maxOutputTokens?: number;
+}
+
+/**
+ * Families and versions Anthropic ships with a 1M-token context window and a
+ * 128K output cap. Keyed `${family}/${version}` in the normalized form
+ * {@link tryParseClaudeModelId} produces (dotted version, no date suffix).
+ *
+ * SOURCE: Anthropic's published model table (model id / context / max output),
+ * as bundled in the `claude-api` skill's model reference, cached 2026-06-24.
+ * This table exists ONLY because the Claude Agent SDK's `ModelInfo`
+ * (`node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts`) carries no window or
+ * limit fields at all — verified against the vendored SDK. Whenever the SDK
+ * gains them, delete this table and map the real fields instead.
+ */
+const CLAUDE_LONG_CONTEXT_MODELS: ReadonlySet<string> = new Set([
+	'fable/5',
+	'mythos/5',
+	'opus/5',
+	'opus/4.8',
+	'opus/4.7',
+	'opus/4.6',
+	'sonnet/5',
+	'sonnet/4.6',
+]);
+
+/**
+ * First-party Claude families whose pre-4.6 generations all shipped the
+ * standard 200K-token context window (Claude 3.x and Claude 4.0 through 4.5). Their
+ * output caps varied per model, so none is asserted here.
+ */
+const CLAUDE_STANDARD_CONTEXT_FAMILIES: ReadonlySet<string> = new Set(['opus', 'sonnet', 'haiku']);
+
+/** The generation at which the first-party families moved to a 1M window. */
+const CLAUDE_LONG_CONTEXT_MIN_VERSION = 4.6;
+
+const CLAUDE_LONG_CONTEXT_TOKENS = 1_000_000;
+const CLAUDE_LONG_CONTEXT_MAX_OUTPUT_TOKENS = 128_000;
+const CLAUDE_STANDARD_CONTEXT_TOKENS = 200_000;
+
+/**
+ * Best-effort context-window limits for a Claude model id, for catalogs whose
+ * upstream source publishes none.
+ *
+ * This is a **fallback**, never a preference: a caller with real limits from
+ * its own transport (CAPI `capabilities.limits`, the BYOK bridge, the SDK's
+ * per-result `ModelUsage`) must use those. Returns `undefined` for anything
+ * this table cannot positively account for — a wrong denominator renders a
+ * confidently wrong gauge, which is worse than no gauge — so callers should
+ * log the miss rather than substitute a guess.
+ */
+export function claudeModelLimitsFallback(modelId: string): IClaudeModelLimits | undefined {
+	const parsed = tryParseClaudeModelId(modelId);
+	if (!parsed) {
+		return undefined;
+	}
+	// The explicit `-1m` variant is a long-context SKU of whatever family it
+	// decorates, so it answers ahead of the per-version tables.
+	if (parsed.modifiers.split('-').includes('1m')) {
+		return { maxContextWindow: CLAUDE_LONG_CONTEXT_TOKENS, maxOutputTokens: CLAUDE_LONG_CONTEXT_MAX_OUTPUT_TOKENS };
+	}
+	if (CLAUDE_LONG_CONTEXT_MODELS.has(`${parsed.name}/${parsed.version}`)) {
+		return { maxContextWindow: CLAUDE_LONG_CONTEXT_TOKENS, maxOutputTokens: CLAUDE_LONG_CONTEXT_MAX_OUTPUT_TOKENS };
+	}
+	const version = Number.parseFloat(parsed.version);
+	if (CLAUDE_STANDARD_CONTEXT_FAMILIES.has(parsed.name) && Number.isFinite(version) && version < CLAUDE_LONG_CONTEXT_MIN_VERSION) {
+		return { maxContextWindow: CLAUDE_STANDARD_CONTEXT_TOKENS };
+	}
+	return undefined;
+}

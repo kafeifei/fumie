@@ -6,6 +6,7 @@
 import { fetchAuthorizationServerMetadata } from '../../../../../../base/common/oauth.js';
 import { SequencerByKey } from '../../../../../../base/common/async.js';
 import { CancellationError } from '../../../../../../base/common/errors.js';
+import { type IProductConfiguration } from '../../../../../../base/common/product.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { readAgentModelByokIdentifier } from '../../../../../../platform/agentHost/common/agentModelByokMeta.js';
 import { type McpOAuthClient, type ModelSelection, type ProtectedResourceMetadata } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
@@ -35,6 +36,26 @@ import { IChatSetupResult } from '../../chatSetup/chatSetup.js';
  */
 export function agentHostMcpServerId(authority: string, serverName: string, resourceUrl: string): string {
 	return `agent-host-mcp:${authority}/${encodeURIComponent(serverName)}/${encodeURIComponent(resourceUrl)}`;
+}
+
+/**
+ * Whether this product resolves workbench credentials and pushes them to an
+ * agent host at all.
+ *
+ * The minimal Sessions product does not: every harness runs on its own
+ * credentials and no VS Code authentication provider is activated to back one,
+ * so a pass over the advertised protected resources can only ever resolve
+ * nothing. It would still forward the empty token that stands for "no
+ * credential", and the host reads that as a revocation of whatever another
+ * client already gave it — the same agent host backs the desktop and the
+ * browser that is remote-controlling it.
+ *
+ * Every client of a given host must agree on this, so both the local and the
+ * remote agent host contributions ask here rather than each spelling the
+ * product shape out.
+ */
+export function forwardsWorkbenchCredentials(product: Pick<IProductConfiguration, 'sessionsMinimalShell' | 'sessionsRequireDefaultAccount'>): boolean {
+	return !(product.sessionsMinimalShell && product.sessionsRequireDefaultAccount === false);
 }
 
 /**

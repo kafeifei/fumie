@@ -49,6 +49,7 @@ Do not turn those files into general Sessions guidance.
 | Sessions sidebar list | [SESSIONS_LIST.md](SESSIONS_LIST.md) |
 | Phone layout and mobile components | [MOBILE.md](MOBILE.md) |
 | AI customizations | [AI_CUSTOMIZATIONS.md](AI_CUSTOMIZATIONS.md) |
+| Agent/model settings and BYOK provider behavior | [docs/model-providers.md](../../../docs/model-providers.md) |
 | Copilot customizations | [copilot-customizations-spec.md](copilot-customizations-spec.md) |
 | Copilot Chat provider | [COPILOT_CHAT_SESSIONS_PROVIDER.md](contrib/providers/copilotChatSessions/COPILOT_CHAT_SESSIONS_PROVIDER.md) |
 | Agent Host provider | [AGENT_HOST_SESSIONS_PROVIDER.md](contrib/providers/agentHost/AGENT_HOST_SESSIONS_PROVIDER.md) |

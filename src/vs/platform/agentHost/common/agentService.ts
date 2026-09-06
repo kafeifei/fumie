@@ -41,7 +41,7 @@ export type {
 	IAgentHostNetworkEndpoint, IAgentHostManagedSettingsSnapshot,
 } from './agent.js';
 export {
-	AgentSession, CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID, GITHUB_COPILOT_PROTECTED_RESOURCE,
+	AgentSession, CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID, KIMI_AGENT_PROVIDER_ID, GITHUB_COPILOT_PROTECTED_RESOURCE,
 	GITHUB_REPO_PROTECTED_RESOURCE, protectedResourcesRequireGitHubCopilotSignIn, resolveAgentChatContext,
 	resolveAgentChatOrigin, resolveSubagentChatParent, resolveAgentHostCustomizations, subagentChatTitle,
 	SubagentChatSignal,
@@ -110,15 +110,11 @@ export const AgentHostSystemProxyEnabledSettingId = 'chat.agentHost.systemProxy.
 /** Configuration key controlling the GitHub MCP server in agent-host sessions. */
 export const AgentHostGitHubMcpServerEnabledSettingId = 'chat.agentHost.githubMcpServer.enabled';
 
-/** Configuration key gating active-agent session and chat title generation. */
-export const AgentHostActiveAgentTitleGenerationSettingId = 'chat.agentHost.experimental.activeAgentTitleGeneration';
-
 /** Configuration key enabling rich-link guidance for Markdown plan documents. */
 export const AgentHostMarkdownPlanRichLinksEnabledSettingId = 'chat.agentHost.experimental.markdownPlanRichLinks';
 
 /** Configuration key gating the artifact tools and their agent instruction. */
 export const ArtifactToolsSettingId = 'chat.artifactTools.enabled';
-
 /**
  * Configuration key gating multiple-working-directory support for the Copilot
  * agent-host provider. When `true`, the Copilot provider advertises the
@@ -186,6 +182,33 @@ export const AgentHostClaudeAgentEnabledSettingId = 'chat.agentHost.claudeAgent.
  */
 export const AgentHostCodexAgentEnabledSettingId = 'chat.agentHost.codexAgent.enabled';
 
+/** Experimental Kimi provider registration gate. */
+export const AgentHostKimiAgentEnabledSettingId = 'chat.agentHost.kimiAgent.enabled';
+
+/** Experimental DeepSeek provider registration gate. */
+export const AgentHostDeepSeekAgentEnabledSettingId = 'chat.agentHost.deepseekAgent.enabled';
+
+/** Experimental Pi provider registration gate. */
+export const AgentHostPiAgentEnabledSettingId = 'chat.agentHost.piAgent.enabled';
+
+/**
+ * Experimental Agent Client Protocol provider registration gate.
+ *
+ * One gate for the whole ACP connector, not one per ACP agent: the agents are
+ * catalog entries behind a single provider, so a per-agent toggle would have to
+ * be invented and persisted for a set that changes at runtime.
+ */
+export const AgentHostAcpAgentEnabledSettingId = 'chat.agentHost.acpAgent.enabled';
+
+/**
+ * Experimental opencode provider registration gate.
+ *
+ * opencode is a user-installed binary rather than a downloadable SDK, so this
+ * toggle is the whole gate: nothing is fetched, and an absent install reports
+ * itself on the first send.
+ */
+export const AgentHostOpencodeAgentEnabledSettingId = 'chat.agentHost.opencodeAgent.enabled';
+
 /**
  * Configuration key controlling whether extension-provided BYOK ("bring your
  * own key") models are published and included in new agent-host sessions.
@@ -218,13 +241,46 @@ export const AgentHostClaudeAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_CLAUDE_AGENT
  */
 export const AgentHostCodexAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_CODEX_AGENT_ENABLED';
 
+/** Environment variable form of {@link AgentHostKimiAgentEnabledSettingId}. */
+export const AgentHostKimiAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_KIMI_AGENT_ENABLED';
+
+/** Environment variable form of {@link AgentHostDeepSeekAgentEnabledSettingId}. */
+export const AgentHostDeepSeekAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_DEEPSEEK_AGENT_ENABLED';
+
+/** Optional Kimi SDK-root override. */
+export const AgentHostKimiSdkRootEnvVar = 'VSCODE_AGENT_HOST_KIMI_SDK_ROOT';
+
+/** Optional DeepSeek SDK-root override. */
+export const AgentHostDeepSeekSdkRootEnvVar = 'VSCODE_AGENT_HOST_DEEPSEEK_SDK_ROOT';
+
+/** Optional Pi SDK-root override. */
+export const AgentHostPiSdkRootEnvVar = 'VSCODE_AGENT_HOST_PI_SDK_ROOT';
+
+/** Environment variable form of {@link AgentHostPiAgentEnabledSettingId}. */
+export const AgentHostPiAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_PI_AGENT_ENABLED';
+
+/** Environment variable form of {@link AgentHostAcpAgentEnabledSettingId}. */
+export const AgentHostAcpAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_ACP_AGENT_ENABLED';
+
+/** Environment variable form of {@link AgentHostOpencodeAgentEnabledSettingId}. */
+export const AgentHostOpencodeAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_OPENCODE_AGENT_ENABLED';
+
 /**
  * Overrides the grace period (in milliseconds) before an idle, fully
- * unsubscribed session is released from memory. Defaults to 30_000. Primarily a
- * test hook so real-SDK integration tests can force a prompt release without
- * waiting the full production grace; production does not set it.
+ * unsubscribed session is released from memory. Primarily a test hook so
+ * real-SDK integration tests can force a prompt release without waiting the
+ * full production grace; production does not set it.
  */
 export const AgentHostSessionReleaseGraceMsEnvVar = 'VSCODE_AGENT_HOST_SESSION_RELEASE_GRACE_MS';
+
+/**
+ * Overrides how many idle, unsubscribed sessions stay warm at once. Beyond the
+ * cap the least-recently-warmed session is released immediately instead of
+ * waiting out {@link AgentHostSessionReleaseGraceMsEnvVar}. A test hook for
+ * exercising the overflow path without opening a realistic number of sessions;
+ * production does not set it.
+ */
+export const AgentHostSessionWarmPoolMaxEnvVar = 'VSCODE_AGENT_HOST_SESSION_WARM_POOL_MAX';
 
 /**
  * Resolves the effective enable state for a Claude/Codex provider from the
@@ -346,6 +402,9 @@ export const AgentHostCodexAgentCodexHomeSettingId = 'chat.agentHost.codexAgent.
  */
 export const AgentHostCodexAgentBinaryArgsSettingId = 'chat.agentHost.codexAgent.binaryArgs';
 
+/** Optional direct path to the Codex executable used for `app-server`. */
+export const AgentHostCodexAgentBinaryPathSettingId = 'chat.agentHost.codexAgent.binaryPath';
+
 /**
  * Environment variable form of {@link AgentHostCodexAgentSdkRootSettingId}.
  * Forwarded by the starters from the setting.
@@ -357,6 +416,9 @@ export const AgentHostCodexAgentCodexHomeEnvVar = 'CODEX_HOME';
 
 /** Forwarded extra args for `codex app-server` (JSON-encoded string[]). */
 export const AgentHostCodexAgentBinaryArgsEnvVar = 'VSCODE_AGENT_HOST_CODEX_APP_SERVER_ARGS';
+
+/** Forwarded direct Codex executable path. */
+export const AgentHostCodexAgentBinaryPathEnvVar = 'VSCODE_AGENT_HOST_CODEX_BINARY_PATH';
 
 // -- OpenTelemetry settings ------------------------------------------------------
 //
@@ -632,9 +694,15 @@ export function buildAgentHostOTelEnv(
 export interface IAgentSdkStarterSettings {
 	readonly codexSdkRoot?: string;
 	readonly codexHome?: string;
+	readonly codexBinaryPath?: string;
 	readonly codexBinaryArgs?: readonly string[];
 	readonly claudeAgentEnabled?: boolean;
 	readonly codexAgentEnabled?: boolean;
+	readonly kimiAgentEnabled?: boolean;
+	readonly deepSeekAgentEnabled?: boolean;
+	readonly piAgentEnabled?: boolean;
+	readonly acpAgentEnabled?: boolean;
+	readonly opencodeAgentEnabled?: boolean;
 }
 
 export function buildAgentSdkEnv(
@@ -650,6 +718,7 @@ export function buildAgentSdkEnv(
 	};
 	setIfMissing(AgentHostCodexAgentSdkRootEnvVar, settings.codexSdkRoot);
 	setIfMissing(AgentHostCodexAgentCodexHomeEnvVar, settings.codexHome);
+	setIfMissing(AgentHostCodexAgentBinaryPathEnvVar, settings.codexBinaryPath);
 	if (Array.isArray(settings.codexBinaryArgs) && settings.codexBinaryArgs.length > 0) {
 		setIfMissing(AgentHostCodexAgentBinaryArgsEnvVar, JSON.stringify(settings.codexBinaryArgs));
 	}
@@ -659,6 +728,21 @@ export function buildAgentSdkEnv(
 	if (settings.codexAgentEnabled !== undefined) {
 		setIfMissing(AgentHostCodexAgentEnabledEnvVar, settings.codexAgentEnabled ? 'true' : 'false');
 	}
+	if (settings.kimiAgentEnabled !== undefined) {
+		setIfMissing(AgentHostKimiAgentEnabledEnvVar, settings.kimiAgentEnabled ? 'true' : 'false');
+	}
+	if (settings.deepSeekAgentEnabled !== undefined) {
+		setIfMissing(AgentHostDeepSeekAgentEnabledEnvVar, settings.deepSeekAgentEnabled ? 'true' : 'false');
+	}
+	if (settings.piAgentEnabled !== undefined) {
+		setIfMissing(AgentHostPiAgentEnabledEnvVar, settings.piAgentEnabled ? 'true' : 'false');
+	}
+	if (settings.acpAgentEnabled !== undefined) {
+		setIfMissing(AgentHostAcpAgentEnabledEnvVar, settings.acpAgentEnabled ? 'true' : 'false');
+	}
+	if (settings.opencodeAgentEnabled !== undefined) {
+		setIfMissing(AgentHostOpencodeAgentEnabledEnvVar, settings.opencodeAgentEnabled ? 'true' : 'false');
+	}
 	return out;
 }
 
@@ -666,6 +750,11 @@ export function buildAgentSdkEnv(
 export interface IAgentHostSocketInfo {
 	readonly socketPath: string;
 }
+
+/** A catalogue snapshot plus the providers that authoritatively answered it. */
+export type IAgentSessionList = IAgentSessionMetadata[] & {
+	readonly providers?: readonly AgentProvider[];
+};
 
 /** Inspector listener information for the agent host process. */
 export interface IAgentHostInspectInfo {
@@ -810,7 +899,7 @@ export interface IAgentService {
 	authenticate(params: AuthenticateParams): Promise<AuthenticateResult>;
 
 	/** List all available sessions from the Copilot CLI. */
-	listSessions(): Promise<IAgentSessionMetadata[]>;
+	listSessions(): Promise<IAgentSessionList>;
 
 	createSession(config?: IAgentCreateSessionConfig): Promise<URI>;
 
@@ -854,6 +943,9 @@ export interface IAgentService {
 
 	/** Dispose a session in the agent host, freeing SDK resources. */
 	disposeSession(session: URI): Promise<void>;
+
+	/** Persist a session's archived state, with an optional one-shot dirty-change receipt. */
+	setSessionArchived(session: URI, isArchived: boolean, preserveChanges?: boolean): Promise<void>;
 
 	createTerminal(params: CreateTerminalParams): Promise<void>;
 
@@ -1105,7 +1197,7 @@ export interface IAgentConnection {
 
 	// ---- Session lifecycle --------------------------------------------------
 	authenticate(params: AuthenticateParams): Promise<AuthenticateResult>;
-	listSessions(): Promise<IAgentSessionMetadata[]>;
+	listSessions(): Promise<IAgentSessionList>;
 	createSession(config?: IAgentCreateSessionConfig): Promise<URI>;
 	resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult>;
 	sessionConfigCompletions(params: IAgentSessionConfigCompletionsParams): Promise<SessionConfigCompletionsResult>;
@@ -1126,6 +1218,7 @@ export interface IAgentConnection {
 	 */
 	readonly initializeResult: IObservable<InitializeResult | undefined>;
 	disposeSession(session: URI): Promise<void>;
+	setSessionArchived?(session: URI, isArchived: boolean, preserveChanges?: boolean): Promise<void>;
 
 	/**
 	 * Host-level network context for diagnostics (version, OS/arch, account,

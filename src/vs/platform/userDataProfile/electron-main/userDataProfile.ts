@@ -43,7 +43,12 @@ export class UserDataProfilesMainService extends UserDataProfilesService impleme
 		@IProductService productService: IProductService,
 	) {
 		super(stateService, uriIdentityService, environmentService, fileService, logService);
-		this.agentPluginsHome = URI.file(getAgentPluginsPath(environmentService.args, joinPath(environmentService.userHome, productService.dataFolderName)));
+		this.agentPluginsHome = URI.file(getAgentPluginsPath(
+			environmentService.args,
+			joinPath(environmentService.userHome, productService.dataFolderName),
+			environmentService.userHome,
+			productService.agentHostDefaultFumieHome,
+		));
 	}
 
 	protected override createDefaultProfile(): IUserDataProfile {
@@ -71,7 +76,7 @@ export class UserDataProfilesMainService extends UserDataProfilesService impleme
 	}
 }
 
-function getAgentPluginsPath(args: NativeParsedArgs, userHome: URI): string {
+function getAgentPluginsPath(args: NativeParsedArgs, defaultRoot: URI, userHome: URI, fumieHome: string | undefined): string {
 	const cliAgentPluginsDir = args['agent-plugins-dir'];
 	if (cliAgentPluginsDir) {
 		return resolve(cliAgentPluginsDir);
@@ -87,5 +92,14 @@ function getAgentPluginsPath(args: NativeParsedArgs, userHome: URI): string {
 		return join(vscodePortable, 'agent-plugins');
 	}
 
-	return joinPath(userHome, 'agent-plugins').fsPath;
+	if (fumieHome) {
+		const expanded = fumieHome === '~'
+			? userHome.fsPath
+			: fumieHome.startsWith('~/') || fumieHome.startsWith('~\\')
+				? join(userHome.fsPath, fumieHome.slice(2))
+				: resolve(fumieHome);
+		return join(expanded, 'plugins');
+	}
+
+	return joinPath(defaultRoot, 'agent-plugins').fsPath;
 }

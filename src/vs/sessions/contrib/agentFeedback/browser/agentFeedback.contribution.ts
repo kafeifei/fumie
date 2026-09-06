@@ -33,7 +33,7 @@ import { ISessionsService } from '../../../services/sessions/browser/sessionsSer
  * Sets the `hasActiveSessionAgentFeedback` context key to true when the
  * currently active session has pending agent feedback items.
  */
-class ActiveSessionFeedbackContextContribution extends Disposable implements IWorkbenchContribution {
+export class ActiveSessionFeedbackContextContribution extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'workbench.contrib.activeSessionFeedbackContext';
 
@@ -91,7 +91,7 @@ registerAgentFeedbackReviewCommands();
 registerSingleton(IAgentFeedbackService, AgentFeedbackService, InstantiationType.Delayed);
 
 // Register the custom attachment widget for agentFeedback attachments
-class AgentFeedbackAttachmentWidgetContribution {
+export class AgentFeedbackAttachmentWidgetContribution {
 	static readonly ID = 'workbench.contrib.agentFeedbackAttachmentWidgetFactory';
 	constructor(
 		@IChatAttachmentWidgetRegistry registry: IChatAttachmentWidgetRegistry,

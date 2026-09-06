@@ -9,7 +9,7 @@ import { join } from '../../../../base/common/path.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { IWindowState as IWindowUIState, WindowMode } from '../../../window/electron-main/window.js';
-import { getWindowsStateStoreData, IWindowsState, IWindowState, restoreWindowsState } from '../../electron-main/windowsStateHandler.js';
+import { getWindowsStateStoreData, IWindowsState, IWindowState, isAgentSessionsWindowState, restoreWindowsState } from '../../electron-main/windowsStateHandler.js';
 import { IWorkspaceIdentifier } from '../../../workspace/common/workspace.js';
 
 suite('Windows State Storing', () => {
@@ -198,6 +198,24 @@ suite('Windows State Storing', () => {
 			}
 		};
 		assertEqualWindowsState(expected, windowsState, 'v1_32_empty_window');
+	});
+
+	test('isAgentSessionsWindowState matches the Agents workspace and profile basename fallback', () => {
+		const agentsWorkspace = URI.file('/Users/me/Library/Application Support/Code - OSS/User/agent-sessions.code-workspace');
+		const otherProfile = URI.file('/tmp/cod/user-data/User/agent-sessions.code-workspace');
+		const folderWindow: IWindowState = { folderUri: URI.file('/tmp/project'), uiState: getUIState() };
+		const emptyWindow: IWindowState = { backupPath: '/tmp/backup', uiState: getUIState() };
+		const agentsWindow: IWindowState = { workspace: toWorkspace(agentsWorkspace), uiState: getUIState() };
+		const otherProfileAgents: IWindowState = { workspace: toWorkspace(otherProfile), uiState: getUIState() };
+		const otherWorkspace: IWindowState = { workspace: toWorkspace(URI.file('/tmp/other.code-workspace')), uiState: getUIState() };
+
+		assert.strictEqual(isAgentSessionsWindowState(undefined, agentsWorkspace), false);
+		assert.strictEqual(isAgentSessionsWindowState(emptyWindow, agentsWorkspace), false);
+		assert.strictEqual(isAgentSessionsWindowState(folderWindow, agentsWorkspace), false);
+		assert.strictEqual(isAgentSessionsWindowState(otherWorkspace, agentsWorkspace), false);
+		assert.strictEqual(isAgentSessionsWindowState(agentsWindow, agentsWorkspace), true);
+		assert.strictEqual(isAgentSessionsWindowState(otherProfileAgents, agentsWorkspace), true);
+		assert.strictEqual(isAgentSessionsWindowState(agentsWindow, undefined), false);
 	});
 
 	ensureNoDisposablesAreLeakedInTestSuite();

@@ -5,14 +5,12 @@
 
 import './emptyFileEditor.contribution.js';
 import { Codicon } from '../../../../base/common/codicons.js';
-import { generateUuid } from '../../../../base/common/uuid.js';
 import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
 import { localize2 } from '../../../../nls.js';
 import { Action2 } from '../../../../platform/actions/common/actions.js';
 import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
 import { IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
-import { IBrowserViewWorkbenchService } from '../../../../workbench/contrib/browserView/common/browserView.js';
 import { openNewSearchEditor } from '../../../../workbench/contrib/searchEditor/browser/searchEditorActions.js';
 import { IEditorGroupsService } from '../../../../workbench/services/editor/common/editorGroupsService.js';
 import { IEditorService } from '../../../../workbench/services/editor/common/editorService.js';
@@ -118,12 +116,8 @@ export class NewBrowserTabAction extends Action2 {
 		});
 	}
 
-	override async run(accessor: ServicesAccessor): Promise<void> {
-		const browserViewWorkbenchService = accessor.get(IBrowserViewWorkbenchService);
-		const editorService = accessor.get(IEditorService);
-		const browserInput = browserViewWorkbenchService.getOrCreateLazy({ id: generateUuid() });
-
-		await editorService.openEditor(browserInput);
+	override async run(): Promise<void> {
+		// Agents window does not embed a browser in the editor area.
 	}
 }
 

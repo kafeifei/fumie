@@ -77,7 +77,7 @@ registerAction2(class extends Action2 {
 				id: Menus.NewSessionConfig,
 				group: 'navigation',
 				order: 0,
-				when: IsActiveSessionCopilotChatCLI,
+				when: ContextKeyExpr.false(),
 			}],
 		});
 	}

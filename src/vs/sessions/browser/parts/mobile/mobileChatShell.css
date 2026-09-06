@@ -28,6 +28,8 @@
 	padding: 0 4px;
 	padding-top: env(safe-area-inset-top);
 	background: var(--vscode-editor-background);
+	border-bottom: 1px solid color-mix(in srgb, var(--vscode-foreground) 9%, transparent);
+	box-sizing: content-box;
 	flex-shrink: 0;
 	-webkit-touch-callout: none;
 	user-select: none;
@@ -66,11 +68,32 @@
 	background: var(--vscode-toolbar-hoverBackground);
 }
 
+/* A labelled action is much easier to discover than the previous bare plus.
+ * It remains compact enough to coexist with the changes summary. */
+.mobile-top-bar .mobile-top-bar-button.mobile-new-session-button {
+	width: auto;
+	min-width: 68px;
+	height: 36px;
+	margin: 0 4px;
+	padding: 0 12px;
+	gap: 5px;
+	border-radius: var(--vscode-cornerRadius-circle);
+	background: color-mix(in srgb, var(--vscode-textLink-foreground) 12%, transparent);
+	color: var(--vscode-textLink-foreground);
+	font-size: 14px;
+	font-weight: var(--vscode-agents-fontWeight-semiBold);
+}
+
+.mobile-top-bar .mobile-new-session-button .codicon {
+	font-size: 15px;
+}
+
 /* -- Mobile titlebar: Changes pill ------------------------------------- */
 /* Pill-shaped button showing total insertions/deletions for the active session. Tapping opens a quick pick of changed files; selecting one opens the mobile diff view. Hidden when the session has no changes or when on the welcome / new-chat screen. */
 
 .mobile-top-bar .mobile-top-bar-button.mobile-changes-pill {
 	width: auto;
+	max-width: 116px;
 	height: 28px;
 	padding: 0 10px;
 	border-radius: var(--vscode-cornerRadius-circle);
@@ -324,32 +347,30 @@
 	margin-top: auto;
 }
 
-/* ---- Phone Layout: Chat Welcome Page ----
- *
- * The mobile welcome page is laid out as a vertical stack:
- *
- *  - Hero (centered, flex: 1)
- *      hexagon logo
- *      "Start by picking a"  (muted label)
- *      [ <icon> workspace  v ]  (prominent pill picker)
- *
- *  - Chat input (pinned to bottom, edge-to-edge, 16px corners)
- *      "What problem are you solving?" + send button
- *
- *  - Bottom config chip row (horizontally scrollable, just below input)
- *      [ Mode v ]  [ Permissions v ]  [ Worktree v ]  ...
- *
- * Each pill picker uses the same chip style: rounded background, subtle
- * border, ~36-40px touch target, label always visible (the row scrolls
- * horizontally rather than collapsing to icon-only on narrow viewports).
- */
+/* Keep provider-generated welcome copy inside the phone viewport. Remote
+ * providers may use a long encoded id when they have no shorter display name. */
+.agent-sessions-workbench.phone-layout .chat-welcome-view,
+.agent-sessions-workbench.phone-layout .chat-welcome-view .chat-welcome-view-title,
+.agent-sessions-workbench.phone-layout .chat-welcome-view .chat-welcome-view-message {
+	max-width: calc(100vw - 32px);
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+/* The aquarium easter egg has a desktop-sized floating hit target and obscures
+ * the new-session hierarchy on a phone. */
+.agent-sessions-workbench.phone-layout .agents-aquarium-toggle {
+	display: none;
+}
+
+/* ---- Phone Layout: New Session ---- */
 
 /* Make the welcome page a flex column that fills the chat area */
 .agent-sessions-workbench.phone-layout .new-chat-widget-container {
 	display: flex !important;
 	flex-direction: column !important;
 	height: 100% !important;
-	padding: 8px 8px 0 8px !important;
+	padding: 0 10px !important;
 }
 
 .agent-sessions-workbench.phone-layout .new-chat-widget-content {
@@ -360,70 +381,141 @@
 	max-width: 100% !important;
 	/* Honor the iOS home indicator: at least 16px gutter, more when the
 	 * device exposes a safe-area inset. */
-	padding-bottom: max(16px, env(safe-area-inset-bottom)) !important;
+	padding-bottom: max(12px, env(safe-area-inset-bottom)) !important;
 }
 
-/* Workspace picker centered vertically with icon above */
+/* A compact, explicit setup area replaces the sparse logo-only welcome page. */
 .agent-sessions-workbench.phone-layout .new-session-workspace-picker-container {
 	flex: 1 !important;
 	display: flex !important;
 	flex-direction: column !important;
-	align-items: center !important;
-	justify-content: center !important;
+	align-items: stretch !important;
+	justify-content: flex-start !important;
 	max-width: 100% !important;
+	min-height: 0 !important;
+	margin: 0 !important;
+	padding: clamp(20px, 6vh, 48px) 6px 16px !important;
 }
 
-/* Show the sessions logo above the workspace picker — same asset as the auth page */
-.agent-sessions-workbench.phone-layout .new-session-workspace-picker-container::before {
-	content: '';
-	display: block;
-	width: 64px;
-	height: 64px;
-	margin-bottom: 16px;
-	background-image: url('../../media/sessions-logo-light.svg');
-	background-size: contain;
-	background-repeat: no-repeat;
-	background-position: center;
-	opacity: 0.85;
+.agent-sessions-workbench.phone-layout .mobile-new-session-intro {
+	display: grid;
+	grid-template-columns: 44px minmax(0, 1fr);
+	grid-template-rows: auto auto;
+	column-gap: 12px;
+	margin: 0 4px 20px;
 }
 
-.vs .agent-sessions-workbench.phone-layout .new-session-workspace-picker-container::before,
-.hc-light .agent-sessions-workbench.phone-layout .new-session-workspace-picker-container::before {
-	background-image: url('../../media/sessions-logo-dark.svg');
+.agent-sessions-workbench.phone-layout .mobile-new-session-intro-icon {
+	grid-row: 1 / 3;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 44px;
+	height: 44px;
+	border-radius: 13px;
+	background: color-mix(in srgb, var(--vscode-textLink-foreground) 14%, transparent);
+	color: var(--vscode-textLink-foreground);
+	font-size: 20px;
 }
 
-/* Center the picker text */
+.agent-sessions-workbench.phone-layout .mobile-new-session-intro-title {
+	margin: 0;
+	font-size: 20px;
+	line-height: 24px;
+	font-weight: var(--vscode-agents-fontWeight-semiBold);
+}
+
+.agent-sessions-workbench.phone-layout .mobile-new-session-intro-description {
+	margin: 3px 0 0;
+	font-size: 13px;
+	line-height: 18px;
+	color: var(--vscode-descriptionForeground);
+}
+
+/* Workspace and agent are explicit full-width setup rows. */
 .agent-sessions-workbench.phone-layout .session-workspace-picker {
 	display: flex !important;
 	flex-direction: column !important;
-	align-items: center !important;
-	gap: 12px !important;
-	font-size: 16px !important;
+	align-items: stretch !important;
+	gap: 6px !important;
+	padding: 14px !important;
+	border: 1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+	border-radius: 16px;
+	background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
 }
 
 .agent-sessions-workbench.phone-layout .session-workspace-picker-label {
-	font-size: 17px;
+	font-size: 12px;
+	line-height: 16px;
+	font-weight: var(--vscode-agents-fontWeight-semiBold);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
 	color: var(--vscode-descriptionForeground);
-	opacity: 0.85;
+}
+
+.agent-sessions-workbench.phone-layout .session-workspace-picker-with-label {
+	display: none;
 }
 
 /* Promote the central workspace picker into a prominent pill so the empty
  * state has a clearly tappable hero affordance, mirroring the inspiration
  * design's "<icon> workspace v" chip. */
 .agent-sessions-workbench.phone-layout .session-workspace-picker .sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label {
+	display: flex;
+	width: 100%;
 	height: auto;
-	min-height: 36px;
-	padding: 2px 6px;
-	font-size: 17px;
-	border-radius: var(--vscode-cornerRadius-circle);
-	background-color: var(--vscode-toolbar-hoverBackground, transparent);
-	border: 1px solid var(--vscode-commandCenter-inactiveBorder, var(--vscode-commandCenter-border, transparent));
-	gap: 4px;
+	min-height: 44px;
+	padding: 8px 10px;
+	font-size: 16px;
+	border-radius: 11px;
+	background-color: var(--vscode-input-background, var(--vscode-toolbar-hoverBackground));
+	border: 1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+	gap: 7px;
 	touch-action: manipulation;
+	box-sizing: border-box;
+}
+
+.agent-sessions-workbench.phone-layout .session-workspace-picker .sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label .sessions-chat-dropdown-label {
+	flex: 1;
+	min-width: 0;
+	text-align: left;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.agent-sessions-workbench.phone-layout .session-workspace-picker .sessions-chat-session-type-picker .action-label {
+	min-height: 40px;
+	padding: 7px 10px;
+	border-radius: 11px;
+	background: transparent;
+	font-size: 14px;
 }
 
 .agent-sessions-workbench.phone-layout .session-workspace-picker .sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label:active {
 	background-color: var(--vscode-toolbar-activeBackground, var(--vscode-toolbar-hoverBackground, transparent));
+}
+
+.agent-sessions-workbench.phone-layout .session-workspace-picker .new-chat-repo-config-container {
+	margin-left: 0;
+	width: 100%;
+	overflow-x: auto;
+}
+
+.agent-sessions-workbench.phone-layout .session-workspace-picker .new-chat-repo-config-container .monaco-action-bar .actions-container,
+.agent-sessions-workbench.phone-layout .session-workspace-picker .new-chat-repo-config-container .sessions-chat-agent-host-config {
+	display: flex;
+	flex-wrap: nowrap;
+	align-items: center;
+	gap: 6px;
+	min-width: max-content;
+}
+
+.agent-sessions-workbench.phone-layout .session-workspace-picker .new-chat-repo-config-container .action-label {
+	min-height: 40px;
+	height: auto;
+	padding: 7px 10px;
+	border-radius: 11px;
+	font-size: 14px;
 }
 
 /* Input slot pinned to the bottom. Flex `order` puts the chip row
@@ -435,12 +527,14 @@
 	flex-shrink: 0 !important;
 	padding: 0 !important;
 	max-width: 100% !important;
+	margin-top: 8px !important;
 }
 
 /* Make the chat input full-width and edge-to-edge styled */
 .agent-sessions-workbench.phone-layout .sessions-chat-input-area {
-	border-radius: 16px !important;
+	border-radius: 18px !important;
 	max-width: 100% !important;
+	box-shadow: 0 5px 18px color-mix(in srgb, #000 16%, transparent);
 }
 
 /* ---- Phone Layout: Config Chip Row ----
@@ -499,7 +593,7 @@
 	gap: 6px;
 	/* Tight insets so the chip row reads as a compact strip docked just
 	 * above the input — matches the inset of the input box itself. */
-	padding: 6px 12px 8px;
+	padding: 6px 4px 8px;
 	/* Pin the lane to the viewport's available width so it never grows
 	 * past it. Without `width: 100%` + `min-width: 0` the flex layout
 	 * above lets the lane stretch with its inline children, and
@@ -512,7 +606,7 @@
 	 * little vertical breathing room. Using `height` (rather than
 	 * `min-height`) keeps the hero icon stable across provider swaps
 	 * and chip-load transitions. */
-	height: 50px;
+	height: 46px;
 	box-sizing: border-box;
 	overflow-x: auto;
 	overflow-y: visible;
@@ -903,20 +997,30 @@
 }
 
 /* -- Phone: Sessions list header --------------------------------------- */
-/* The desktop header row (Sessions label + New + Filter + Find toolbar) is hidden on phone in favor of the filter-chips row and the (+) button in MobileTitlebarPart. The row container itself is still rendered because the tree's find widget mounts inside it; the `phone-layout-empty` class is removed when the find widget is open so the row reappears for searching. */
+/* Desktop chrome (sidebar nav + WORKSPACES header) is hidden on
+ * phone in favor of the filter-chips row and the (+) button in MobileTitlebarPart.
+ * The header row container is still rendered because the tree's find widget
+ * mounts inside it; the `phone-layout-empty` class is removed when the find
+ * widget is open so the row reappears for searching. */
+
+.agent-sessions-workbench.phone-layout .agent-sessions-sidebar-nav,
+.agent-sessions-workbench.phone-layout .agent-sessions-workspaces-header,
+.agent-sessions-workbench.phone-layout .agent-sessions-new-agent-row {
+	display: none;
+}
 
 .agent-sessions-workbench.phone-layout .agent-sessions-header-row.phone-layout-empty {
 	display: none;
 }
 
-/* On phone the label / actions slots are intentionally left empty (the
- * desktop header content is replaced by the mobile filter chips and the
- * (+) button in MobileTitlebarPart). When the find widget opens the row
- * becomes visible, but these two empty flex children would still occupy
- * leading space because of `gap` between siblings. Collapse them so the
- * find input sits flush with the row's leading edge. */
-.agent-sessions-workbench.phone-layout .agent-sessions-header-row > .agent-sessions-header-label,
-.agent-sessions-workbench.phone-layout .agent-sessions-header-row > .agent-sessions-header-actions {
+/* On phone the actions / search-trigger slots are unused (the desktop header
+ * content is replaced by the mobile filter chips and the (+) button in
+ * MobileTitlebarPart). When the find widget opens the row becomes visible,
+ * but these empty flex children would still occupy leading space because of
+ * `gap` between siblings. Collapse them so the find input sits flush with
+ * the row's leading edge. */
+.agent-sessions-workbench.phone-layout .agent-sessions-header-row > .agent-sessions-header-actions,
+.agent-sessions-workbench.phone-layout .agent-sessions-header-row > .agent-sessions-search-trigger {
 	display: none;
 }
 

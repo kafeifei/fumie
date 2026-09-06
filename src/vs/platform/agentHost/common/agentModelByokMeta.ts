@@ -20,11 +20,30 @@ import type { IAgentModelInfo } from './agent.js';
 export const BYOK_MODEL_IDENTIFIER_META_KEY = 'byokModelIdentifier';
 
 /**
- * Builds a `_meta` payload carrying the BYOK model identifier, or `undefined` when there
- * is none so callers can avoid attaching an empty `_meta` object.
+ * Well-known key marking a BYOK model the host's serving window has hidden in its own
+ * "Manage Models" page, carried under the same open `_meta` bag.
+ *
+ * Only set when hidden, and only by the host: it is the host's visibility state, not the
+ * reading client's. A client that reaches the catalog only through a host — the Agents
+ * window in a browser — has no other copy of that state, so without this key it cannot
+ * tell a hidden row from one the user never configured. Absent means "not hidden by the
+ * host", which is also what an older host says by saying nothing.
  */
-export function createAgentModelByokMeta(modelIdentifier: string | undefined): Record<string, unknown> | undefined {
-	return modelIdentifier !== undefined ? { [BYOK_MODEL_IDENTIFIER_META_KEY]: modelIdentifier } : undefined;
+export const BYOK_MODEL_HIDDEN_META_KEY = 'byokModelHidden';
+
+/**
+ * Builds a `_meta` payload carrying the BYOK model identifier and, when the serving
+ * window has the model hidden, the hidden marker. Returns `undefined` when there is
+ * nothing to carry so callers can avoid attaching an empty `_meta` object.
+ */
+export function createAgentModelByokMeta(modelIdentifier: string | undefined, hidden?: boolean): Record<string, unknown> | undefined {
+	if (modelIdentifier === undefined) {
+		return undefined;
+	}
+	return {
+		[BYOK_MODEL_IDENTIFIER_META_KEY]: modelIdentifier,
+		...(hidden ? { [BYOK_MODEL_HIDDEN_META_KEY]: true } : {}),
+	};
 }
 
 /**
@@ -38,4 +57,14 @@ export function readAgentModelByokIdentifier(model: IAgentModelInfo | SessionMod
 	}
 	const value = meta[BYOK_MODEL_IDENTIFIER_META_KEY];
 	return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Reads the host's hidden marker from a model's open `_meta` bag, ignoring unrelated
+ * keys and values of the wrong type. `false` for anything that does not say `true`,
+ * including a host old enough not to publish the key at all.
+ */
+export function readAgentModelByokHidden(model: IAgentModelInfo | SessionModelInfo): boolean {
+	const meta = model._meta;
+	return meta !== undefined && meta[BYOK_MODEL_HIDDEN_META_KEY] === true;
 }

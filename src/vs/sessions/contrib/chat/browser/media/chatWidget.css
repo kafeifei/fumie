@@ -14,9 +14,10 @@
 .new-chat-widget-container {
 	display: flex;
 	flex-direction: column;
-	/* Cross-axis: keep children flush left so the input's left edge — and therefore
-	 * the attach (+) button — stays anchored as the viewport narrows past max-width. */
-	align-items: flex-start;
+	/* The new-session composer is the landing surface. It shares behavior with
+	 * the created-session composer, but keeps its own centered presentation. */
+	--sessions-new-chat-max-width: 640px;
+	align-items: center;
 	justify-content: center;
 	width: 100%;
 	height: 100%;
@@ -42,7 +43,7 @@
 .new-session-workspace-picker-container {
 	display: none;
 	width: 100%;
-	max-width: 800px;
+	max-width: var(--sessions-new-chat-max-width, 640px);
 	padding: 0;
 	box-sizing: border-box;
 	margin-bottom: var(--vscode-spacing-size20);
@@ -70,6 +71,12 @@
 	margin-bottom: 0;
 }
 
+/* Phone-only onboarding copy. The mobile shell promotes this into a compact
+ * new-session header; keep it out of the established desktop welcome layout. */
+.mobile-new-session-intro {
+	display: none;
+}
+
 /* Quick chat composer: no workspace to pick, so hide the picker row entirely. */
 .new-chat-widget-content.quick-chat .new-session-workspace-picker-container {
 	display: none;
@@ -88,7 +95,7 @@
 
 .new-chat-widget-content {
 	width: 100%;
-	max-width: 800px;
+	max-width: var(--sessions-new-chat-max-width, 640px);
 	display: flex;
 	flex-direction: column;
 	align-items: stretch;
@@ -97,7 +104,7 @@
 
 .new-chat-widget-container .new-chat-bottom-container {
 	width: 100%;
-	max-width: 800px;
+	max-width: var(--sessions-new-chat-max-width, 640px);
 	margin-top: 4px;
 	padding: 0 4px;
 	box-sizing: border-box;
@@ -240,6 +247,56 @@
 	justify-content: center;
 }
 
+/* Compact harness inside the input and permissions below it. */
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .new-chat-session-type-picker-host,
+.new-chat-widget-container .sessions-chat-composer-controls .new-chat-session-controls {
+	display: flex;
+	align-items: center;
+	min-width: 0;
+	max-width: 200px;
+}
+
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .new-chat-session-type-picker-host,
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .sessions-chat-session-type-picker,
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .sessions-chat-session-type-picker .action-label {
+	min-width: 0;
+	overflow: hidden;
+}
+
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .new-chat-session-type-picker-host:empty,
+.new-chat-widget-container .sessions-chat-composer-controls .new-chat-session-controls:empty {
+	display: none;
+}
+
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .sessions-chat-session-type-picker .action-label,
+.new-chat-widget-container .sessions-chat-composer-controls .new-chat-session-controls .action-label {
+	display: flex;
+	align-items: center;
+	height: 16px;
+	padding: 0;
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	line-height: 16px;
+	color: var(--vscode-icon-foreground);
+}
+
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .sessions-chat-session-type-picker .action-label > .codicon,
+.new-chat-widget-container .sessions-chat-composer-controls .new-chat-session-controls .action-label > .codicon {
+	font-size: var(--vscode-codiconFontSize-compact, 12px);
+	width: auto;
+	height: auto;
+}
+
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .sessions-chat-session-type-picker .action-label > .codicon-chevron-down,
+.new-chat-widget-container .sessions-chat-composer-controls .new-chat-session-controls .action-label > .codicon-chevron-down {
+	display: none;
+}
+
+.new-chat-widget-container .new-chat-input-area .sessions-chat-toolbar .sessions-chat-session-type-picker .sessions-chat-dropdown-label,
+.new-chat-widget-container .sessions-chat-composer-controls .new-chat-session-controls .sessions-chat-dropdown-label {
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	margin-left: 4px;
+}
+
 /* Pickers row */
 .session-workspace-picker {
 	display: flex;
@@ -255,6 +312,55 @@
 
 .new-chat-widget-container .new-session-workspace-picker-container .sessions-chat-workspace-picker {
 	max-width: 400px;
+	min-width: 0;
+	flex: 0 1 auto;
+}
+
+/* Original Branch / New Worktree chips, next to the folder picker. */
+.session-workspace-picker .new-chat-repo-config-container {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	min-width: 0;
+	margin-left: 4px;
+}
+
+.session-workspace-picker .new-chat-repo-config-container:not(:has(.action-item)):not(:has(.sessions-chat-picker-slot)) {
+	display: none;
+}
+
+.session-workspace-picker .new-chat-repo-config-container > *,
+.session-workspace-picker .new-chat-repo-config-container .sessions-chat-picker-slot .action-label {
+	min-width: 0;
+	overflow: hidden;
+}
+
+.session-workspace-picker .new-chat-repo-config-container .monaco-action-bar .actions-container {
+	gap: 2px;
+}
+
+.session-workspace-picker .new-chat-repo-config-container .action-label {
+	height: 16px;
+	padding: 3px 8px;
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	color: var(--vscode-icon-foreground);
+}
+
+.session-workspace-picker .new-chat-repo-config-container .action-label > .codicon {
+	font-size: var(--vscode-codiconFontSize-compact, 12px);
+	width: auto;
+	height: auto;
+}
+
+.session-workspace-picker .new-chat-repo-config-container .action-label > .codicon-chevron-down,
+.session-workspace-picker .new-chat-repo-config-container .sessions-chat-picker-slot .action-label > .codicon-chevron-down,
+.session-workspace-picker .new-chat-repo-config-container .monaco-action-bar .action-item .action-label > .codicon-chevron-down {
+	display: none;
+}
+
+.session-workspace-picker .new-chat-repo-config-container .sessions-chat-dropdown-label {
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	margin-left: 4px;
 }
 
 .new-chat-widget-container .sessions-chat-session-type-picker,
@@ -277,9 +383,9 @@
 	display: none;
 }
 
-/* Project picker in inline title row */
-.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label,
-.sessions-chat-picker-slot.sessions-chat-session-type-picker .action-label {
+/* Project picker in the new-session title row. Harness lives next to the
+ * model picker in the composer toolbar and uses that row's 16px / 11px metrics. */
+.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label {
 	height: auto;
 	padding: 4px;
 	font-size: var(--vscode-agents-fontSize-heading2, 18px);
@@ -291,25 +397,21 @@
 	touch-action: manipulation;
 }
 
-.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label:hover,
-.sessions-chat-picker-slot.sessions-chat-session-type-picker .action-label:hover {
+.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label:hover {
 	background-color: var(--vscode-toolbar-hoverBackground);
 	color: var(--vscode-foreground);
 }
 
-.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label .sessions-chat-dropdown-label,
-.sessions-chat-picker-slot.sessions-chat-session-type-picker .action-label .sessions-chat-dropdown-label {
+.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label .sessions-chat-dropdown-label {
 	font-size: var(--vscode-agents-fontSize-heading2, 18px);
 }
 
-.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label > .codicon:not(.sessions-chat-dropdown-chevron),
-.sessions-chat-picker-slot.sessions-chat-session-type-picker .action-label > .codicon:not(.sessions-chat-dropdown-chevron) {
+.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label > .codicon:not(.sessions-chat-dropdown-chevron) {
 	font-size: var(--vscode-codiconFontSize, 16px);
 	margin: 0;
 }
 
-.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label .sessions-chat-dropdown-chevron,
-.sessions-chat-picker-slot.sessions-chat-session-type-picker .action-label .sessions-chat-dropdown-chevron {
+.sessions-chat-picker-slot.sessions-chat-workspace-picker .action-label .sessions-chat-dropdown-chevron {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;

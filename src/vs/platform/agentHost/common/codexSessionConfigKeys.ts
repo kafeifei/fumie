@@ -15,6 +15,9 @@
  * `ApprovalsReviewer`). Protocol-typed narrowing helpers live alongside the
  * node agent in `node/codex/codexSessionConfigKeys.ts`.
  */
+import type { AutoApproveLevel } from './agentHostSchema.js';
+import { SessionConfigKey } from './sessionConfigKeys.js';
+
 export const enum CodexSessionConfigKey {
 	PermissionsPreset = 'codex.permissionsPreset',
 	ApprovalPolicy = 'codex.approvalPolicy',
@@ -53,7 +56,7 @@ export const CODEX_DEFAULT_PERMISSIONS_PRESET: CodexPermissionsPreset = 'default
 
 /** Returns Codex's provider-native configuration for unattended Agent Merge turns. */
 export function getCodexAutonomousSessionConfig(policyRestricted: boolean): Record<string, unknown> | undefined {
-	return policyRestricted ? undefined : { [CodexSessionConfigKey.PermissionsPreset]: 'auto-review' satisfies CodexPermissionsPreset };
+	return policyRestricted ? undefined : { [SessionConfigKey.AutoApprove]: 'assisted' satisfies AutoApproveLevel };
 }
 
 /**

@@ -199,7 +199,7 @@ function renderTitleBar(ctx: ComponentFixtureContext, state: ITitleBarState): vo
 
 export default defineThemedFixtureGroup({ path: 'sessions/' }, {
 
-	// Default: shows the active session workspace.
+	// Default: shows the active session title as display text.
 	SessionsTitleBar_ActiveSession: defineComponentFixture({
 		render: (ctx) => renderTitleBar(ctx, {
 			activeSession: createMockActiveSession('Fix authentication redirect loop', 'vscode'),

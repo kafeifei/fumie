@@ -3,12 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { McpServerConfig, OnElicitation, Options, PermissionMode, SDKUserMessage, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
+import type { McpServerConfig, OnElicitation, Options, PermissionMode, SDKRateLimitInfo, SDKUserMessage, SessionStore, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { Sequencer } from '../../../../base/common/async.js';
+import { DeferredPromise, Sequencer } from '../../../../base/common/async.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
-import { Disposable, DisposableStore, MutableDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, MutableDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { isEqual } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { INativeEnvironmentService } from '../../../environment/common/environment.js';
@@ -31,7 +31,8 @@ import type { ClientPluginCustomization, CustomizationEnablement } from '../../c
 import { CustomizationType, parseRequiredSessionUriFromChatUri, type Customization, type ToolCallResult } from '../../common/state/sessionState.js';
 import { IClaudeAgentSdkService } from './claudeAgentSdkService.js';
 import { buildClientMcpServers, buildOptions, toClaudeMcpServers, type ClaudeDeniedMcpServerSpec } from './claudeSdkOptions.js';
-import { claudeTransportForProvider, parseClaudeModelSelection, toClaudeSdkModelId } from './claudeModelSelection.js';
+import { IClaudeBackingStore } from './claudeBackingStore.js';
+import { claudeTransportForProvider, parseClaudeByokSelection, parseClaudeModelSelection, toClaudeSdkModelId } from './claudeModelSelection.js';
 import { buildServerToolMcpServer, CLAUDE_SERVER_TOOL_MCP_SERVER_NAME, serverToolAllowList } from './claudeServerToolMcpServer.js';
 import { convertToolCallResult } from './clientTools/claudeClientToolResult.js';
 import { readClaudePermissionMode } from './claudeSessionPermissionMode.js';
@@ -61,6 +62,8 @@ import { GITHUB_MCP_SERVER_NAME, resolveGitHubMcpServerConfiguration } from '../
 import { ICopilotApiService } from '../shared/copilotApiService.js';
 import { IAgentHostAuthenticationService } from '../agentHostAuthenticationService.js';
 import { IAgentHostGitHubEndpointService } from '../agentHostGitHubEndpointService.js';
+import { IProductService } from '../../../product/common/productService.js';
+import { composeSessionHostContext } from '../../common/sessionHostContext.js';
 
 // Re-export for callers that import IRematerializer from the session.
 export type { IRematerializer } from './claudeSdkPipeline.js';
@@ -142,8 +145,8 @@ function toClaudeDeniedMcpServer(definition: IMcpServerDefinition): ClaudeDenied
  *   • SDK identity, exact chat channel, workspace, and working directories.
  *   • The {@link ClaudeSdkPipeline} that drives the SDK Query lifecycle
  *     and emits every {@link AgentSignal} for this session (router-
- *     mapped per-message signals plus `ChatTurnComplete` and
- *     `steering_consumed`).
+ *     mapped per-message signals plus turn-boundary actions, including
+ *     pending-to-turn steering promotion).
  *   • Pending-permission and pending-user-input registries (Phase 7),
  *     surfaced via `requestPermission` / `requestUserInput`.
  */
@@ -189,7 +192,8 @@ export class ClaudeAgentSession extends Disposable {
 	/** Resolved project metadata captured at create time (if any). */
 	readonly project: IAgentSessionProjectInfo | undefined;
 	/** Always-present abort controller; wired into `Options.abortController` at materialize time. */
-	readonly abortController: AbortController;
+	private _abortController: AbortController;
+	get abortController(): AbortController { return this._abortController; }
 
 	/**
 	 * The actual directory work is done in. Defaults to {@link workspace} until
@@ -314,6 +318,9 @@ export class ClaudeAgentSession extends Disposable {
 
 	private readonly _onDidSessionProgress = this._register(new Emitter<AgentSignal>());
 	readonly onDidSessionProgress: Event<AgentSignal> = this._onDidSessionProgress.event;
+
+	private readonly _onDidRateLimitInfo = this._register(new Emitter<SDKRateLimitInfo>());
+	readonly onDidRateLimitInfo: Event<SDKRateLimitInfo> = this._onDidRateLimitInfo.event;
 
 	/**
 	 * Real Copilot credits (in nano-AIU) billed by CAPI for the current
@@ -447,6 +454,7 @@ export class ClaudeAgentSession extends Disposable {
 		@IAgentConfigurationService private readonly _configurationService: IAgentConfigurationService,
 		@IAgentHostOTelService private readonly _otelService: IAgentHostOTelService,
 		@IClaudeAgentSdkService private readonly _sdkService: IClaudeAgentSdkService,
+		@IClaudeBackingStore private readonly _backingStore: IClaudeBackingStore,
 		@ISessionDataService private readonly _sessionDataService: ISessionDataService,
 		@ILogService private readonly _logService: ILogService,
 		@IFileService private readonly _fileService: IFileService,
@@ -455,6 +463,7 @@ export class ClaudeAgentSession extends Disposable {
 		@ICopilotApiService private readonly _copilotApiService: ICopilotApiService,
 		@IAgentHostAuthenticationService private readonly _authenticationService: IAgentHostAuthenticationService,
 		@IAgentHostGitHubEndpointService private readonly _gitHubEndpointService: IAgentHostGitHubEndpointService,
+		@IProductService private readonly _productService: IProductService,
 	) {
 		super();
 		this._chatChannelUri = chatChannelUri;
@@ -468,10 +477,14 @@ export class ClaudeAgentSession extends Disposable {
 		this._provisionalModel = model;
 		this._provisionalAgent = agent;
 		this.provisionalConfig = config;
-		this.abortController = abortController;
+		this._abortController = abortController;
 		this._desiredAdditionalDirectories = additionalDirectories;
 		this._appliedAdditionalDirectories = additionalDirectories;
 		this._hostCustomizations = [];
+		// A session torn down before (or while) materializing never installs a
+		// pipeline, so release the waiters instead of leaving them parked on a
+		// runtime that will never exist.
+		this._register(toDisposable(() => this._pipelineReady.complete()));
 		this.toolDiff = this._register(toolDiff);
 		this._register(this.clientCustomizationsDiff.onDidChange(() => this._onDidCustomizationsChange.fire()));
 		this._register(this._customizationEnablementService.onDidChange(event => {
@@ -555,6 +568,17 @@ export class ClaudeAgentSession extends Disposable {
 	 * write is safe regardless of the pipeline's own dbRef lifecycle (the
 	 * ref-count keeps the shared DB alive; disposing only decrements).
 	 */
+	/**
+	 * The transcript namespace every Fumie-spawned subprocess writes into.
+	 * Both halves always travel together — see {@link IBuildOptionsInput.store}.
+	 */
+	private _sdkStore(): { sessionStore: SessionStore; configDir: string } {
+		return {
+			sessionStore: this._backingStore.fumieStore,
+			configDir: this._backingStore.subprocessConfigDir,
+		};
+	}
+
 	private async _withDatabase(resource: URI, fn: (db: ISessionDatabase) => Promise<void>): Promise<void> {
 		const ref = this._sessionDataService.openDatabase(resource);
 		try {
@@ -625,11 +649,26 @@ export class ClaudeAgentSession extends Disposable {
 		const agentName = await resolveClaudeAgentName(this._provisionalAgent, this._fileService, this._logService, this.sessionId);
 		const telemetry = await this._otelService.getNativeSdkTelemetryConfig();
 		const traceContext = this._otelService.getSessionTraceContext(this.sessionId, ctx.resource.toString());
+		// Shares the user's global `CLAUDE.md` into the isolated home. Idempotent
+		// per start, and best-effort: instructions going missing is a degraded
+		// session, but failing here would be no session at all.
+		try {
+			await this._backingStore.prepareFumieHome();
+		} catch (err) {
+			this._logService.warn(`[Claude] Could not share instructions into the isolated home for ${this.sessionId}`, err);
+		}
+		// The link above is only readable by the transports that load user
+		// settings from disk; native pins `settingSources: []`, so it also needs
+		// the text itself. `buildOptions` decides which transports consume it.
+		// Read once per materialize, like the telemetry snapshot above: the
+		// yield-restart rebuild below reuses it.
+		const globalClaudeMd = await this._backingStore.readGlobalClaudeMd();
 
 		const options = await buildOptions(
 			{
 				sessionId: this.sessionId,
 				workingDirectory: this.workingDirectory,
+				store: this._sdkStore(),
 				additionalDirectories: this._appliedAdditionalDirectories,
 				model: this._provisionalModel,
 				abortController: this.abortController,
@@ -646,6 +685,8 @@ export class ClaudeAgentSession extends Disposable {
 				telemetry,
 				traceContext,
 				getUserPromptAdditionalContext: () => this._hostInstructions?.join('\n\n'),
+				systemPromptAppend: composeSessionHostContext(this._productService),
+				globalClaudeMd,
 			},
 			ctx.transport,
 			data => this._logService.error(`[Claude SDK stderr] ${data}`),
@@ -680,7 +721,12 @@ export class ClaudeAgentSession extends Disposable {
 			throw err;
 		}
 		this._register(pipeline.onDidProduceSignal(s => this._onDidSessionProgress.fire(this._enrichSignalWithMcpContributor(this._enrichSignalWithCredits(s)))));
+		this._register(pipeline.onDidRateLimitInfo(info => this._onDidRateLimitInfo.fire(info)));
 		this._pipeline = pipeline;
+		// The control plane is reachable from here on, so anyone parked on
+		// {@link whenPipelineReady} can proceed while the rest of materialize
+		// (MCP reconciliation, server-tool advertisement) settles.
+		this._pipelineReady.complete();
 		this._register(this._configurationService.onDidSessionConfigChange(event => {
 			if (!event.origin || event.session !== ctx.configResource.toString()) {
 				return;
@@ -744,6 +790,7 @@ export class ClaudeAgentSession extends Disposable {
 					{
 						sessionId: this.sessionId,
 						workingDirectory: this.workingDirectory!,
+						store: this._sdkStore(),
 						additionalDirectories: this._desiredAdditionalDirectories,
 						model: this._provisionalModel,
 						abortController: rebuildAbort,
@@ -760,6 +807,8 @@ export class ClaudeAgentSession extends Disposable {
 						telemetry,
 						traceContext,
 						getUserPromptAdditionalContext: () => this._hostInstructions?.join('\n\n'),
+						systemPromptAppend: composeSessionHostContext(this._productService),
+						globalClaudeMd,
 					},
 					rebuildTransport,
 					data => this._logService.error(`[Claude SDK stderr] ${data}`),
@@ -961,12 +1010,50 @@ export class ClaudeAgentSession extends Disposable {
 	/** True once {@link materialize} has installed the SDK pipeline. */
 	get isPipelineReady(): boolean { return this._pipeline !== undefined; }
 
+	/** Called only at the next serialized send, after the cancelled startup settled. */
+	resetCancelledProvisional(): boolean {
+		if (this._pipeline || !this._abortController.signal.aborted) {
+			return false;
+		}
+		this._abortController = new AbortController();
+		return true;
+	}
+
+	/**
+	 * Settles once this session's fate as a runtime is decided: either
+	 * {@link materialize} has installed the SDK pipeline, or the session was
+	 * torn down without ever reaching one. Never rejects — a caller awaits it
+	 * and then re-reads {@link isPipelineReady} to learn which of the two
+	 * happened.
+	 *
+	 * Exists for the control-plane caller that arrives while the first send is
+	 * still materializing (session naming, which the host issues off the very
+	 * first message): waiting here reaches the same Query the first turn runs
+	 * on, without a second startup and without queueing behind that turn on
+	 * the agent's send sequencer.
+	 */
+	get whenPipelineReady(): Promise<void> { return this._pipelineReady.p; }
+	private readonly _pipelineReady = new DeferredPromise<void>();
+
 	/**
 	 * Whether this chat currently has a turn in flight or queued. False when
 	 * provisional (no pipeline) or idle between turns. Used by non-destructive
 	 * idle release to avoid disconnecting mid-turn.
 	 */
 	get hasActiveTurn(): boolean { return this._pipeline?.hasActiveTurn ?? false; }
+
+	/**
+	 * Whether this chat's subprocess is still hosting a background subagent
+	 * that has not reported back. Read alongside {@link hasActiveTurn} by the
+	 * idle-release gates: the turn can be long finished while background work
+	 * continues inside the same CLI process, and releasing the chat aborts it.
+	 *
+	 * Read through the pipeline rather than {@link subagents} directly: the
+	 * registry outlives materialization, but there is nothing to keep alive
+	 * until a subprocess exists (and a provisional chat is already trivially
+	 * releasable).
+	 */
+	get hasOpenBackgroundSubagents(): boolean { return this._pipeline?.hasOpenBackgroundSubagents ?? false; }
 
 	/** Pre-materialize model selection accessor (read by materializer to build Options). */
 	get provisionalModel(): ModelSelection | undefined { return this._provisionalModel; }
@@ -1030,6 +1117,11 @@ export class ClaudeAgentSession extends Disposable {
 	 *   The pipeline's bijective cache dedupes a no-op `setPermissionMode`,
 	 *   so this is free when nothing changed.
 	 *
+	 * The rebuild is deferred — not skipped — while a turn is in flight or a
+	 * background subagent is still running inside the subprocess; see
+	 * {@link _rebindForSyncedState}. The turn then goes out with the config the
+	 * SDK already has, and the next send rebuilds.
+	 *
 	 * When {@link hasPendingTransportSwitch} is set, the agent resolves the new
 	 * transport (it owns the live proxy handle) and passes it as `switchTransport`.
 	 * It is staged for the pre-flight rebuild below, which rebinds the subprocess
@@ -1072,6 +1164,15 @@ export class ClaudeAgentSession extends Disposable {
 		}
 	}
 
+	/**
+	 * Generate a title through Claude's live control plane. Out of band: no
+	 * user turn is sent and nothing is appended to the transcript. Throws if
+	 * the session has no pipeline yet (not materialized).
+	 */
+	generateSessionTitle(description: string): Promise<string | undefined> {
+		return this._requirePipeline().generateSessionTitle(description);
+	}
+
 	private _replaceDesiredWorkingDirectories(workingDirectories: readonly URI[]): void {
 		const primary = this.workingDirectory;
 		if (!primary || !isEqual(primary, workingDirectories[0])) {
@@ -1097,6 +1198,25 @@ export class ClaudeAgentSession extends Disposable {
 	 * resolved server-side entries from the rebuilt `Query`.
 	 */
 	private async _rebindForSyncedState(): Promise<void> {
+		if (this._pipeline?.hasActiveTurn) {
+			// Rebinding mid-turn tears down the subprocess holding the
+			// in-flight prompt and the fresh one never receives it. Every
+			// dirty condition that routes here persists, so the pre-send
+			// sync applies it when the next turn starts.
+			this._logService.info(`[Claude:${this.sessionId}] deferring rebind: turn in flight`);
+			return;
+		}
+		if (this._pipeline?.hasOpenBackgroundSubagents) {
+			// Same reasoning one step out: a background subagent is an
+			// in-process task of this very subprocess, so rebinding between
+			// turns kills work the user started and never asked to stop. The
+			// user only sent another message; answering it with the config the
+			// SDK already has is cheaper than losing that task. Every dirty
+			// condition persists, so the next send rebinds once the background
+			// work is done.
+			this._logService.info(`[Claude:${this.sessionId}] deferring rebind: background subagent still running`);
+			return;
+		}
 		this._pendingClientToolCalls.rejectAll(new CancellationError());
 		await this._requirePipeline().rebindForRestart();
 		this._onDidCustomizationsChange.fire();
@@ -1143,11 +1263,19 @@ export class ClaudeAgentSession extends Disposable {
 		// masquerade as a native→proxy switch on a native session (mirrors the same
 		// guard in `resolveClaudeSessionTransport`). Only a genuinely
 		// provider-qualified id can move a live session across transports.
+		//
+		// A BYOK id is its own case: the loopback endpoint baked into the live
+		// subprocess's env is per-vendor, so arriving from another transport — or
+		// from another vendor — is a cross-transport move even though the id
+		// carries no `@provider=` qualification. Same-vendor model changes stay a
+		// hot-swap (the endpoint is unchanged; only the request body's model moves).
+		const byok = parseClaudeByokSelection(model);
 		const parsed = parseClaudeModelSelection(model);
+		const materialized = this._materializedTransport;
 		const crossesTransport =
-			this.isPipelineReady &&
-			parsed.explicitProvider &&
-			claudeTransportForProvider(parsed.provider) !== this._transportKind;
+			this.isPipelineReady && (byok
+				? materialized?.kind !== 'byok' || materialized.vendor !== byok.vendor
+				: parsed.explicitProvider && claudeTransportForProvider(parsed.provider) !== this._transportKind);
 		if (crossesTransport) {
 			// Cross-transport switch on a live session: the running subprocess is
 			// pinned to the old transport/credential, and pushing the new model onto
@@ -1212,14 +1340,17 @@ export class ClaudeAgentSession extends Disposable {
 
 	/**
 	 * Inject a steering message. Builds the `priority: 'now'`
-	 * {@link SDKUserMessage} and hands it to the pipeline; the pipeline
-	 * inherits the parent's turnId (CONTEXT.md M10) and fires
-	 * `steering_consumed` when the SDK accepts it. No-op if the pipeline
-	 * is aborted.
+	 * {@link SDKUserMessage} and hands it to the pipeline together with the
+	 * pending protocol message. The pipeline retains that message until the
+	 * SDK's preemption result, then promotes it into a fresh visible turn.
+	 * No-op if the pipeline is aborted or not yet materialized (steering can
+	 * race the first send's materialization); the message stays in the
+	 * pending slot and the host requeues it as a queued message at turn end.
 	 */
 	injectSteering(steeringMessage: PendingMessage): void {
-		const pipeline = this._requirePipeline();
-		if (pipeline.isAborted) {
+		const pipeline = this._pipeline;
+		if (!pipeline || pipeline.isAborted) {
+			this._logService.info(`[Claude:${this.sessionId}] injectSteering: skipped (${pipeline ? 'pipeline aborted' : 'not materialized'}) id=${steeringMessage.id}`);
 			return;
 		}
 		const contentBlocks = resolvePromptToContentBlocks(
@@ -1238,7 +1369,7 @@ export class ClaudeAgentSession extends Disposable {
 			// boundary is the convention for both code paths.
 			uuid: steeringMessage.id as `${string}-${string}-${string}-${string}-${string}`,
 		};
-		pipeline.injectSteering(sdkMessage, steeringMessage.id);
+		pipeline.injectSteering(sdkMessage, steeringMessage);
 	}
 
 	/** Live permission-mode change. Forwards to the pipeline; the pipeline remembers it for re-application after a rebind. */

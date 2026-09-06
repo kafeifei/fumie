@@ -46,9 +46,11 @@ import {
 	type ToolResultContent,
 	type ToolResultSubagentContent,
 	type ToolResultTextContent,
+	type ToolResultTodoListContent,
 	type UsageInfo,
 	type Message,
 } from './protocol/state.js';
+import type { SessionSummaryChanges } from './protocol/notifications.js';
 
 // Re-export everything from the protocol state module
 export {
@@ -93,6 +95,8 @@ export {
 	type ToolResultSubagentContent,
 	type ToolResultTerminalContent,
 	type ToolResultTextContent,
+	type ToolResultTodoItem,
+	type ToolResultTodoListContent,
 	type Turn, type URI, type UsageInfo,
 	type Message
 } from './protocol/state.js';
@@ -145,6 +149,17 @@ export interface UsageInfoMeta {
 	 */
 	contextAttribution?: IContextAttributionData;
 	/**
+	 * Context-window dimensions of the model that served the turn's last
+	 * main-loop call, as reported by the backend per call (e.g. the Claude
+	 * SDK's `modelUsage[].contextWindow`, Codex's
+	 * `ThreadTokenUsage.modelContextWindow`). Lets the context-usage gauge
+	 * compute a denominator for models whose catalog metadata advertises no
+	 * window sizes (e.g. host-managed gateway models). On the wire this may
+	 * also be a bare total-tokens number; {@link readUsageInfoMeta}
+	 * normalizes both forms to this object.
+	 */
+	modelContextWindow?: IModelContextWindow;
+	/**
 	 * Per-model token totals accumulated across every model call in the turn,
 	 * including calls made by subagents and the summarization call a compaction
 	 * performs. Unlike {@link UsageInfo.inputTokens}, which describes only the
@@ -154,6 +169,20 @@ export interface UsageInfoMeta {
 	turnTokenTotals?: readonly ITurnTokenTotal[];
 	/** Per-model token totals for this turn only, excluding descendant sub-agents (sum a tree without double-counting). */
 	directTurnTokenTotals?: readonly ITurnTokenTotal[];
+	/**
+	 * Input tokens newly *written* to the prompt cache on the call this report
+	 * describes, disjoint from both {@link UsageInfo.inputTokens} and
+	 * {@link UsageInfo.cacheReadTokens}. Together those three partition the
+	 * call's prompt; see {@link usageOccupancyTokens}, the one place that folds
+	 * them.
+	 *
+	 * This rides in `_meta` because the upstream protocol's {@link UsageInfo}
+	 * has no field for it — `protocol/common/state.ts` is generated from
+	 * microsoft/agent-host-protocol and any field added there is lost on the
+	 * next sync. If upstream ever adds `cacheCreationTokens` to `UsageInfo`,
+	 * fold this key back into the generated type and delete the slot.
+	 */
+	cacheCreationTokens?: number;
 	/** Copilot usage for this turn only. The root's {@link copilotUsage} stays inclusive of descendants. */
 	directCopilotUsage?: {
 		readonly totalNanoAiu?: number;
@@ -190,6 +219,14 @@ export function withMessageHiddenFromTranscript(message: Message, hidden: boolea
 	};
 }
 
+/** Context-window dimensions reported by the backend for a served model call. */
+export interface IModelContextWindow {
+	/** Total window size in tokens, input and output combined. */
+	readonly totalTokens: number;
+	/** Output-token budget carved out of {@link totalTokens}, when reported. */
+	readonly maxOutputTokens?: number;
+}
+
 /** Whole-turn token consumption attributed to a single model. */
 export interface ITurnTokenTotal {
 	readonly model: string;
@@ -224,6 +261,29 @@ export interface IContextAttributionEntry {
 	readonly tokens: number;
 	readonly parentId?: string;
 	readonly attributes?: Readonly<Record<string, string | undefined>>;
+}
+
+function readModelContextWindow(value: unknown): IModelContextWindow | undefined {
+	// Codex's app-server reports the window as a bare number (protocol
+	// `ThreadTokenUsage.modelContextWindow`, emitted verbatim by its mapper
+	// since before this key had any reader); providers that also know the
+	// output budget report the object form. Accept both.
+	if (typeof value === 'number') {
+		return value > 0 ? { totalTokens: value } : undefined;
+	}
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	const totalTokens = raw['totalTokens'];
+	if (typeof totalTokens !== 'number' || !(totalTokens > 0)) {
+		return undefined;
+	}
+	const maxOutputTokens = raw['maxOutputTokens'];
+	return {
+		totalTokens,
+		...(typeof maxOutputTokens === 'number' && maxOutputTokens > 0 ? { maxOutputTokens } : {}),
+	};
 }
 
 type AccountQuotaSnapshot = NonNullable<NonNullable<UsageInfoMeta['quotaSnapshots']>[string]>;
@@ -281,6 +341,10 @@ export function readUsageInfoMeta(usage: UsageInfo | undefined): UsageInfoMeta {
 	if (contextAttribution) {
 		result.contextAttribution = contextAttribution;
 	}
+	const modelContextWindow = readModelContextWindow(meta['modelContextWindow']);
+	if (modelContextWindow) {
+		result.modelContextWindow = modelContextWindow;
+	}
 	const turnTokenTotals = readTurnTokenTotals(meta['turnTokenTotals']);
 	if (turnTokenTotals) {
 		result.turnTokenTotals = turnTokenTotals;
@@ -288,6 +352,9 @@ export function readUsageInfoMeta(usage: UsageInfo | undefined): UsageInfoMeta {
 	const directTurnTokenTotals = readTurnTokenTotals(meta['directTurnTokenTotals']);
 	if (directTurnTokenTotals) {
 		result.directTurnTokenTotals = directTurnTokenTotals;
+	}
+	if (isTokenCount(meta['cacheCreationTokens'])) {
+		result.cacheCreationTokens = meta['cacheCreationTokens'];
 	}
 	const directCopilotUsage = meta['directCopilotUsage'];
 	if (directCopilotUsage && typeof directCopilotUsage === 'object' && !Array.isArray(directCopilotUsage)) {
@@ -336,6 +403,38 @@ function isTokenCount(value: unknown): value is number {
 }
 
 /**
+ * How much of the context window this call's prompt occupied.
+ *
+ * The single owner of that arithmetic. Three input-side counters partition the
+ * prompt and all three sit in the window, so occupancy is their sum:
+ *
+ * - {@link UsageInfo.inputTokens} — fresh, *uncached* input: the prompt bytes
+ *   the model actually had to read, excluding anything served from or written
+ *   to the prompt cache.
+ * - {@link UsageInfo.cacheReadTokens} — input served from the prompt cache.
+ * - {@link UsageInfoMeta.cacheCreationTokens} — input newly *written* to the
+ *   cache. A first turn typically reports zero cache reads and a large cache
+ *   creation, so a client that ignores it under-reports that turn entirely.
+ *   It lives in `_meta` rather than on {@link UsageInfo} because the upstream
+ *   protocol type has no such field and `protocol/common/state.ts` is
+ *   generated; if upstream ever adds it, fold it back and drop the meta read.
+ *
+ * {@link UsageInfo.outputTokens} is the fourth field and is deliberately not
+ * part of this sum: it is completion, not prompt.
+ *
+ * Agents transcribe the numbers their model server reported into the counter
+ * that means the same thing and never pre-fold; every provider disagreeing
+ * about the fold is exactly what this function exists to prevent recurring.
+ *
+ * Callers that want to know whether there is anything to show at all ask
+ * {@link hasReportedUsage} first: a report with no token fields occupies
+ * nothing, and zero is not the same answer as "unknown".
+ */
+export function usageOccupancyTokens(usage: UsageInfo | undefined): number {
+	return (usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (readUsageInfoMeta(usage).cacheCreationTokens ?? 0);
+}
+
+/**
  * Whether a usage report actually records consumption, as opposed to merely
  * existing.
  *
@@ -350,10 +449,18 @@ export function hasReportedUsage(usage: UsageInfo | undefined): boolean {
 	if (!usage) {
 		return false;
 	}
-	if (typeof usage.inputTokens === 'number' || typeof usage.outputTokens === 'number') {
+	// All four token counters count: since mappers stopped folding the cache
+	// numbers into `inputTokens`, a call whose prompt was served entirely from
+	// cache reports no fresh input at all, and that is still a turn with
+	// numbers to show.
+	if (typeof usage.inputTokens === 'number' || typeof usage.outputTokens === 'number'
+		|| typeof usage.cacheReadTokens === 'number') {
 		return true;
 	}
 	const meta = readUsageInfoMeta(usage);
+	if (typeof meta.cacheCreationTokens === 'number') {
+		return true;
+	}
 	// Negative totals are treated as absent, matching how credits are read for display.
 	return (typeof meta.copilotUsage?.totalNanoAiu === 'number' && meta.copilotUsage.totalNanoAiu >= 0)
 		// A report can carry only the session total — a compaction billed while no turn
@@ -680,6 +787,23 @@ export function getToolSubagentContent(result: { content?: readonly ToolResultCo
 	return undefined;
 }
 
+/**
+ * Extracts the first todo-list content entry from a tool call's `content` array.
+ * Works with both completed tool call results and running tool call states.
+ * Returns `undefined` if there are no todo-list content parts.
+ */
+export function getToolTodoListContent(result: { content?: readonly ToolResultContent[] }): ToolResultTodoListContent | undefined {
+	if (!result.content || result.content.length === 0) {
+		return undefined;
+	}
+	for (const c of result.content) {
+		if (hasKey(c, { type: true }) && c.type === ToolResultContentType.TodoList) {
+			return c as ToolResultTodoListContent;
+		}
+	}
+	return undefined;
+}
+
 // ---- Subagent URI helpers ---------------------------------------------------
 
 const SUBAGENT_URI_SEGMENT = 'subagent';
@@ -767,6 +891,35 @@ export function createSessionState(summary: SessionSummary): SessionState {
 	if (summary.annotations !== undefined) { state.annotations = summary.annotations; }
 	if (summary._meta !== undefined) { state._meta = summary._meta; }
 	return state;
+}
+
+/**
+ * Decodes a `root/sessionSummaryChanged` diff into the in-memory shape every
+ * consumer is written against: `null` — the wire spelling of "this optional
+ * field was cleared" — becomes `undefined`, and the key stays present so a
+ * spread overwrites the cached value and a `hasOwnProperty` check still sees
+ * the clear.
+ *
+ * `null` exists only because `undefined` does not survive JSON: a host that
+ * spells a clear as `{ activity: undefined }` puts `{}` on the wire, the
+ * client learns nothing, and the stale activity (with its spinner) sits on the
+ * session-list row forever. Identity fields are dropped, as the protocol says
+ * receivers may.
+ */
+export function normalizeSessionSummaryChanges(changes: SessionSummaryChanges): Partial<SessionSummary> {
+	const carries = (key: keyof SessionSummary) => Object.prototype.hasOwnProperty.call(changes, key);
+	const normalized: Partial<SessionSummary> = {};
+	if (changes.title !== undefined) { normalized.title = changes.title; }
+	if (changes.status !== undefined) { normalized.status = changes.status; }
+	if (changes.modifiedAt !== undefined) { normalized.modifiedAt = changes.modifiedAt; }
+	if (carries('activity')) { normalized.activity = changes.activity ?? undefined; }
+	if (carries('origin')) { normalized.origin = changes.origin ?? undefined; }
+	if (carries('project')) { normalized.project = changes.project ?? undefined; }
+	if (carries('workingDirectories')) { normalized.workingDirectories = changes.workingDirectories ?? undefined; }
+	if (carries('annotations')) { normalized.annotations = changes.annotations ?? undefined; }
+	if (carries('changes')) { normalized.changes = changes.changes ?? undefined; }
+	if (carries('_meta')) { normalized._meta = changes._meta ?? undefined; }
+	return normalized;
 }
 
 /**
@@ -1840,6 +1993,47 @@ export const AH_META_IS_ARCHIVED_DB_KEY = 'isArchived';
 
 /** Legacy metadata key for the archived flag; see {@link AH_META_IS_ARCHIVED_DB_KEY}. */
 export const AH_META_IS_DONE_DB_KEY = 'isDone';
+
+/**
+ * Session-database metadata key recording that a Fumie catalog session is still a
+ * provisional draft: it entered the catalog at create time but its harness has not
+ * materialized a native session yet (that happens on the first message). Written by
+ * `AgentService` with the create-time working directories while provisional and
+ * reset to `'false'` at materialization. Readers use it to tell an unmaterialized
+ * draft (revivable at the same URI, sweepable when untouched) apart from a session
+ * whose harness metadata is only transiently unavailable.
+ */
+export const AH_META_PROVISIONAL_DB_KEY = 'agentHost.provisional';
+
+/** Create-time facts kept for an unmaterialized provisional draft. */
+export interface IProvisionalDraftMarker {
+	readonly workingDirectories?: readonly string[];
+}
+
+/** Serializes {@link IProvisionalDraftMarker} for {@link AH_META_PROVISIONAL_DB_KEY}. */
+export function serializeProvisionalDraftMarker(marker: IProvisionalDraftMarker | undefined): string {
+	return marker ? JSON.stringify(marker) : 'false';
+}
+
+/** Parses {@link AH_META_PROVISIONAL_DB_KEY}; `undefined` when the session is not a provisional draft. */
+export function readProvisionalDraftMarker(value: string | undefined): IProvisionalDraftMarker | undefined {
+	if (!value || value === 'false') {
+		return undefined;
+	}
+	if (value === 'true') {
+		return {};
+	}
+	try {
+		const parsed = JSON.parse(value) as { workingDirectories?: unknown };
+		return {
+			...(Array.isArray(parsed.workingDirectories) && parsed.workingDirectories.every((d): d is string => typeof d === 'string')
+				? { workingDirectories: parsed.workingDirectories }
+				: {}),
+		};
+	} catch {
+		return {};
+	}
+}
 
 /**
  * Session-database metadata key recording whether a session has been read. This is

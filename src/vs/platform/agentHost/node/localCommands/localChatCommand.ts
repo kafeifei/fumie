@@ -51,19 +51,11 @@ export interface ILocalChatCommandContext {
 
 /**
  * The outcome of a {@link ILocalChatCommand.tryHandle} that accepted a request:
- * the work to perform plus any metadata the dispatcher and its caller need.
+ * the work to perform.
  */
 export interface ILocalChatCommandHandling {
 	/** Performs the (possibly async) work of the command. */
 	run(): Promise<void>;
-	/**
-	 * A provisional title the command suggests for a brand-new session — for
-	 * example a `!command`'s command text. It is surfaced up through the
-	 * {@link AgentHostLocalCommands} dispatcher so the caller can title an
-	 * otherwise-untitled session; a subsequent real request replaces it with a
-	 * generated title. Commands that do not title the session omit this.
-	 */
-	readonly suggestedTitle?: string;
 }
 
 /**
@@ -160,11 +152,10 @@ export class AgentHostLocalCommands extends Disposable {
 
 	/**
 	 * Offers `request` to each command. When one handles it, the dispatcher has
-	 * already scheduled its `run`; it returns the {@link ILocalChatCommandHandling}
-	 * so the caller can act on carried metadata such as
-	 * {@link ILocalChatCommandHandling.suggestedTitle}. Its presence means the
-	 * caller MUST NOT forward the message to the agent (and MUST NOT invoke `run`
-	 * again). Returns `undefined` when no command applies.
+	 * already scheduled its `run` and returns its
+	 * {@link ILocalChatCommandHandling}; the caller MUST NOT forward the message
+	 * to the agent (and MUST NOT invoke `run` again). Returns `undefined` when no
+	 * command applies.
 	 */
 	tryHandle(request: ILocalChatCommandRequest): ILocalChatCommandHandling | undefined {
 		for (const command of this._commands) {

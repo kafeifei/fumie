@@ -73,6 +73,7 @@ import { IAgentPluginManager } from '../../common/agentPluginManager.js';
 import { ClaudeProxyService, IClaudeProxyService } from '../../node/claude/claudeProxyService.js';
 import { ICopilotApiService, type ICopilotApiServiceRequestOptions } from '../../node/shared/copilotApiService.js';
 import { createNoopGitService, createSessionDataService } from '../common/sessionTestHelpers.js';
+import { ByokLmBridgeRegistry, IByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
 import {
 	makeContentBlockStartText,
 	makeContentBlockStartToolUse,
@@ -523,7 +524,10 @@ class RoundTripQuery implements AsyncGenerator<SDKMessage, void> {
 				if (!startup?.onElicitation) {
 					throw new Error('integration test: elicitation marker but Options.onElicitation not wired');
 				}
-				const result = await startup.onElicitation(item.request, { signal: new AbortController().signal });
+				const result = await startup.onElicitation(item.request, {
+					signal: new AbortController().signal,
+					requestId: 'integration-elicitation',
+				});
 				this._sdk.elicitationResults.push(result);
 				continue;
 			}
@@ -550,6 +554,7 @@ class RoundTripQuery implements AsyncGenerator<SDKMessage, void> {
 	applyFlagSettings(): never { throw new Error('not modeled'); }
 	initializationResult(): never { throw new Error('not modeled'); }
 	reinitialize(): never { throw new Error('not modeled'); }
+	updateSettings(): never { throw new Error('not modeled'); }
 	supportedCommands(): never { throw new Error('not modeled'); }
 	supportedModels(): never { throw new Error('not modeled'); }
 	supportedAgents(): never { throw new Error('not modeled'); }
@@ -715,6 +720,7 @@ suite('ClaudeAgent integration (proxy-backed)', function () {
 		const configService = disposables.add(new AgentConfigurationService(stateManager, logService));
 
 		const services = new ServiceCollection(
+			[IByokLmBridgeRegistry, new ByokLmBridgeRegistry()],
 			[ILogService, logService],
 			[ICopilotApiService, capi],
 			[IClaudeProxyService, realProxy],
@@ -807,7 +813,7 @@ suite('ClaudeAgent integration (proxy-backed)', function () {
 		// closed via Symbol.asyncDispose (no orphan subprocess). Trace-context
 		// release for the default chat now happens inside disposeChat itself —
 		// there is no separate finalize step.
-		await agent.chats.disposeChat(created.chat, chatContext(created.chat, created.session));
+		await agent.chats.deleteChat(created.chat, chatContext(created.chat, created.session));
 		assert.strictEqual(sdk.warmQueries[0].asyncDisposeCount, 1, 'WarmQuery is asyncDisposed on chat dispose');
 	});
 
@@ -854,6 +860,7 @@ suite('ClaudeAgent integration (proxy-backed)', function () {
 		const configService = disposables.add(new AgentConfigurationService(stateManager, logService));
 
 		const services = new ServiceCollection(
+			[IByokLmBridgeRegistry, new ByokLmBridgeRegistry()],
 			[ILogService, logService],
 			[ICopilotApiService, capi],
 			[IClaudeProxyService, realProxy],
@@ -935,6 +942,7 @@ suite('ClaudeAgent integration (proxy-backed)', function () {
 		const configService = disposables.add(new AgentConfigurationService(stateManager, logService));
 
 		const services = new ServiceCollection(
+			[IByokLmBridgeRegistry, new ByokLmBridgeRegistry()],
 			[ILogService, logService],
 			[ICopilotApiService, capi],
 			[IClaudeProxyService, realProxy],

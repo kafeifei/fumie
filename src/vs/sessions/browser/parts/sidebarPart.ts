@@ -59,7 +59,6 @@ export class SidebarPart extends AbstractPaneCompositePart {
 	static readonly MARGIN_BOTTOM = 0;
 	static readonly MARGIN_LEFT = 0;
 	private static readonly FOOTER_ITEM_HEIGHT = 26;
-	private static readonly FOOTER_ITEM_GAP = 4;
 	private static readonly FOOTER_VERTICAL_PADDING = 6;
 	private static readonly FOOTER_BOTTOM_MARGIN = 2;
 	private static readonly FOOTER_BORDER_TOP = 1;
@@ -206,8 +205,7 @@ export class SidebarPart extends AbstractPaneCompositePart {
 		}
 
 		return SidebarPart.FOOTER_VERTICAL_PADDING * 2
-			+ (actionCount * SidebarPart.FOOTER_ITEM_HEIGHT)
-			+ ((actionCount - 1) * SidebarPart.FOOTER_ITEM_GAP)
+			+ SidebarPart.FOOTER_ITEM_HEIGHT
 			+ SidebarPart.FOOTER_BOTTOM_MARGIN
 			+ SidebarPart.FOOTER_BORDER_TOP;
 	}

@@ -209,6 +209,15 @@
 	padding: 0;
 }
 
+.monaco-workbench .mobile-picker-sheet-search-input:focus {
+	outline: none;
+}
+
+.mobile-picker-sheet-search:focus-within {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
 .mobile-picker-sheet-search-input::placeholder {
 	color: var(--vscode-descriptionForeground);
 }

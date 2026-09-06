@@ -118,6 +118,7 @@ export abstract class AgentHostSessionEnumPicker extends Disposable {
 	protected abstract _getActionItemIcon(item: IAgentHostSessionEnumPickerItem, currentValue: string): ThemeIcon | undefined;
 	protected abstract _getTriggerAriaLabel(label: string): string;
 	protected abstract _getWidgetAriaLabel(): string;
+	protected _getPickerItems(items: readonly IAgentHostSessionEnumPickerItem[], _currentValue: string): readonly IAgentHostSessionEnumPickerItem[] { return items; }
 	protected _getFooterActionItems(): readonly IActionListItem<IAgentHostSessionEnumPickerItem>[] { return []; }
 	protected _handleFooterActionItem(_item: IAgentHostSessionEnumPickerItem): boolean { return false; }
 
@@ -167,13 +168,17 @@ export abstract class AgentHostSessionEnumPicker extends Disposable {
 		const enumValues = (schema.enum ?? []).map(value => String(value));
 		const enumLabels = schema.enumLabels ?? [];
 		const enumDescriptions = schema.enumDescriptions ?? [];
-		const items: IAgentHostSessionEnumPickerItem[] = enumValues.map((value, index) => ({
+		const schemaItems: IAgentHostSessionEnumPickerItem[] = enumValues.map((value, index) => ({
 			value,
 			label: enumLabels[index] ?? value,
 			description: enumDescriptions[index],
 		}));
 		const rawCurrent = config?.values[this._property] ?? schema.default;
 		const currentValue = typeof rawCurrent === 'string' && enumValues.includes(rawCurrent) ? rawCurrent : enumValues[0] ?? '';
+		const items = this._getPickerItems(schemaItems, currentValue);
+		if (items.length === 0) {
+			return undefined;
+		}
 		return { provider: rawProvider, sessionId: session.sessionId, currentValue, items, tooltip: schema.description ?? schema.title ?? '' };
 	}
 

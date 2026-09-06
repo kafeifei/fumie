@@ -14,7 +14,7 @@ import { FEEDBACK_ANNOTATION_META_KEY, type IFeedbackAnnotationMeta } from '../.
 import { buildAnnotationsUri } from '../../../../common/annotationsUri.js';
 import { buildOpenSessionLinkUri } from '../../../../common/openSessionLink.js';
 import { SessionServerToolName } from '../../../../common/serverToolNames.js';
-import type { ListSessionsResult, SubscribeResult } from '../../../../common/state/protocol/commands.js';
+import type { SubscribeResult } from '../../../../common/state/protocol/commands.js';
 import { ActionType, NotificationType, type ChatToolCallCompleteAction, type ChatToolCallStartAction, type SessionAddedParams, type StateAction } from '../../../../common/state/sessionActions.js';
 import {
 	buildDefaultChatUri,
@@ -63,7 +63,6 @@ const sessionToolNames = [
 	SessionServerToolName.CreateChat,
 	SessionServerToolName.SendMessage,
 	SessionServerToolName.GetSessionContext,
-	SessionServerToolName.DeleteSession,
 ] as const;
 
 export function defineServerToolsTests(context: IAgentHostE2ETestContext): void {
@@ -74,8 +73,6 @@ export function defineServerToolsTests(context: IAgentHostE2ETestContext): void 
 	const supportsFullSessionContext = config.provider !== 'claude';
 	// Codex fails model authentication while materializing the target session.
 	const supportsCrossSessionSend = config.provider !== 'codex';
-	// Claude leaves the target listed; Codex fails authentication while materializing it.
-	const supportsCrossSessionDelete = config.provider === 'copilotcli';
 	// Claude and Codex start another turn instead of rejecting a message to the current chat.
 	const supportsSelfSendRejection = config.provider === 'copilotcli';
 	// Model ids are not provider-qualified; Claude and Codex selections currently resolve to Copilot.
@@ -898,31 +895,6 @@ export function defineServerToolsTests(context: IAgentHostE2ETestContext): void 
 		});
 	}, supportsProviderModelSessionCreation);
 
-	serverToolTest('server tool: delete_session removes a non-current session', async function () {
-		const session = await createSession('delete-session', true);
-		const target = await addSession('delete-session-target', session.workspace, true);
-		await materializeSession(target, 'turn-delete-session-target-seed', 'DELETE_TARGET_READY');
-		context.client.clearReceived();
-		const { turn } = await driveServerTool(
-			session,
-			'turn-delete-session',
-			`Call delete_session exactly once with session "${target.sessionUri}", then reply exactly "deleted".`,
-			SessionServerToolName.DeleteSession,
-		);
-		const result = await context.client.call<ListSessionsResult>('listSessions', { channel: ROOT_STATE_URI });
-		assert.deepStrictEqual({
-			sawPendingConfirmation: turn.sawPendingConfirmation,
-			stillListed: result.items.some(item => item.resource === target.sessionUri),
-		}, {
-			sawPendingConfirmation: true,
-			stillListed: false,
-		});
-		const trackedIndex = createdSessions.indexOf(target.sessionUri);
-		if (trackedIndex >= 0) {
-			createdSessions.splice(trackedIndex, 1);
-		}
-	}, supportsCrossSessionDelete);
-
 	serverToolTest('server tool: send_message refuses to target the invoking chat', async function () {
 		const session = await createSession('send-self', true);
 		await driveServerTool(
@@ -945,17 +917,4 @@ export function defineServerToolsTests(context: IAgentHostE2ETestContext): void 
 			steeringMessage: undefined,
 		});
 	}, supportsSelfSendRejection);
-
-	serverToolTest('server tool: delete_session refuses to delete the invoking session', async function () {
-		const session = await createSession('delete-current', true);
-		await driveServerTool(
-			session,
-			'turn-delete-current',
-			`You must call delete_session exactly once with session "${session.sessionUri}" so its safety check can reject the call. Do not refuse on your own. After the tool fails, reply exactly "refused".`,
-			SessionServerToolName.DeleteSession,
-			{ success: false, result: [/current session/i] },
-		);
-		const result = await context.client.call<ListSessionsResult>('listSessions', { channel: ROOT_STATE_URI });
-		assert.strictEqual(result.items.some(item => item.resource === session.sessionUri), true);
-	});
 }

@@ -19,6 +19,7 @@ import type { Event } from '../../../base/common/event.js';
 import { DisposableStore, MutableDisposable } from '../../../base/common/lifecycle.js';
 import { raceTimeout } from '../../../base/common/async.js';
 import { URI } from '../../../base/common/uri.js';
+import { joinPath } from '../../../base/common/resources.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { localize } from '../../../nls.js';
 import { NativeEnvironmentService } from '../../environment/node/environmentService.js';
@@ -40,12 +41,16 @@ import { BANG_COMMAND_PREFIX } from './agentHostBangCommand.js';
 import { CopilotAgent } from './copilot/copilotAgent.js';
 import { ClaudeAgent } from './claude/claudeAgent.js';
 import { ClaudeSdkPackage } from './claude/claudeAgentSdkService.js';
+import { scheduleOrphanedClaudeResumeDirCleanup } from './claude/claudeResumeTempCleanup.js';
 import { CodexAgent, CodexSdkPackage } from './codex/codexAgent.js';
+import { OpencodeAgent } from './opencode/opencodeAgent.js';
+import { OPENCODE_AGENT_PROVIDER_ID } from '../common/agent.js';
 import { createCodexProviderConfiguration } from './codex/codexProviderConfiguration.js';
 import { IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
-import { AgentHostCodexEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
+import { AgentHostClaudeEnabledConfigKey, AgentHostCodexEnabledConfigKey, AgentHostOpencodeEnabledConfigKey, type AgentHostProviderEnabledConfigKey } from '../common/agentHostSchema.js';
+import { registerProviderWhenEnabled } from './agentProviderEnablement.js';
 import { AgentModelRefreshScheduler, MODEL_REFRESH_INTERVAL_MS } from './agentModelRefreshScheduler.js';
-import { AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeSdkRootEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostCodexAgentSdkRootEnvVar, isAgentEnabled } from '../common/agentService.js';
+import { AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeSdkRootEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostCodexAgentSdkRootEnvVar, AgentHostOpencodeAgentEnabledEnvVar } from '../common/agentService.js';
 import { WebSocketProtocolServer } from './webSocketTransport.js';
 import { ProtocolServerHandler } from './protocolServerHandler.js';
 import { AgentHostClientFileSystemProvider } from '../common/agentHostClientFileSystemProvider.js';
@@ -54,6 +59,10 @@ import { resolveServerUrls } from './serverUrls.js';
 import ErrorTelemetry from '../../telemetry/node/errorTelemetry.js';
 import { AgentHostLaunchKind } from '../common/agentHostTelemetry.js';
 import { ISessionDataService } from '../common/sessionDataService.js';
+import { AgentHostLegacyUserDataDirEnvVar, AgentHostFumieHomeEnvVar, applyAgentHostProductEnv } from '../common/agentHostProductEnv.js';
+import { AgentHostDatabase } from './agentHostDatabase.js';
+import { migrateLegacyFumieData } from './fumie/fumieDataMigration.js';
+import { scrubModelProviderEnvironment } from './modelProviderEnvironment.js';
 
 /** Log to stderr so messages appear in the terminal alongside the process. */
 function log(msg: string): void {
@@ -152,6 +161,12 @@ function parseServerOptions(): IServerOptions {
 // ---- Main -------------------------------------------------------------------
 
 async function main(): Promise<void> {
+	applyAgentHostProductEnv(process.env, product);
+	scrubModelProviderEnvironment(process.env);
+	const codexHome = process.env[AgentHostCodexAgentCodexHomeEnvVar];
+	if (codexHome) {
+		await fs.promises.mkdir(codexHome, { recursive: true });
+	}
 	const options = parseServerOptions();
 	const disposables = new DisposableStore();
 	const errorTelemetry = disposables.add(new MutableDisposable<ErrorTelemetry>());
@@ -181,6 +196,13 @@ async function main(): Promise<void> {
 
 	logService.info('[AgentHostServer] Starting standalone agent host server');
 
+	const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
+	await migrateLegacyFumieData(process.env[AgentHostLegacyUserDataDirEnvVar], fumieHome?.fsPath, logService);
+	const sessionsHome = fumieHome ? joinPath(fumieHome, 'sessions') : undefined;
+	const rootConfigResource = sessionsHome ? joinPath(sessionsHome, 'agent-host-config.json') : undefined;
+	const storageResource = sessionsHome ? joinPath(sessionsHome, 'agent-host-storage.json') : undefined;
+	const orchestratorDatabase = sessionsHome ? new AgentHostDatabase(joinPath(sessionsHome, 'catalog.db').fsPath) : undefined;
+
 	if (!options.quiet) {
 		if (options.claudeSdkRoot) {
 			process.env[AgentHostClaudeSdkRootEnvVar] = options.claudeSdkRoot;
@@ -200,6 +222,13 @@ async function main(): Promise<void> {
 		hostLaunchKind: AgentHostLaunchKind.VSCodeCLI,
 		providerConfigurations: [createCodexProviderConfiguration(environmentService.userHome)],
 		byok: { kind: 'unavailable' },
+		...(sessionsHome ? {
+			sessionDataHome: sessionsHome,
+			rootConfigResource: rootConfigResource!,
+			storageResource: storageResource!,
+			orchestratorDatabase: orchestratorDatabase!,
+			pluginBasePath: joinPath(fumieHome!, 'plugins', 'cache'),
+		} : {}),
 	});
 	disposables.add(runtime);
 	const { agentService, instantiationService } = runtime;
@@ -228,9 +257,11 @@ async function main(): Promise<void> {
 	let sdkDownloadProgress: Event<IAgentSdkDownloadProgress> | undefined;
 	if (!options.quiet) {
 		sdkDownloadProgress = runtime.sdkDownloadProgress;
-		const copilotAgent = disposables.add(instantiationService.createInstance(CopilotAgent));
-		agentService.registerProvider(copilotAgent);
-		log('CopilotAgent registered');
+		if (!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes('copilotcli')) {
+			const copilotAgent = disposables.add(instantiationService.createInstance(CopilotAgent));
+			agentService.registerProvider(copilotAgent);
+			log('CopilotAgent registered');
+		}
 		// Claude and Codex providers are gated on two things:
 		//  1. The user-facing enable toggle (`chat.agentHost.<x>Agent.enabled`,
 		//     forwarded as an env var by the renderer-side starters; the remote
@@ -244,28 +275,53 @@ async function main(): Promise<void> {
 		//     devDependency, so `CodexAgent._resolveSdkRoot` resolves it from
 		//     `node_modules` in dev; built/shipped installs use the env-var
 		//     override or `product.agentSdks.codex`.
-		if (isAgentEnabled(process.env[AgentHostClaudeAgentEnabledEnvVar], true) && (!environmentService.isBuilt || agentSdkDownloader.isAvailable(ClaudeSdkPackage))) {
-			const claudeAgent = disposables.add(instantiationService.createInstance(ClaudeAgent));
-			agentService.registerProvider(claudeAgent);
-			log('ClaudeAgent registered');
+		//
+		// Registration is one-way (register-on-enable) for each of them: the
+		// env-var toggle carries the value this process was spawned with and the
+		// connected client's forwarded root config carries every later change, so
+		// turning an Agent on takes effect immediately while turning it off takes
+		// effect on the next agent host restart. See
+		// {@link registerProviderWhenEnabled}.
+		const registerWhenEnabled = (
+			enabledEnvVar: string,
+			rootConfigKey: AgentHostProviderEnabledConfigKey,
+			register: () => void,
+			enabledByDefault?: boolean,
+		): void => {
+			disposables.add(registerProviderWhenEnabled(agentConfigurationService, { enabledEnvVar, rootConfigKey, enabledByDefault }, register));
+		};
+		if ((!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes('claude')) && (!environmentService.isBuilt || agentSdkDownloader.isAvailable(ClaudeSdkPackage))) {
+			registerWhenEnabled(AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeEnabledConfigKey, () => {
+				const claudeAgent = disposables.add(instantiationService.createInstance(ClaudeAgent));
+				agentService.registerProvider(claudeAgent);
+				log('ClaudeAgent registered');
+				// The SDK deletes the `claude-resume-<uuid>` scratch dir it
+				// materializes for a resume only when that query shuts down, so
+				// every host crash / force-quit / reload strands one — transcript
+				// copy and credentials file included — and they accumulate one per
+				// resume. Nothing else is positioned to notice, so sweep the
+				// unreachable ones from here, the moment we know this process is
+				// one that can produce them. `agentHostMain` does the same.
+				scheduleOrphanedClaudeResumeDirCleanup(logService);
+			}, true);
 		}
-		if (!environmentService.isBuilt || agentSdkDownloader.isAvailable(CodexSdkPackage)) {
-			let codexRegistered = false;
-			const registerCodexIfEnabled = () => {
-				if (codexRegistered) {
-					return;
-				}
-				const enabledByEnv = isAgentEnabled(process.env[AgentHostCodexAgentEnabledEnvVar], false);
-				const enabledByRootConfig = agentConfigurationService.getRootValue(platformRootSchema, AgentHostCodexEnabledConfigKey) === true;
-				if (enabledByEnv || enabledByRootConfig) {
-					codexRegistered = true;
-					const codexAgent = disposables.add(instantiationService.createInstance(CodexAgent));
-					agentService.registerProvider(codexAgent);
-					log('CodexAgent registered');
-				}
-			};
-			registerCodexIfEnabled();
-			disposables.add(agentConfigurationService.onDidRootConfigChange(() => registerCodexIfEnabled()));
+		if ((!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes('codex')) && (!environmentService.isBuilt || agentSdkDownloader.isAvailable(CodexSdkPackage))) {
+			registerWhenEnabled(AgentHostCodexAgentEnabledEnvVar, AgentHostCodexEnabledConfigKey, () => {
+				const codexAgent = disposables.add(instantiationService.createInstance(CodexAgent));
+				agentService.registerProvider(codexAgent);
+				log('CodexAgent registered');
+			});
+		}
+		// opencode has no SDK to download: the binary is one the user installed and
+		// the models are opencode's own, so the enable toggle and the product
+		// allowlist are the whole gate. A missing install reports itself on the
+		// first send.
+		if (!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes(OPENCODE_AGENT_PROVIDER_ID)) {
+			registerWhenEnabled(AgentHostOpencodeAgentEnabledEnvVar, AgentHostOpencodeEnabledConfigKey, () => {
+				const opencodeAgent = disposables.add(instantiationService.createInstance(OpencodeAgent));
+				agentService.registerProvider(opencodeAgent);
+				log('OpencodeAgent registered');
+			});
 		}
 	}
 

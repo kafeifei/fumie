@@ -19,10 +19,11 @@ import { sandboxConfigSchema } from '../common/sandboxConfigSchema.js';
 import { agentHostProxyConfigSchema, clientOwnedApprovalRootConfigKeys, platformRootSchema, type ISchema, type SchemaDefinition, type SchemaValue } from '../common/agentHostSchema.js';
 import { ProtocolError } from '../common/state/sessionProtocol.js';
 import { ActionType, type ActionOrigin } from '../common/state/sessionActions.js';
-import { isAhpChatChannel, parseSubagentSessionUri, ROOT_STATE_URI, type URI as ProtocolURI } from '../common/state/sessionState.js';
+import { isAhpChatChannel, parseSubagentSessionUri, ROOT_STATE_URI, SessionLifecycle, type URI as ProtocolURI } from '../common/state/sessionState.js';
 import { AgentSession } from '../common/agent.js';
+import { LOCKED_SESSION_WORKSPACE_CONFIG_KEYS } from '../common/sessionConfigKeys.js';
 import { AgentHostStateManager } from './agentHostStateManager.js';
-import type { WorktreeIsolation } from './shared/worktreeIsolation.js';
+import type { IWorktreeDiskBudgetSession, WorktreeService } from './worktree/worktreeService.js';
 
 export const IAgentConfigurationService = createDecorator<IAgentConfigurationService>('agentConfigurationService');
 
@@ -112,7 +113,12 @@ export interface IAgentConfigurationService {
 	isWorkingDirectoryPending(session: ProtocolURI): boolean;
 
 	/** Resolves a persisted working directory, repairing a removed worktree when possible. */
-	resolveWorkingDirectoryForResume(session: ProtocolURI, workingDirectory: URI): Promise<URI>;
+	resolveWorkingDirectoryForResume(
+		session: ProtocolURI,
+		workingDirectory: URI,
+		diskBudgetSessions?: readonly IWorktreeDiskBudgetSession[],
+		onWillReclaimWorktree?: (sessionId: string) => Promise<void>,
+	): Promise<URI>;
 
 	/**
 	 * Merges a partial config patch into a session's values via a
@@ -182,10 +188,10 @@ export class AgentConfigurationService extends Disposable implements IAgentConfi
 	 * Copilot API dependencies. Consulted by {@link isWorkingDirectoryPending},
 	 * which degrades to folder behavior while it is unset (tests, early startup).
 	 */
-	private _worktree: WorktreeIsolation | undefined;
+	private _worktree: WorktreeService | undefined;
 	private readonly _worktreePendingListener = this._register(new MutableDisposable());
 
-	setWorktreeIsolation(worktree: WorktreeIsolation): void {
+	setWorktreeIsolation(worktree: WorktreeService): void {
 		this._worktree = worktree;
 		const onDidChangeWorkingDirectoryPending = worktree.onDidChangeWorkingDirectoryPending;
 		this._worktreePendingListener.value = onDidChangeWorkingDirectoryPending
@@ -261,11 +267,23 @@ export class AgentConfigurationService extends Disposable implements IAgentConfi
 		return this._worktree?.isWorkingDirectoryPending(AgentSession.id(session)) ?? false;
 	}
 
-	async resolveWorkingDirectoryForResume(session: ProtocolURI, workingDirectory: URI): Promise<URI> {
-		return this._worktree?.resolveWorkingDirectoryForResume(URI.parse(session), AgentSession.id(session), workingDirectory) ?? workingDirectory;
+	async resolveWorkingDirectoryForResume(
+		session: ProtocolURI,
+		workingDirectory: URI,
+		diskBudgetSessions?: readonly IWorktreeDiskBudgetSession[],
+		onWillReclaimWorktree?: (sessionId: string) => Promise<void>,
+	): Promise<URI> {
+		return this._worktree?.resolveWorkingDirectoryForResume(URI.parse(session), AgentSession.id(session), workingDirectory, diskBudgetSessions, onWillReclaimWorktree) ?? workingDirectory;
 	}
 
 	updateSessionConfig(session: ProtocolURI, patch: Record<string, unknown>): void {
+		const state = this._stateManager.getSessionState(session);
+		const lockedKeys = state?.lifecycle === SessionLifecycle.Ready
+			? Object.keys(patch).filter(key => LOCKED_SESSION_WORKSPACE_CONFIG_KEYS.has(key))
+			: [];
+		if (lockedKeys.length > 0) {
+			throw new Error(`Session workspace configuration is locked after creation: ${lockedKeys.join(', ')}`);
+		}
 		this._stateManager.dispatchServerAction(session, {
 			type: ActionType.SessionConfigChanged,
 			config: patch,

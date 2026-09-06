@@ -9550,7 +9550,7 @@ suite('CopilotAgentSession', () => {
 			const serverToolHost = new FakeServerToolHost([
 				...fakeToolDefinitions,
 				{ name: 'ephemeralServerTool', description: 'Available in ephemeral sessions', inputSchema: { type: 'object', properties: {} }, enabledForEphemeralSessions: true },
-				{ name: SessionServerToolName.RenameChat, description: 'Rename the chat', inputSchema: { type: 'object', properties: {} } },
+				{ name: SessionServerToolName.CreateChat, description: 'Create a chat', inputSchema: { type: 'object', properties: {} } },
 			]);
 			const { runtime } = await createAgentSession(disposables, { serverToolHost, isEphemeral: true });
 

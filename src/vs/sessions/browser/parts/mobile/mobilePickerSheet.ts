@@ -145,6 +145,13 @@ export interface IMobilePickerSheetHeaderAction {
 export interface IMobilePickerSheetSearchSource {
 	/** Placeholder text for the search input. */
 	readonly placeholder: string;
+	/**
+	 * Whether the search input should take focus when the sheet opens.
+	 * Defaults to true. Pickers with a useful current/default choice can
+	 * disable this so opening the sheet does not immediately cover that
+	 * choice with the phone keyboard.
+	 */
+	readonly autoFocus?: boolean;
 	/** Section title shown above the result list. */
 	readonly resultsSectionTitle?: string;
 	/** Aria label for the search input (defaults to {@link placeholder}). */
@@ -475,7 +482,7 @@ export function showMobilePickerSheet(
 
 		// Focus the search input if present, otherwise focus the first
 		// checked row (or the first row) for keyboard users.
-		if (searchInput) {
+		if (searchInput && options?.search?.autoFocus !== false) {
 			searchInput.focus();
 		} else {
 			(renderState.firstCheckedRow ?? renderState.firstRow)?.focus();

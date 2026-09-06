@@ -6,7 +6,8 @@
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
 import { URI } from '../../../../base/common/uri.js';
 import type { IAgentServerToolHost } from '../../common/agentServerTools.js';
-import { ClaudePermissionMode, ClaudeSessionConfigKey } from '../../common/claudeSessionConfigKeys.js';
+import { AutoApproveLevel } from '../../common/agentHostSchema.js';
+import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { ChatInputRequestPurpose, withChatInputRequestPurpose } from '../../common/meta/agentChatInputRequestMeta.js';
 import { ChatInputResponseKind, ToolCallPendingConfirmationState, ToolCallStatus } from '../../common/state/protocol/state.js';
 import { IAgentConfigurationService } from '../agentConfigurationService.js';
@@ -259,7 +260,7 @@ async function handleExitPlanMode(
 	});
 	if (approved) {
 		deps.configurationService.updateSessionConfig(deps.configurationResource.toString(), {
-			[ClaudeSessionConfigKey.PermissionMode]: 'acceptEdits' satisfies ClaudePermissionMode,
+			[SessionConfigKey.AutoApprove]: 'assisted' satisfies AutoApproveLevel,
 		});
 		return { behavior: 'allow', updatedInput: input };
 	}

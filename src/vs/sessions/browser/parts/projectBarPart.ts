@@ -270,7 +270,7 @@ export class ProjectBarPart extends Part {
 				{
 					appearance: { showPointer: true },
 					position: { hoverPosition: HoverPosition.RIGHT },
-					content: 'Add Folder to Project'
+					content: localize('projectBar.addFolder', "Add Folder to Project")
 				},
 				{ groupId: HOVER_GROUP_ID }
 			)
@@ -286,7 +286,7 @@ export class ProjectBarPart extends Part {
 		// Keyboard support
 		this.addFolderButton.setAttribute('tabindex', '0');
 		this.addFolderButton.setAttribute('role', 'button');
-		this.addFolderButton.setAttribute('aria-label', 'Add Folder to Project');
+		this.addFolderButton.setAttribute('aria-label', localize('projectBar.addFolder', "Add Folder to Project"));
 		this.workspaceEntryDisposables.value?.add(
 			addDisposableListener(this.addFolderButton, EventType.KEY_DOWN, (e: KeyboardEvent) => {
 				if (e.key === 'Enter' || e.key === ' ') {
@@ -299,8 +299,8 @@ export class ProjectBarPart extends Part {
 
 	private async pickAndAddFolder(): Promise<void> {
 		const folders = await this.fileDialogService.showOpenDialog({
-			openLabel: 'Add',
-			title: 'Add Folder to Project',
+			openLabel: localize('projectBar.addFolder.openLabel', "Add"),
+			title: localize('projectBar.addFolder', "Add Folder to Project"),
 			canSelectFolders: true,
 			canSelectMany: false,
 			defaultUri: await this.fileDialogService.defaultFolderPath(),

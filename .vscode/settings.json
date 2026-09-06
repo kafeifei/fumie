@@ -11,6 +11,20 @@
 		".github/skills/azure-pipelines/azure-pipeline.ts": false
 	},
 	"chat.editing.explainChanges.enabled": true,
+	// Fumie has one automatic repository instruction entry. Claude and Copilot
+	// adapters remain for their native harnesses, but Local must not stack them.
+	"chat.useAgentsMdFile": true,
+	"chat.useNestedAgentsMdFiles": false,
+	"chat.useClaudeMdFile": false,
+	"github.copilot.chat.codeGeneration.useInstructionFiles": false,
+	"chat.instructionsFilesLocations": {
+		".github/instructions": false,
+		".claude/rules": false,
+	},
+	"chat.agentFilesLocations": {
+		".github/agents": false,
+		".claude/agents": false,
+	},
 	// --- Editor ---
 	"editor.insertSpaces": false,
 	"editor.experimental.asyncTokenization": true,
@@ -144,9 +158,11 @@
 		"ts": "warning",
 		"eslint": "warning"
 	},
+	// Fumie: copy only small ignored configuration files. Dependencies belong to
+	// each worktree and must be installed there; sharing is limited to the package
+	// manager cache.
 	"git.worktreeIncludeFiles": [
 		"product.overrides.json",
-		"**/node_modules/**",
 	],
 	// --- GitHub ---
 	"githubPullRequests.experimental.createView": true,
@@ -212,8 +228,11 @@
 	"azureMcp.readOnly": true,
 	"debug.breakpointsView.presentation": "tree",
 	"chat.agentSkillsLocations": {
-		".github/skills/.local": true,
+		".agents/skills": true,
+		".github/skills": false,
+		".claude/skills": false,
+		".github/skills/.local": false,
 		".agents/skills/.local": true,
-		".claude/skills/.local": true,
+		".claude/skills/.local": false,
 	}
 }

@@ -32,7 +32,7 @@ import { ILogService } from '../../../../../platform/log/common/log.js';
 import { AnythingQuickAccessProviderRunOptions } from '../../../../../platform/quickinput/common/quickAccess.js';
 import { IQuickInputService, IQuickPickItem, IQuickPickItemWithResource, QuickPickItem } from '../../../../../platform/quickinput/common/quickInput.js';
 import { resolveCommandsContext } from '../../../../browser/parts/editor/editorCommandsContext.js';
-import { ResourceContextKey } from '../../../../common/contextkeys.js';
+import { IsSessionsWindowContext, ResourceContextKey } from '../../../../common/contextkeys.js';
 import { EditorResourceAccessor, isEditorCommandsContext, isEditorInput, SideBySideEditor } from '../../../../common/editor.js';
 import { IEditorGroupsService } from '../../../../services/editor/common/editorGroupsService.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
@@ -485,8 +485,12 @@ export class AttachContextAction extends Action2 {
 				primary: KeyMod.CtrlCmd | KeyCode.Slash,
 				weight: KeybindingWeight.EditorContrib
 			},
-			menu: [{
+			menu: [...[
+				{ id: MenuId.ChatInput, when: IsSessionsWindowContext.negate() },
+				{ id: MenuId.ChatInputSecondary, when: IsSessionsWindowContext },
+			].map(({ id, when }) => ({
 				when: ContextKeyExpr.and(
+					when,
 					ChatContextKeys.inQuickChat.negate(),
 					ChatContextKeys.location.isEqualTo(ChatAgentLocation.Chat),
 					ContextKeyExpr.or(
@@ -494,10 +498,10 @@ export class AttachContextAction extends Action2 {
 						ChatContextKeys.agentSupportsAttachments
 					)
 				),
-				id: MenuId.ChatInput,
+				id,
 				group: 'navigation',
 				order: -1
-			}, {
+			})), {
 				when: ContextKeyExpr.and(
 					ChatContextKeys.inQuickChat.negate(),
 					ChatContextKeys.location.isEqualTo(ChatAgentLocation.EditorInline),

@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { IAnchor } from '../../../../../../../../base/browser/ui/contextview/contextview.js';
+import { AnchorPosition } from '../../../../../../../../base/common/layout.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../../../base/test/common/utils.js';
 import { ExtensionIdentifier } from '../../../../../../../../platform/extensions/common/extensions.js';
 import { ActionListItemKind, IActionListItem, IActionListOptions } from '../../../../../../../../platform/actionWidget/browser/actionList.js';
@@ -20,7 +22,7 @@ import { ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier } f
  * the agent host's `thinkingLevel` schema), so each group's default is
  * omittable to cover that case.
  */
-function createModel(options?: { readonly omitEffortDefault?: boolean; readonly omitContextDefault?: boolean }): ILanguageModelChatMetadataAndIdentifier {
+function createModel(options?: { readonly omitEffortDefault?: boolean; readonly omitContextDefault?: boolean; readonly includePerformance?: boolean }): ILanguageModelChatMetadataAndIdentifier {
 	return {
 		identifier: 'copilot/test-model',
 		metadata: {
@@ -43,6 +45,17 @@ function createModel(options?: { readonly omitEffortDefault?: boolean; readonly 
 						enumDescriptions: ['Faster', 'Balanced'],
 						default: options?.omitEffortDefault ? undefined : 'low',
 					},
+					...(options?.includePerformance ? {
+						serviceTier: {
+							type: 'string',
+							title: 'Speed',
+							group: 'performance',
+							enum: ['standard', 'priority'],
+							enumItemLabels: ['Standard', 'Fast'],
+							enumDescriptions: ['Default speed and usage', '1.5x speed, increased usage'],
+							default: 'standard',
+						},
+					} : {}),
 					context: {
 						type: 'number',
 						group: 'tokens',
@@ -172,6 +185,100 @@ suite('ModelPickerConfiguration', () => {
 		});
 	});
 
+	test('keeps Standard quiet and surfaces a selected Fast service tier', () => {
+		const model = createModel({ includePerformance: true });
+		const standard = render(model, { effort: 'medium', serviceTier: 'standard', context: 65536 });
+		const fast = render(model, { effort: 'medium', serviceTier: 'priority', context: 65536 });
+
+		assert.deepStrictEqual({
+			standard: { label: standard.label, ariaLabel: standard.ariaLabel },
+			fast: { label: fast.label, ariaLabel: fast.ariaLabel },
+			sections: fast.sections,
+		}, {
+			standard: { label: 'Medium 64K', ariaLabel: 'Thinking Effort: Medium, Context Size: 64K' },
+			fast: { label: 'Medium Fast 64K', ariaLabel: 'Thinking Effort: Medium, Speed: Fast, Context Size: 64K' },
+			sections: [
+				{ kind: ActionListItemKind.Header, label: 'Thinking Effort' },
+				{ className: 'chat-model-picker-config-option', label: 'Low', checked: false, ariaDescription: 'Default, Faster' },
+				{ className: 'chat-model-picker-config-option', label: 'Medium', checked: true, ariaDescription: 'Balanced' },
+				{ kind: ActionListItemKind.Separator, label: undefined },
+				{ kind: ActionListItemKind.Header, label: 'Speed' },
+				{ className: 'chat-model-picker-config-option', label: 'Standard', checked: false, ariaDescription: 'Default, Default speed and usage' },
+				{ className: 'chat-model-picker-config-option', label: 'Fast', checked: true, ariaDescription: '1.5x speed, increased usage' },
+				{ kind: ActionListItemKind.Separator, label: undefined },
+				{ kind: ActionListItemKind.Header, label: 'Context Size' },
+				{ className: 'chat-model-picker-config-option', label: '32K', checked: false, ariaDescription: 'Default' },
+				{ className: 'chat-model-picker-config-option', label: '64K', checked: true, ariaDescription: undefined },
+			],
+		});
+	});
+
+	test('uses the host action widget placement and visibility lifecycle', () => {
+		const model = createModel();
+		const container = document.createElement('div');
+		const button = document.createElement('a');
+		const anchor: IAnchor = { x: 10, y: 20, width: 30, height: 1 };
+		const visibility: boolean[] = [];
+		let shownPlacement: { anchor: unknown; container: unknown; anchorPosition: AnchorPosition | undefined } | undefined;
+		let onHide: (() => void) | undefined;
+		const actionWidgetService = {
+			show: (
+				_id: string,
+				_supportsPreview: boolean,
+				_items: IActionListItem<IActionWidgetDropdownAction>[],
+				delegate: { onHide: () => void },
+				shownAnchor: unknown,
+				shownContainer: unknown,
+				_actions: unknown,
+				_accessibilityProvider: unknown,
+				options: IActionListOptions,
+			) => {
+				onHide = delegate.onHide;
+				shownPlacement = {
+					anchor: shownAnchor,
+					container: shownContainer,
+					anchorPosition: options.anchorPosition,
+				};
+			},
+			focusItemById: () => { },
+			updateItems: () => { },
+			hide: () => onHide?.(),
+		} as unknown as IActionWidgetService;
+		const access: IModelConfigurationAccess = {
+			getModelConfiguration: () => ({}),
+			setModelConfiguration: async () => { },
+			getModelConfigurationActions: () => [],
+		};
+		const controller = new ModelPickerConfiguration({
+			getSelectedModel: () => model,
+			getConfigurationAccess: () => access,
+			isDisabled: () => false,
+			shouldShowCacheBreakHint: () => false,
+			getCacheBreakLearnMoreLink: () => undefined,
+			dismissCacheBreakHint: () => { },
+			onDidChangeVisibility: visible => { visibility.push(visible); },
+			getActionWidgetContainer: () => container,
+			getActionWidgetAnchor: () => anchor,
+			getAnchorPosition: () => AnchorPosition.BELOW,
+		}, actionWidgetService, { publicLog2: () => { } } as unknown as ITelemetryService);
+
+		controller.show(button);
+		controller.show(button);
+		controller.show(button);
+		controller.dispose();
+
+		assert.deepStrictEqual({
+			shownPlacement,
+			visibility,
+		}, {
+			shownPlacement: {
+				anchor,
+				container,
+				anchorPosition: AnchorPosition.BELOW,
+			},
+			visibility: [true, false, true, false],
+		});
+	});
 	// A producer that cannot resolve a default leaves it `undefined`, which used
 	// to be stringified straight into the label as "undefined 272K". The group is
 	// dropped from the label instead, while its options stay selectable.

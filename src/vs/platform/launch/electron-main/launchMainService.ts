@@ -70,7 +70,7 @@ export class LaunchMainService implements ILaunchMainService {
 
 			// Create a window if there is none
 			if (this.windowsMainService.getWindowCount() === 0) {
-				const window = (await this.windowsMainService.openEmptyWindow({ context: OpenContext.DESKTOP })).at(0);
+				const window = (await this.windowsMainService.openWindowOnActivate({ context: OpenContext.DESKTOP })).at(0);
 				if (window) {
 					whenWindowReady = window.ready();
 				}
@@ -195,10 +195,7 @@ export class LaunchMainService implements ILaunchMainService {
 
 					usedWindows = [lastActive];
 				} else {
-					usedWindows = await this.windowsMainService.open({
-						...baseConfig,
-						forceEmpty: true
-					});
+					usedWindows = await this.windowsMainService.openWindowOnActivate(baseConfig);
 				}
 			}
 		}

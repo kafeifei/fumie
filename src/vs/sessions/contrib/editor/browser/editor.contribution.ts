@@ -8,19 +8,20 @@ import './media/editorBreadcrumbs.css';
 import './media/editorHeader.css';
 import '../../../../workbench/services/themes/browser/modernTabColorCustomizations.js';
 import './diffEditor.sessions.contribution.js';
-import { NewBrowserTabAction, NewChangesTabAction, NewFileTabAction, NewSearchTabAction } from './addTabActions.js';
-import { localize2 } from '../../../../nls.js';
+import { NewChangesTabAction, NewFileTabAction, NewSearchTabAction } from './addTabActions.js';
+import { localize, localize2 } from '../../../../nls.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
 import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { Schemas } from '../../../../base/common/network.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ServicesAccessor } from '../../../../editor/browser/editorExtensions.js';
-import { Action2, isIMenuItem, MenuId, MenuRegistry, registerAction2 } from '../../../../platform/actions/common/actions.js';
+import { ICommandAction } from '../../../../platform/action/common/action.js';
+import { Action2, IMenuItem, isIMenuItem, MenuId, MenuRegistry, registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
-import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
+import { ContextKeyExpr, ContextKeyExpression } from '../../../../platform/contextkey/common/contextkey.js';
 import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
-import { ActiveEditorContext, EditorPartModalContext, IsAuxiliaryWindowContext, IsSessionsWindowContext, IsTopRightEditorGroupContext, MainEditorAreaVisibleContext } from '../../../../workbench/common/contextkeys.js';
+import { ActiveEditorCannotCloseContext, ActiveEditorContext, ActiveEditorDirtyContext, ActiveEditorStickyContext, EditorPartModalContext, EditorTabsVisibleContext, IsAuxiliaryWindowContext, IsSessionsWindowContext, IsTopRightEditorGroupContext, MainEditorAreaVisibleContext } from '../../../../workbench/common/contextkeys.js';
 import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../../workbench/common/contributions.js';
 import { Menus } from '../../../browser/menus.js';
 import { IAgentWorkbenchLayoutService } from '../../../browser/workbench.js';
@@ -37,7 +38,7 @@ import { CHANGES_VIEW_ID } from '../../changes/common/changes.js';
 import { ChangesViewPane } from '../../changes/browser/changesView.js';
 import { prepareMoveCopyEditors } from '../../../../workbench/browser/parts/editor/editor.js';
 import { Parts } from '../../../../workbench/services/layout/browser/layoutService.js';
-import { MOVE_MODAL_EDITOR_TO_MAIN_COMMAND_ID } from '../../../../workbench/browser/parts/editor/editorCommands.js';
+import { CLOSE_EDITOR_COMMAND_ID, CLOSE_EDITORS_IN_GROUP_COMMAND_ID, MOVE_MODAL_EDITOR_TO_MAIN_COMMAND_ID, UNPIN_EDITOR_COMMAND_ID } from '../../../../workbench/browser/parts/editor/editorCommands.js';
 import { TERMINAL_VIEW_ID } from '../../../../workbench/contrib/terminal/common/terminal.js';
 import { TEXT_FILE_EDITOR_ID } from '../../../../workbench/contrib/files/common/files.js';
 import { ISessionsService } from '../../../services/sessions/browser/sessionsService.js';
@@ -85,7 +86,6 @@ class SinglePaneAddTabContribution extends Disposable implements IWorkbenchContr
 		}
 
 		this._register(registerAction2(NewFileTabAction));
-		this._register(registerAction2(NewBrowserTabAction));
 		this._register(registerAction2(NewSearchTabAction));
 		this._register(registerAction2(NewChangesTabAction));
 	}
@@ -481,6 +481,109 @@ class AddFileAsContextAction extends Action2 {
 }
 
 registerAction2(AddFileAsContextAction);
+
+// ---- Editor title: close / unpin -------------------------------------------
+//
+// The single-pane layout points the editor group's `editorActions` menu at
+// {@link Menus.SessionsEditorTitle} (see `singlePaneEditorPart.ts`) and forces
+// `showTabs: 'single'`, so the toolbar renders next to a single tab. Upstream
+// registers the close/unpin toolbar buttons for that mode on
+// {@link MenuId.EditorTitle} only (see `workbench/browser/parts/editor/editor.contribution.ts`),
+// and `EditorTitleMenuBridgeContribution` below deliberately mirrors extension
+// contributions only — so without these registrations the Agents window would
+// show no close button at all. The command ids, icons, alternatives, `when`
+// clauses and order are kept identical to upstream so the two windows behave
+// the same; in particular `ActiveEditorCannotCloseContext` keeps the Changes /
+// Files placeholder tabs from offering a close button.
+
+const CLOSE_ORDER = 1000000; // towards the far end, mirroring upstream
+
+function appendSessionsEditorToolItem(primary: ICommandAction, when: ContextKeyExpression | undefined, order: number, alternative?: ICommandAction): void {
+	const item: IMenuItem = {
+		command: {
+			id: primary.id,
+			title: primary.title,
+			icon: primary.icon
+		},
+		group: 'navigation',
+		when,
+		order
+	};
+
+	if (alternative) {
+		item.alt = {
+			id: alternative.id,
+			title: alternative.title,
+			icon: alternative.icon
+		};
+	}
+
+	MenuRegistry.appendMenuItem(Menus.SessionsEditorTitle, item);
+}
+
+// Close (tabs disabled, normal editor)
+appendSessionsEditorToolItem(
+	{
+		id: CLOSE_EDITOR_COMMAND_ID,
+		title: localize('close', "Close"),
+		icon: Codicon.close
+	},
+	ContextKeyExpr.and(EditorTabsVisibleContext.toNegated(), ActiveEditorDirtyContext.toNegated(), ActiveEditorStickyContext.toNegated(), ActiveEditorCannotCloseContext.toNegated()),
+	CLOSE_ORDER,
+	{
+		id: CLOSE_EDITORS_IN_GROUP_COMMAND_ID,
+		title: localize('closeAll', "Close All"),
+		icon: Codicon.closeAll
+	}
+);
+
+// Close (tabs disabled, dirty editor)
+appendSessionsEditorToolItem(
+	{
+		id: CLOSE_EDITOR_COMMAND_ID,
+		title: localize('close', "Close"),
+		icon: Codicon.closeDirty
+	},
+	ContextKeyExpr.and(EditorTabsVisibleContext.toNegated(), ActiveEditorDirtyContext, ActiveEditorStickyContext.toNegated(), ActiveEditorCannotCloseContext.toNegated()),
+	CLOSE_ORDER,
+	{
+		id: CLOSE_EDITORS_IN_GROUP_COMMAND_ID,
+		title: localize('closeAll', "Close All"),
+		icon: Codicon.closeAll
+	}
+);
+
+// Unpin (tabs disabled, sticky editor)
+appendSessionsEditorToolItem(
+	{
+		id: UNPIN_EDITOR_COMMAND_ID,
+		title: localize('unpin', "Unpin"),
+		icon: Codicon.pinned
+	},
+	ContextKeyExpr.and(EditorTabsVisibleContext.toNegated(), ActiveEditorDirtyContext.toNegated(), ActiveEditorStickyContext),
+	CLOSE_ORDER,
+	{
+		id: CLOSE_EDITOR_COMMAND_ID,
+		title: localize('close', "Close"),
+		icon: Codicon.close
+	}
+);
+
+// Unpin (tabs disabled, dirty & sticky editor)
+appendSessionsEditorToolItem(
+	{
+		id: UNPIN_EDITOR_COMMAND_ID,
+		title: localize('unpin', "Unpin"),
+		icon: Codicon.pinnedDirty
+	},
+	ContextKeyExpr.and(EditorTabsVisibleContext.toNegated(), ActiveEditorDirtyContext, ActiveEditorStickyContext),
+	CLOSE_ORDER,
+	{
+		id: CLOSE_EDITOR_COMMAND_ID,
+		title: localize('close', "Close"),
+		icon: Codicon.close
+	}
+);
 
 /**
  * Mirrors extension-contributed `editor/title` items into {@link Menus.SessionsEditorTitle}

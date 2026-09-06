@@ -30,6 +30,7 @@ import { ISSHRemoteAgentHostService, isSSHHostKeyDeniedError, SSHAuthMethod, typ
 import { isTunnelHosted, ITunnelAgentHostService, TUNNEL_ADDRESS_PREFIX, type ITunnelInfo } from '../../../../../platform/agentHost/common/tunnelAgentHost.js';
 import { IWSLRemoteAgentHostService, WSL_INSTALL_DOCS_URL, type IWSLDistro } from '../../../../../platform/agentHost/common/wslRemoteAgentHost.js';
 import { ContextKeyExpr } from '../../../../../platform/contextkey/common/contextkey.js';
+import { IsWebContext } from '../../../../../platform/contextkey/common/contextkeys.js';
 import { IInstantiationService, ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { INotificationService, Severity } from '../../../../../platform/notification/common/notification.js';
 import { IQuickInputButton, IQuickInputService, IQuickPickItem } from '../../../../../platform/quickinput/common/quickInput.js';
@@ -58,6 +59,16 @@ export const RemoteAgentHostCommandIds = {
 	manageRemoteAgentHosts: 'workbench.action.sessions.manageRemoteAgentHosts',
 	updateRemoteAgentHost: 'workbench.action.sessions.updateRemoteAgentHost',
 } as const;
+
+/**
+ * SSH and WSL dial out from the client process itself — a raw TCP socket for
+ * SSH, a local `wsl.exe` for WSL — which a browser cannot do. The web bundle
+ * registers `NullSSHRemoteAgentHostService` / `NullWSLRemoteAgentHostService`
+ * (see `sessions.web.main.ts`), whose methods throw, so gate the entry points
+ * rather than let the commands surface and then fail on use. Dev Tunnel connect
+ * stays available in web: it goes over a relay the browser can reach.
+ */
+const DialsOutFromClientContext = IsWebContext.negate();
 
 registerAction2(class extends Action2 {
 	constructor() {
@@ -645,11 +656,17 @@ registerAction2(class extends Action2 {
 			category: SessionsCategories.Sessions,
 			f1: true,
 			icon: Codicon.remote,
-			precondition: ContextKeyExpr.equals(`config.${RemoteAgentHostsEnabledSettingId}`, true),
+			precondition: ContextKeyExpr.and(
+				DialsOutFromClientContext,
+				ContextKeyExpr.equals(`config.${RemoteAgentHostsEnabledSettingId}`, true),
+			),
 			menu: {
 				id: Menus.SessionWorkspaceManage,
 				order: 20,
-				when: SessionWorkspacePickerGroupContext.isEqualTo(SESSION_WORKSPACE_GROUP_REMOTE),
+				when: ContextKeyExpr.and(
+					DialsOutFromClientContext,
+					SessionWorkspacePickerGroupContext.isEqualTo(SESSION_WORKSPACE_GROUP_REMOTE),
+				),
 			},
 		});
 	}
@@ -669,7 +686,10 @@ registerAction2(class extends Action2 {
 			title: localize2('addNewSSHHost', "Add New SSH Host..."),
 			category: SessionsCategories.Sessions,
 			f1: true,
-			precondition: ContextKeyExpr.equals(`config.${RemoteAgentHostsEnabledSettingId}`, true),
+			precondition: ContextKeyExpr.and(
+				DialsOutFromClientContext,
+				ContextKeyExpr.equals(`config.${RemoteAgentHostsEnabledSettingId}`, true),
+			),
 		});
 	}
 
@@ -730,7 +750,10 @@ registerAction2(class extends Action2 {
 			title: localize2('configureSSHHosts', "Configure SSH Hosts..."),
 			category: SessionsCategories.Sessions,
 			f1: true,
-			precondition: ContextKeyExpr.equals(`config.${RemoteAgentHostsEnabledSettingId}`, true),
+			precondition: ContextKeyExpr.and(
+				DialsOutFromClientContext,
+				ContextKeyExpr.equals(`config.${RemoteAgentHostsEnabledSettingId}`, true),
+			),
 		});
 	}
 
@@ -1274,6 +1297,7 @@ registerAction2(class extends Action2 {
 			f1: true,
 			icon: Codicon.terminalLinux,
 			precondition: ContextKeyExpr.and(
+				DialsOutFromClientContext,
 				ContextKeyExpr.equals('isWindows', true),
 				ContextKeyExpr.equals(`config.${RemoteAgentHostsEnabledSettingId}`, true),
 			),
@@ -1281,6 +1305,7 @@ registerAction2(class extends Action2 {
 				id: Menus.SessionWorkspaceManage,
 				order: 15,
 				when: ContextKeyExpr.and(
+					DialsOutFromClientContext,
 					ContextKeyExpr.equals('isWindows', true),
 					SessionWorkspacePickerGroupContext.isEqualTo(SESSION_WORKSPACE_GROUP_REMOTE),
 				),

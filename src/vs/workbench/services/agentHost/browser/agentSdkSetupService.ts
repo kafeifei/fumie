@@ -6,7 +6,7 @@
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
-import { AGENT_SDK_SETUP_DOWNLOAD_REQUEST_KEY, AGENT_SDK_SETUP_RELOAD_REQUEST_KEY, IAgentSdkSetupInfo, readAgentSdkSetupInfos, readConsentedSdkAgents, resolveConsentedSdkDownloads, writeConsentedSdkAgents } from '../../../../platform/agentHost/common/agentSdkSetup.js';
+import { AGENT_SDK_SETUP_CANCEL_SIGN_IN_REQUEST_KEY, AGENT_SDK_SETUP_DOWNLOAD_REQUEST_KEY, AGENT_SDK_SETUP_RELOAD_REQUEST_KEY, AGENT_SDK_SETUP_SIGN_IN_REQUEST_KEY, IAgentSdkSetupInfo, readAgentSdkSetupInfos, readConsentedSdkAgents, resolveConsentedSdkDownloads, writeConsentedSdkAgents } from '../../../../platform/agentHost/common/agentSdkSetup.js';
 import { IAgentHostService } from '../../../../platform/agentHost/common/agentService.js';
 import { ActionType } from '../../../../platform/agentHost/common/state/sessionActions.js';
 import { ROOT_STATE_URI } from '../../../../platform/agentHost/common/state/sessionState.js';
@@ -52,6 +52,7 @@ type AgentSdkSetupFunnelStep =
 	| 'docsClicked'
 	| 'gitHubSignInClicked'
 	| 'signInClicked'
+	| 'signInCancelled'
 	| 'reloadClicked';
 
 interface IAgentSdkSetupFunnelEvent {
@@ -61,7 +62,7 @@ interface IAgentSdkSetupFunnelEvent {
 
 type AgentSdkSetupFunnelClassification = {
 	agent: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The agent whose setup this step belongs to, e.g. claude or codex.' };
-	step: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'Which step of the agent SDK setup funnel was reached (downloadOffered, downloadClicked, consentedDownload, noAccount, docsClicked, gitHubSignInClicked, signInClicked, reloadClicked, resolved).' };
+	step: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'Which step of the agent SDK setup funnel was reached (downloadOffered, downloadClicked, consentedDownload, noAccount, docsClicked, gitHubSignInClicked, signInClicked, signInCancelled, reloadClicked, resolved).' };
 	owner: 'TylerLeonhardt';
 	comment: 'Tracks how far a signed-out user gets through setting up their own Claude or Codex account.';
 };
@@ -91,8 +92,15 @@ export interface IAgentSdkSetupService {
 	/** Start GitHub sign-in, which reaches every agent's models through our proxy. */
 	signInToGitHub(agent: string): void;
 
-	/** Start `agent`'s own sign-in flow, if it declared one. */
+	/**
+	 * Start `agent`'s own sign-in flow, if it declared one. Never refused for a
+	 * sign-in already running: what happens in the browser is invisible here, so
+	 * pressing again abandons the old attempt and starts a fresh one.
+	 */
 	signIn(agent: string): void;
+
+	/** Abandon `agent`'s running sign-in flow and return it to signed-out. */
+	cancelSignIn(agent: string): void;
 
 	/**
 	 * Whether `agent` has been asked to fetch its SDK and the host has not
@@ -108,7 +116,7 @@ export interface IAgentSdkSetupService {
 	reportSetupState(agent: string, state: AgentSdkSetupState): void;
 }
 
-class AgentSdkSetupService extends Disposable implements IAgentSdkSetupService {
+export class AgentSdkSetupService extends Disposable implements IAgentSdkSetupService {
 	declare readonly _serviceBrand: undefined;
 
 	private readonly _onDidChangeSetups = this._register(new Emitter<readonly IAgentSdkSetupInfo[]>());
@@ -196,14 +204,21 @@ class AgentSdkSetupService extends Disposable implements IAgentSdkSetupService {
 	}
 
 	signIn(agent: string): void {
-		// Codex is the only agent with an in-app sign-in today, and comparing against
-		// the service's own `agent` rather than a literal keeps `'codex'` out of the
-		// workbench. A second such agent turns this comparison into a lookup.
-		if (agent !== this._codexAccountService.agent) {
+		const setup = this._getSetup(agent);
+		if (agent !== this._codexAccountService.agent && !setup?.signInProviderName) {
 			return;
 		}
 		this._reportStep(agent, 'signInClicked');
-		this._codexAccountService.signIn();
+		if (agent === this._codexAccountService.agent) {
+			this._codexAccountService.signIn();
+		} else {
+			this._dispatchRequest(AGENT_SDK_SETUP_SIGN_IN_REQUEST_KEY, agent);
+		}
+	}
+
+	cancelSignIn(agent: string): void {
+		this._reportStep(agent, 'signInCancelled');
+		this._dispatchRequest(AGENT_SDK_SETUP_CANCEL_SIGN_IN_REQUEST_KEY, agent);
 	}
 
 	reportSetupState(agent: string, state: AgentSdkSetupState): void {

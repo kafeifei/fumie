@@ -53,7 +53,6 @@ suite('serverToolGroups display', () => {
 			chat: display('create_chat'),
 			send: display('send_message'),
 			context: display('get_session_context'),
-			del: display('delete_session'),
 		}, {
 			list: { displayName: 'List Sessions', invocation: 'List sessions' },
 			current: { displayName: 'Get Current Session', invocation: 'Get current session' },
@@ -61,7 +60,6 @@ suite('serverToolGroups display', () => {
 			chat: { displayName: 'Create Chat', invocation: 'Create chat' },
 			send: { displayName: 'Send Message', invocation: 'Send message' },
 			context: { displayName: 'Get Session Context', invocation: 'Read session context' },
-			del: { displayName: 'Delete Session', invocation: 'Deleting session' },
 		});
 	});
 

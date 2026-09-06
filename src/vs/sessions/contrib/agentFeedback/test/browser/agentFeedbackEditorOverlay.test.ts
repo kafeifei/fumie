@@ -15,8 +15,10 @@ import { EditorGroupView } from '../../../../../workbench/browser/parts/editor/e
 import { IEditorGroupsService } from '../../../../../workbench/services/editor/common/editorGroupsService.js';
 import { createEditorPart, TestFileEditorInput, workbenchInstantiationService } from '../../../../../workbench/test/browser/workbenchTestServices.js';
 import { ICodeReviewService } from '../../../codeReview/browser/codeReviewService.js';
+import { ISessionChangesService } from '../../../changes/browser/sessionChangesService.js';
+import { SessionChangesEditorInput } from '../../../changes/browser/sessionChangesEditorInput.js';
 import { EmptyFileEditorInput } from '../../../editor/browser/emptyFileEditorInput.js';
-import { AgentFeedbackEditorOverlay, getAgentFeedbackOverlayResourceCandidates } from '../../browser/agentFeedbackEditorOverlay.js';
+import { AgentFeedbackEditorOverlay, getAgentFeedbackOverlayResourceCandidates, getAgentFeedbackOverlaySessionResource } from '../../browser/agentFeedbackEditorOverlay.js';
 import { IAgentFeedbackService } from '../../browser/agentFeedbackService.js';
 
 suite('AgentFeedbackEditorOverlay', () => {
@@ -35,6 +37,9 @@ suite('AgentFeedbackEditorOverlay', () => {
 			override readonly onDidChangeFeedbackScope = Event.None;
 		});
 		instantiationService.stub(ICodeReviewService, new class extends mock<ICodeReviewService>() { });
+		instantiationService.stub(ISessionChangesService, new class extends mock<ISessionChangesService>() {
+			override getSessionResource(): undefined { return undefined; }
+		});
 
 		const group = editorPart.activeGroup;
 		assert.ok(group instanceof EditorGroupView);
@@ -85,5 +90,34 @@ suite('AgentFeedbackEditorOverlay', () => {
 			file: [workspaceFolder],
 			emptyFiles: [],
 		});
+	});
+
+	test('resolves a session Changes input directly without enumerating its files', () => {
+		const disposables = store.add(new DisposableStore());
+		const instantiationService = workbenchInstantiationService(undefined, disposables);
+		instantiationService.stub(IWorkbenchLayoutService, new class extends mock<IWorkbenchLayoutService>() {
+			override readonly onDidChangePartVisibility = Event.None;
+			override isVisible() { return true; }
+		});
+		const sessionResource = URI.parse('claude:/session');
+		const multiDiffSource = URI.parse('changes-multi-diff-source:?session');
+		const input = disposables.add(instantiationService.createInstance(SessionChangesEditorInput, multiDiffSource));
+		let resolvedSources = 0;
+		const service = new class extends mock<ISessionChangesService>() {
+			override getSessionResource(resource: URI): URI | undefined {
+				resolvedSources++;
+				assert.strictEqual(resource, multiDiffSource);
+				return sessionResource;
+			}
+		};
+
+		assert.deepStrictEqual({
+			docked: getAgentFeedbackOverlaySessionResource(input, service),
+			innerMultiDiff: getAgentFeedbackOverlaySessionResource(input.multiDiffInput, service),
+		}, {
+			docked: sessionResource,
+			innerMultiDiff: sessionResource,
+		});
+		assert.strictEqual(resolvedSources, 2);
 	});
 });

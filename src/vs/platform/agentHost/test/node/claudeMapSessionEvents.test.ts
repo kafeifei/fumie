@@ -10,7 +10,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { NullLogService } from '../../../log/common/log.js';
 import type { AgentSignal } from '../../common/agent.js';
 import { ActionType } from '../../common/state/sessionActions.js';
-import { ResponsePartKind, ToolResultContentType } from '../../common/state/sessionState.js';
+import { ResponsePartKind, ToolResultContentType, readUsageInfoMeta, usageOccupancyTokens } from '../../common/state/sessionState.js';
 import { STREAMING_TOOL_DISPLAY_INTERVAL_MS } from '../../common/streamingToolCallDisplay.js';
 import { ToolCallConfirmationReason, ToolCallContributorKind } from '../../common/state/protocol/state.js';
 import { ClaudeMapperState, mapSDKMessageToAgentSignals } from '../../node/claude/claudeMapSessionEvents.js';
@@ -874,13 +874,112 @@ suite('claudeMapSessionEvents — direct mapper tests', () => {
 					type: ActionType.ChatUsage,
 					turnId: TURN_ID,
 					usage: {
+						// No main-loop assistant message was seen, so the result
+						// envelope's own counters are transcribed 1:1 — each into
+						// the counter that means the same thing, none summed.
 						inputTokens: 12,
 						outputTokens: 34,
 						cacheReadTokens: 5,
 						model: 'claude-test',
+						_meta: {
+							turnTokenTotals: [
+								{ model: 'claude-test', inputTokens: 12, cachedTokens: 5, outputTokens: 34 },
+							],
+							modelContextWindow: { totalTokens: 200_000, maxOutputTokens: 8192 },
+							// Cache creation has no field on the generated `UsageInfo`,
+							// so it rides in the protocol's sanctioned extension slot.
+							cacheCreationTokens: 0,
+						},
 					},
 				},
 			},
+		]);
+	});
+
+	test('result transcribes the last main-loop assistant call\'s three input-side counters un-summed', () => {
+		const state = new ClaudeMapperState();
+		const registry = r();
+		const log = new NullLogService();
+
+		// Two main-loop calls; the second one's usage describes the session's
+		// current context occupancy and must win.
+		const first = makeAssistantMessage(SESSION_ID, []);
+		first.message.usage = { ...first.message.usage, input_tokens: 10, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 100, output_tokens: 50 };
+		mapSDKMessageToAgentSignals(first, SESSION, TURN_ID, state, log, registry);
+
+		const second = makeAssistantMessage(SESSION_ID, []);
+		second.message.usage = { ...second.message.usage, input_tokens: 20, cache_read_input_tokens: 70_000, cache_creation_input_tokens: 1_500, output_tokens: 200 };
+		mapSDKMessageToAgentSignals(second, SESSION, TURN_ID, state, log, registry);
+
+		const result = makeResultSuccess(SESSION_ID);
+		// Whole-turn sums — deliberately different from the last call so the
+		// test catches a mapper that falls back to them.
+		result.usage.input_tokens = 30;
+		result.usage.output_tokens = 250;
+		result.usage.cache_read_input_tokens = 71_000;
+		const signals = mapSDKMessageToAgentSignals(result, SESSION, TURN_ID, state, log, registry);
+
+		assert.strictEqual(signals.length, 1);
+		const usage = signals[0];
+		assert.ok(usage.kind === 'action' && usage.action.type === ActionType.ChatUsage);
+		assert.strictEqual(usage.action.usage.inputTokens, 20);
+		assert.strictEqual(usage.action.usage.outputTokens, 200);
+		assert.strictEqual(usage.action.usage.cacheReadTokens, 70_000);
+		assert.strictEqual(readUsageInfoMeta(usage.action.usage).cacheCreationTokens, 1_500);
+		// The occupancy the gauge shows is unchanged from when the mapper
+		// pre-folded these three: the client now does that sum, once.
+		assert.strictEqual(usageOccupancyTokens(usage.action.usage), 71_520);
+	});
+
+	test('subagent assistant messages do not update main-loop context occupancy', () => {
+		const state = new ClaudeMapperState();
+		const inner = makeAssistantMessage(SESSION_ID, []);
+		inner.parent_tool_use_id = 'toolu_task_1';
+		inner.message.usage = { ...inner.message.usage, input_tokens: 999 };
+
+		mapSDKMessageToAgentSignals(inner, SESSION, TURN_ID, state, new NullLogService(), r());
+
+		assert.strictEqual(state.getLastMainLoopUsage(), undefined);
+	});
+
+	test('result success with multiple modelUsage entries attributes the turn to the model with the most output tokens and lists every entry', () => {
+		// A turn's `modelUsage` regularly holds the conversation model plus
+		// the CLI's background utility calls (e.g. Haiku). The turn must be
+		// attributed to the conversation model — not whichever key happens to
+		// come first — and every entry must surface in `turnTokenTotals`.
+		const result = makeResultSuccess(SESSION_ID);
+		result.modelUsage = {
+			'claude-haiku-test': {
+				inputTokens: 200,
+				outputTokens: 8,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+				webSearchRequests: 0,
+				costUSD: 0,
+				contextWindow: 200_000,
+				maxOutputTokens: 8192,
+			},
+			'claude-main-test': {
+				inputTokens: 1000,
+				outputTokens: 500,
+				cacheReadInputTokens: 300,
+				cacheCreationInputTokens: 0,
+				webSearchRequests: 0,
+				costUSD: 0,
+				contextWindow: 200_000,
+				maxOutputTokens: 8192,
+			},
+		};
+
+		const signals = mapSDKMessageToAgentSignals(result, SESSION, TURN_ID, new ClaudeMapperState(), new NullLogService(), r());
+
+		assert.strictEqual(signals.length, 1);
+		const usage = signals[0];
+		assert.ok(usage.kind === 'action' && usage.action.type === ActionType.ChatUsage);
+		assert.strictEqual(usage.action.usage.model, 'claude-main-test');
+		assert.deepStrictEqual(usage.action.usage._meta?.['turnTokenTotals'], [
+			{ model: 'claude-haiku-test', inputTokens: 200, cachedTokens: 0, outputTokens: 8 },
+			{ model: 'claude-main-test', inputTokens: 1000, cachedTokens: 300, outputTokens: 500 },
 		]);
 	});
 
@@ -888,6 +987,8 @@ suite('claudeMapSessionEvents — direct mapper tests', () => {
 		// Per-turn credits come from CAPI `copilot_usage` via the proxy, not
 		// from the SDK's Anthropic-list-price `total_cost_usd`. The mapper
 		// must never attach a `_meta.cost` (it would mislabel USD as credits).
+		// The bag itself is no longer empty — cache creation rides in it — so the
+		// assertion is about the key, not about `_meta` being absent.
 		const result = makeResultSuccess(SESSION_ID);
 		result.total_cost_usd = 0.1234;
 
@@ -896,7 +997,8 @@ suite('claudeMapSessionEvents — direct mapper tests', () => {
 		assert.strictEqual(signals.length, 1);
 		const usage = signals[0];
 		assert.ok(usage.kind === 'action' && usage.action.type === ActionType.ChatUsage);
-		assert.strictEqual(usage.action.usage._meta, undefined);
+		assert.strictEqual(readUsageInfoMeta(usage.action.usage).cost, undefined);
+		assert.deepStrictEqual(usage.action.usage._meta, { cacheCreationTokens: 0 });
 	});
 
 	test('result success without modelUsage omits the model field on ChatUsage', () => {

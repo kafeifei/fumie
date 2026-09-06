@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { Event } from '../../../../../../base/common/event.js';
 import { Disposable } from '../../../../../../base/common/lifecycle.js';
 import { LRUCache } from '../../../../../../base/common/map.js';
 import { constObservable, derived, derivedOpts, IObservable, mapObservableArrayCached, observableFromEvent } from '../../../../../../base/common/observable.js';
@@ -13,6 +14,7 @@ import { IAgentConnection } from '../../../../../../platform/agentHost/common/ag
 import { buildTurnChangesetUri, ChangesetKind } from '../../../../../../platform/agentHost/common/changesetUri.js';
 import { normalizeFileEdit } from '../../../../../../platform/agentHost/common/fileEditDiff.js';
 import { toAgentHostUri } from '../../../../../../platform/agentHost/common/agentHostUri.js';
+import { NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
 import {
 	buildDefaultChatUri,
 	ChangesetStatus,
@@ -67,6 +69,12 @@ function getToolCallFileEdits(toolCall: ToolCallState): ISessionFileDiff[] {
  * lazily inside the returned observable (so they exist only while a summary is
  * actually observing the diffs) and the per-request observables are memoized so
  * repeated lookups share one subscription.
+ *
+ * For a session the host does not know yet, every subscription is deferred
+ * until the backend announces it: a client-local Agents-window draft renders
+ * its first turn the instant the user presses Enter, which is before the
+ * handler's `createSession` lands, so subscribing right away would fail on the
+ * wire with "Session not found on backend".
  */
 export class AgentHostResponseFileChangesProvider extends Disposable implements IChatResponseFileChangesProvider {
 
@@ -78,6 +86,7 @@ export class AgentHostResponseFileChangesProvider extends Disposable implements 
 		private readonly _connectionAuthority: string,
 		private readonly _resolveBackendSession: (sessionResource: URI) => URI | undefined,
 		private readonly _resolveBackendChat?: (sessionResource: URI) => URI | undefined,
+		private readonly _isPendingSession?: (sessionResource: URI) => boolean,
 	) {
 		super();
 	}
@@ -92,7 +101,7 @@ export class AgentHostResponseFileChangesProvider extends Disposable implements 
 		const key = `${backendSession.toString()}\0${backendChat?.toString() ?? ''}\0${requestId}`;
 		let obs = this._perRequest.get(key);
 		if (!obs) {
-			obs = this._createDiffsObservable(backendSession, backendChat, requestId);
+			obs = this._createDiffsObservable(this._backendSessionWhenKnown(sessionResource, backendSession), backendSession, backendChat, requestId);
 			this._perRequest.set(key, obs);
 		}
 		return obs;
@@ -108,18 +117,43 @@ export class AgentHostResponseFileChangesProvider extends Disposable implements 
 		const key = `${backendSession.toString()}\0${backendChat?.toString() ?? ''}\0${requestId}`;
 		let obs = this._perRequestFileEdits.get(key);
 		if (!obs) {
-			obs = this._createFileEditDiffsObservable(backendSession, backendChat, requestId);
+			obs = this._createFileEditDiffsObservable(this._backendSessionWhenKnown(sessionResource, backendSession), backendSession, backendChat, requestId);
 			this._perRequestFileEdits.set(key, obs);
 		}
 		return obs;
 	}
 
-	private _createDiffsObservable(backendSession: URI, backendChat: URI | undefined, requestId: string): IObservable<readonly IEditSessionEntryDiff[]> {
+	/**
+	 * Resolves to `backendSession` only once the host is known to have the
+	 * session, so callers never subscribe to a session that does not exist yet.
+	 * A session that is not a pending client-local draft — or one someone else
+	 * already holds on the wire (the handler, or the editor-window provisional
+	 * service for an untitled chat) — is known immediately; otherwise the
+	 * observable stays `undefined` until the host announces the session.
+	 */
+	private _backendSessionWhenKnown(sessionResource: URI, backendSession: URI): IObservable<URI | undefined> {
+		if (!this._isPendingSession?.(sessionResource) || this._connection.getSubscriptionUnmanaged(StateComponents.Session, backendSession)) {
+			return constObservable(backendSession);
+		}
+
+		const backendSessionId = backendSession.toString();
+		const sessionAdded = Event.filter(
+			this._connection.onDidNotification,
+			n => n.type === NotificationType.SessionAdded && String(n.summary.resource) === backendSessionId,
+		);
+		let known = false;
+		return observableFromEvent(this, sessionAdded, notification => {
+			known ||= notification !== undefined;
+			return known ? backendSession : undefined;
+		});
+	}
+
+	private _createDiffsObservable(backendSessionObs: IObservable<URI | undefined>, backendSession: URI, backendChat: URI | undefined, requestId: string): IObservable<readonly IEditSessionEntryDiff[]> {
 		// Resolve the per-turn changeset URI, but only when the agent actually
 		// advertises a `turn` changeset in its catalogue. Agents that don't
 		// support per-turn changesets never produce a turn-changeset URI, so
 		// the summary stays empty (and self-hidden) for them.
-		const sessionStateObs = this._subscribe<SessionState>(StateComponents.Session, constObservable(backendSession));
+		const sessionStateObs = this._subscribe<SessionState>(StateComponents.Session, backendSessionObs);
 
 		const turnChangesetUriObs = derivedOpts<URI | undefined>({ equalsFn: isEqual }, reader => {
 			const sessionState = sessionStateObs.read(reader).read(reader);
@@ -134,7 +168,7 @@ export class AgentHostResponseFileChangesProvider extends Disposable implements 
 		});
 
 		const changesetStateObs = this._subscribe<ChangesetState>(StateComponents.Changeset, turnChangesetUriObs);
-		const responseFileEditsObs = this._createFileEditDiffsObservable(backendSession, backendChat, requestId);
+		const responseFileEditsObs = this._createFileEditDiffsObservable(backendSessionObs, backendSession, backendChat, requestId);
 
 		return derived(reader => {
 			if (!turnChangesetUriObs.read(reader)) {
@@ -150,11 +184,16 @@ export class AgentHostResponseFileChangesProvider extends Disposable implements 
 		});
 	}
 
-	private _createFileEditDiffsObservable(backendSession: URI, backendChat: URI | undefined, requestId: string): IObservable<readonly IChatResponseFileEdit[]> {
-		const sessionStateObs = this._subscribe<SessionState>(StateComponents.Session, constObservable(backendSession));
+	private _createFileEditDiffsObservable(backendSessionObs: IObservable<URI | undefined>, backendSession: URI, backendChat: URI | undefined, requestId: string): IObservable<readonly IChatResponseFileEdit[]> {
+		const sessionStateObs = this._subscribe<SessionState>(StateComponents.Session, backendSessionObs);
 		const defaultChatUri = URI.parse(buildDefaultChatUri(backendSession.toString()));
 
 		const chatUrisObs = derivedOpts<readonly URI[]>({ equalsFn: uriArrayEquals }, reader => {
+			// The host does not know the session yet: opening any chat
+			// subscription now would fail on the wire.
+			if (!backendSessionObs.read(reader)) {
+				return [];
+			}
 			if (backendChat) {
 				return [backendChat];
 			}

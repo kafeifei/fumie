@@ -4,9 +4,74 @@
  *--------------------------------------------------------------------------------------------*/
 
 .agent-sessions-workbench .part.auxiliarybar > .title {
-	padding-left: 4px;
-	padding-right: 2px;
+	padding-left: 8px;
+	padding-right: 4px;
+	height: 35px;
 	background-color: var(--vscode-agentsPanel-background);
+	border-bottom: 1px solid var(--vscode-agentsPanel-border, transparent);
+}
+
+/* Compact Files | Changes tabs — inspector switch, not a VS Code pane title. */
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title.has-composite-bar > .title-label {
+	display: none;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector .pane-header {
+	display: none !important;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .composite-bar-container {
+	flex: 1;
+	min-width: 0;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .composite-bar-container > .composite-bar > .monaco-action-bar .action-item .action-label {
+	font-size: var(--vscode-agents-fontSize-label1, 12px);
+	font-weight: var(--vscode-agents-fontWeight-medium, 500);
+	text-transform: none;
+	letter-spacing: 0;
+	padding: 4px 10px;
+	line-height: 18px;
+	color: var(--vscode-descriptionForeground);
+	outline: none !important;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .composite-bar-container > .composite-bar > .monaco-action-bar .action-item .action-label::before {
+	display: none;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .composite-bar-container > .composite-bar > .monaco-action-bar .action-item:hover .action-label,
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .composite-bar-container > .composite-bar > .monaco-action-bar .action-item:focus .action-label {
+	color: var(--vscode-foreground) !important;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .composite-bar-container > .composite-bar > .monaco-action-bar .action-item.checked .action-label {
+	color: var(--vscode-foreground) !important;
+	font-weight: var(--vscode-agents-fontWeight-semiBold, 600);
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .composite-bar-container > .composite-bar > .monaco-action-bar .action-item.checked:not(:focus) .active-item-indicator:before,
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .composite-bar-container > .composite-bar > .monaco-action-bar .action-item.checked.clicked:focus .active-item-indicator:before {
+	border-top-color: transparent !important;
+	border-bottom: 2px solid var(--vscode-panelTitle-activeBorder, var(--vscode-focusBorder));
+	top: auto;
+	bottom: 0;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .title-actions {
+	opacity: 0;
+	transition: opacity 80ms ease;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title:hover > .title-actions,
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title:focus-within > .title-actions {
+	opacity: 1;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector > .title > .title-actions .action-label {
+	width: 20px;
+	height: 20px;
+	padding: 2px;
 }
 
 /* Override base workbench monaco editor background in auxiliary bar content */
@@ -14,4 +79,30 @@
 .agent-sessions-workbench .part.auxiliarybar > .content .monaco-editor .margin,
 .agent-sessions-workbench .part.auxiliarybar > .content .monaco-editor .monaco-editor-background {
 	background-color: var(--vscode-agentsPanel-background);
+}
+
+/* Dense inspector trees (Files explorer + Changes list). */
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector .monaco-list .monaco-list-row {
+	border-radius: var(--vscode-cornerRadius-small, 4px);
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector .monaco-list .monaco-list-row .monaco-icon-label {
+	font-size: var(--vscode-agents-fontSize-label1, 12px);
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector .explorer-folders-view {
+	padding: 2px 4px 8px;
+	box-sizing: border-box;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector .explorer-folders-view .monaco-tl-indent {
+	width: 8px;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector .explorer-folders-view .monaco-tl-twistie {
+	padding-right: 2px;
+}
+
+.agent-sessions-workbench .part.auxiliarybar.sessions-inspector .explorer-folders-view .monaco-list-row:hover {
+	background: var(--vscode-list-hoverBackground);
 }

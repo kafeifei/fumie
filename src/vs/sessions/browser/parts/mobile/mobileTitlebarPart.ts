@@ -30,6 +30,7 @@ import { ChatEntitlement, ChatEntitlementService, IChatEntitlementService } from
 import { getAccountTitleBarState, getAccountProfileImageUrl, getAccountTitleBarBadgeKey, resolveAccountInfo } from '../../accountTitleBarState.js';
 import { IChatDashboardService } from '../../chatDashboardService.js';
 import { MOBILE_OPEN_CHANGES_VIEW_COMMAND_ID } from './contributions/mobileChangesView.js';
+import { formatTokenCount } from '../../../../base/common/numbers.js';
 import { URI } from '../../../../base/common/uri.js';
 
 /**
@@ -179,6 +180,7 @@ export class MobileTitlebarPart extends Disposable {
 		newSessionButton.setAttribute('aria-label', localize('mobileTopBar.newSessionAria', "New session"));
 		const newSessionIcon = append(newSessionButton, $('span'));
 		newSessionIcon.classList.add(...ThemeIcon.asClassNameArray(Codicon.plus));
+		append(newSessionButton, $('span.mobile-new-session-label')).textContent = localize('mobileTopBar.newSessionLabel', "New");
 		this._register(addDisposableListener(newSessionButton, EventType.CLICK, () => this._onDidClickNewSession.fire()));
 
 		// Account indicator — shown on welcome/new session, hidden in a chat
@@ -230,8 +232,8 @@ export class MobileTitlebarPart extends Disposable {
 			changesPill.style.display = visible ? '' : 'none';
 			if (visible) {
 				if (added > 0 || removed > 0) {
-					changesAddedEl.textContent = `+${added}`;
-					changesRemovedEl.textContent = `-${removed}`;
+					changesAddedEl.textContent = `+${formatTokenCount(added)}`;
+					changesRemovedEl.textContent = `-${formatTokenCount(removed)}`;
 					changesPill.title = localize('mobileTopBar.changesTooltip', "{0} files changed (+{1} -{2})", changes.length, added, removed);
 				} else {
 					changesAddedEl.textContent = changes.length === 1

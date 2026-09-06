@@ -91,6 +91,10 @@
 	display: none !important;
 }
 
+.new-chat-widget-content.no-agent-host .mobile-new-session-intro {
+	display: none;
+}
+
 /* Animate in alongside the rest of the welcome content so it lands at the
  * same time as the workspace picker would have. */
 .new-chat-widget-container.revealed .no-agent-host-empty-state {

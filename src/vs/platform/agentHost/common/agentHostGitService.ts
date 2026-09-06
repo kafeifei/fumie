@@ -203,6 +203,23 @@ export interface IWorktreeFileProgress {
 	readonly filesTotal: number;
 }
 
+/**
+ * Immutable four-state Git snapshot used to build a stash-shaped archive
+ * commit without touching the visible branch, real index, or refs/stash.
+ */
+export interface IWorktreeArchiveSnapshot {
+	/** Commit checked out by the worktree when the snapshot was captured. */
+	readonly baseCommit: string;
+	/** Tree of the checked-out base commit. */
+	readonly baseTreeOid: string;
+	/** Tree represented by the real index. */
+	readonly indexTreeOid: string;
+	/** Tree represented by tracked working-tree contents. */
+	readonly workingTreeOid: string;
+	/** Tree containing only non-ignored untracked paths, when any exist. */
+	readonly untrackedTreeOid?: string;
+}
+
 export interface IAddWorktreeOptions {
 	readonly path: URI;
 	readonly commitish: string;
@@ -247,6 +264,12 @@ export interface IAgentHostGitService {
 	/** Removes a worktree, preserving Git's dirty-worktree protection unless `force` is explicitly requested. */
 	removeWorktree(repositoryRoot: URI, worktree: URI, options?: { readonly force?: boolean }): Promise<void>;
 	/**
+	 * Deletes a local branch after its Fumie-owned worktree has been removed.
+	 * Optional only so narrow test doubles that never manage worktrees do not
+	 * need to implement destructive Git operations.
+	 */
+	deleteBranch?(repositoryRoot: URI, branchName: string, options?: { readonly force?: boolean }): Promise<void>;
+	/**
 	 * Returns true when the named branch exists in the repository
 	 * (`refs/heads/<branchName>` resolves). Used by archive cleanup to
 	 * confirm the branch is preserved before deleting the worktree, and by
@@ -260,6 +283,12 @@ export interface IAgentHostGitService {
 	 * worktree that still contains uncommitted work.
 	 */
 	hasUncommittedChanges(workingDirectory: URI): Promise<boolean>;
+	/**
+	 * Captures tracked, staged, and untracked changes into Git objects without
+	 * touching the real index or visible branch. Git-ignored files are outside
+	 * this boundary and belong to the explicit worktree-include/setup contract.
+	 */
+	captureWorktreeArchiveSnapshot?(workingDirectory: URI): Promise<IWorktreeArchiveSnapshot | undefined>;
 
 	/**
 	 * Stages and commits all tracked, staged, and untracked changes in the
@@ -367,10 +396,15 @@ export interface IAgentHostGitService {
 	captureWorkingTreeAsTree(workingDirectory: URI): Promise<string | undefined>;
 
 	/**
-	 * Creates a commit object from a tree (optionally chained to a parent)
+	 * Creates a commit object from a tree (optionally chained to one or more parents)
 	 * and returns its OID. Does NOT update any ref.
 	 */
-	commitTree(repositoryRoot: URI, treeOid: string, parentOid: string | undefined, message: string): Promise<string | undefined>;
+	commitTree(repositoryRoot: URI, treeOid: string, parentOid: string | undefined, message: string, options?: { readonly syntheticIdentity?: boolean }): Promise<string | undefined>;
+	/** Creates a commit with an ordered parent list, used for standard stash-shaped archive commits. */
+	commitTreeWithParents?(repositoryRoot: URI, treeOid: string, parentOids: readonly string[], message: string, options?: { readonly syntheticIdentity?: boolean }): Promise<string | undefined>;
+
+	/** Applies a stash-shaped private archive commit, including its index and untracked parent. */
+	applyWorktreeArchiveStash?(workingDirectory: URI, ref: string): Promise<void>;
 
 	/**
 	 * Updates a ref to point at `newOid`. Creates the ref if missing.
@@ -379,7 +413,8 @@ export interface IAgentHostGitService {
 
 	/**
 	 * Batch-deletes the given refs via `git update-ref --stdin -z`.
-	 * Missing refs are tolerated.
+	 * Missing refs are tolerated; every other Git error is propagated and
+	 * successful completion verifies that every requested ref is absent.
 	 */
 	deleteRefs(repositoryRoot: URI, refs: readonly string[]): Promise<void>;
 

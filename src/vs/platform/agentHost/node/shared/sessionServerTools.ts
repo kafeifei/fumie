@@ -10,7 +10,7 @@ import { localize } from '../../../../nls.js';
 import { AgentSession, type AgentProvider, type IAgentCreateSessionConfig, type IAgentModelInfo, type IAgentSessionMetadata } from '../../common/agent.js';
 import { SessionStatus } from '../../common/state/protocol/channels-session/state.js';
 import type { IAgentServerToolDefinition } from '../../common/agentServerTools.js';
-import { buildChatUri, buildDefaultChatUri, getInlineToolInput, getSessionRelatedPullRequestUrls, isDefaultChatUri, isSessionStatusArchived, isSessionStatusRead, parseChatUri, readSessionGitState, readSessionGitHubState, readSessionOrchestration, ResponsePartKind, ToolCallStatus, TurnState, type ISessionOrchestration, type Message, type ModelSelection, type ResponsePart, type SessionIdleNotification, type ToolCallState, type ToolDefinition, type Turn, type URI as ProtocolURI } from '../../common/state/sessionState.js';
+import { buildChatUri, buildDefaultChatUri, getInlineToolInput, getSessionRelatedPullRequestUrls, isSessionStatusArchived, isSessionStatusRead, parseChatUri, readSessionGitState, readSessionGitHubState, readSessionOrchestration, ResponsePartKind, ToolCallStatus, TurnState, type ISessionOrchestration, type Message, type ModelSelection, type ResponsePart, type SessionIdleNotification, type ToolCallState, type ToolDefinition, type Turn, type URI as ProtocolURI } from '../../common/state/sessionState.js';
 import { buildOpenSessionLinkUri, parseOpenSessionLinkChatId, parseOpenSessionLinkUri } from '../../common/openSessionLink.js';
 import { SessionServerToolName } from '../../common/serverToolNames.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -33,7 +33,7 @@ const maxCreatedChats = 25;
 /** Process-wide backstop against runaway `send_message` fan-out. */
 const maxSentMessages = 50;
 
-const sessionConfirmationToolNames: ReadonlySet<string> = new Set([SessionServerToolName.CreateSession, SessionServerToolName.CreateChat, SessionServerToolName.SendMessage, SessionServerToolName.DeleteSession]);
+const sessionConfirmationToolNames: ReadonlySet<string> = new Set([SessionServerToolName.CreateSession, SessionServerToolName.CreateChat, SessionServerToolName.SendMessage]);
 
 /** Whether the given session server tool requires user confirmation before it runs. */
 export function sessionToolRequiresConfirmation(toolName: string): boolean {
@@ -92,25 +92,6 @@ const createChatInputSchema: ToolDefinition['inputSchema'] = {
 	required: ['prompt'],
 };
 
-const renameChatInputSchema: ToolDefinition['inputSchema'] = {
-	type: 'object',
-	properties: {
-		session: { type: 'string', description: 'Optional owning session: a session URI from `list_sessions` or an `agent-host-session://` link. When provided with `chat`, it must match that chat\'s session.' },
-		chat: { type: 'string', description: 'The chat to rename: pass an `agent-host-session://` session or chat link. Omit when renaming the chat in which this tool is running.' },
-		title: { type: 'string', maxLength: 200, description: 'Short, descriptive chat title, ideally 1-4 words.' },
-		automatic: { type: 'boolean', description: 'Set to true only when this call is fulfilling the host\'s automatic title reminder. Omit for user-requested renames.' },
-	},
-	required: ['title'],
-};
-
-const deleteSessionInputSchema: ToolDefinition['inputSchema'] = {
-	type: 'object',
-	properties: {
-		session: { type: 'string', description: 'The session to delete: a session URI from `list_sessions` or an `agent-host-session://` link (e.g. from `create_session`).' },
-	},
-	required: ['session'],
-};
-
 const sendMessageInputSchema: ToolDefinition['inputSchema'] = {
 	type: 'object',
 	properties: {
@@ -167,13 +148,6 @@ export const sessionServerToolDefinitions: IAgentServerToolDefinition[] = [
 		annotations: { readOnlyHint: false },
 	},
 	{
-		name: SessionServerToolName.RenameChat,
-		title: 'Rename Chat',
-		description: 'Rename one specific chat so it is easy to find later. Renaming the default chat also names its owning session, while peer-chat titles remain independent. Use a short, human-friendly chat name in sentence case (1-4 words). Pass an `agent-host-session://` session or chat link to target another chat, or omit `chat` to rename the chat in which this tool is running. Name a fresh chat once its scope is clear, typically soon after `create_chat` or early in that chat. Call this tool again whenever the user explicitly asks to rename the chat; every invocation replaces the current title.',
-		inputSchema: renameChatInputSchema,
-		annotations: { readOnlyHint: false },
-	},
-	{
 		name: SessionServerToolName.SendMessage,
 		title: 'Send Message',
 		description: 'Send a message to an existing session or chat, starting a new turn there. Provide a session URI from `list_sessions` or an `agent-host-session://` link (a `create_chat` link targets that specific chat). The message is delivered asynchronously — this tool does not wait for or return the reply. The UI shows a confirmation with a button to open the target, so reply with a single short sentence and do NOT print the URL or tell the user to click a button.',
@@ -186,13 +160,6 @@ export const sessionServerToolDefinitions: IAgentServerToolDefinition[] = [
 		description: 'Read the recent conversation of an existing session or chat: a compacted transcript of its turns (messages, replies, and tool calls). Use this to see what a session you created is doing, or to gather context before sending it a message. Returns a compacted summary by default (`detail: "summary"`); request `digest` or `full` for more detail. For session metadata (status, working directory, changes, …) use `list_sessions` with the `session` argument.',
 		inputSchema: getSessionContextInputSchema,
 		annotations: { readOnlyHint: true },
-	},
-	{
-		name: SessionServerToolName.DeleteSession,
-		title: 'Delete Session',
-		description: 'Permanently delete a session (identified by a session URI from `list_sessions`), including its stored data. This cannot be undone. Refuses to delete the current session.',
-		inputSchema: deleteSessionInputSchema,
-		annotations: { readOnlyHint: false, destructiveHint: true },
 	},
 ];
 
@@ -222,17 +189,12 @@ export interface IResolvedCreateSessionArgs {
 
 /** Minimal dependency surface needed by the session server-tool group. */
 export interface ISessionServerToolAccessor {
-	readonly isActiveAgentTitleGenerationEnabled: () => boolean;
 	readonly listSessions: () => Promise<readonly IAgentSessionMetadata[]>;
-	readonly getSession: (session: URI) => Promise<IAgentSessionMetadata | undefined>;
 	readonly createSession: (config: IAgentCreateSessionConfig) => Promise<URI>;
 	readonly getModels: () => readonly IAgentModelInfo[];
 	readonly getCreationDefaults: (source: URI) => ISessionCreationDefaults | undefined;
 	readonly startPrompt: (session: URI, chat: URI, prompt: string) => Promise<void>;
 	readonly createChat: (session: URI, chat: URI, options?: { title?: string; model?: ModelSelection }) => Promise<void>;
-	readonly renameChat: (session: URI, chat: URI, title: string) => Promise<IRenameTitleResult>;
-	readonly reportToolError: (toolName: SessionServerToolName, error: unknown) => void;
-	readonly deleteSession: (session: URI) => Promise<void>;
 	/** Reads a point-in-time snapshot of a session's chat conversation (default chat, or a specific chat by id). */
 	readonly getChatContext: (session: URI, chatId?: string) => Promise<IChatContextSnapshot | undefined>;
 	/** The spawn depth of a session (0 for a user/top-level session, N for one created N levels deep by `create_session`). */
@@ -240,10 +202,6 @@ export interface ISessionServerToolAccessor {
 	/** Records the spawn depth of a freshly-created session so its own `create_session` calls can enforce the recursion limit. */
 	readonly setSessionSpawnDepth: (session: URI, depth: number) => void;
 	readonly setSessionOrchestration: (session: URI, orchestration: ISessionOrchestration) => Promise<void>;
-}
-
-export interface IRenameTitleResult {
-	readonly title: string;
 }
 
 export interface ISessionCreationDefaults {
@@ -327,50 +285,6 @@ function getOptionalString(value: unknown, field: string, toolName: string): str
 		throw new Error(`Invalid ${toolName} input: ${field} must be a non-empty string.`);
 	}
 	return value;
-}
-
-function decodeHtmlEntities(value: string): string {
-	const namedEntities: Record<string, string> = {
-		amp: '&',
-		apos: '\'',
-		gt: '>',
-		lt: '<',
-		nbsp: '\u00a0',
-		quot: '"',
-	};
-	return value.replace(/&(?:#(\d+)|#x([\da-f]+)|([a-z]+));/gi, (match, decimal: string | undefined, hexadecimal: string | undefined, named: string | undefined) => {
-		const numeric = decimal ?? hexadecimal;
-		if (numeric !== undefined) {
-			const codePoint = Number.parseInt(numeric, decimal !== undefined ? 10 : 16);
-			return Number.isSafeInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10FFFF
-				? String.fromCodePoint(codePoint)
-				: match;
-		}
-		return named ? namedEntities[named.toLowerCase()] ?? match : match;
-	});
-}
-
-function normalizeGeneralChatTitle(title: string): string {
-	return decodeHtmlEntities(title).trim().replace(/\s+/g, ' ');
-}
-
-function normalizeProjectSessionTitle(title: string): string {
-	const trimmed = decodeHtmlEntities(title)
-		.trim()
-		.replace(/^["'`]+|["'`]+$/g, '')
-		.trim()
-		.replace(/^[.,;:!?\-\u2014]+|[.,;:!?\-\u2014]+$/g, '')
-		.trim();
-	const humanized = !/\s/.test(trimmed) && /[/_-]/.test(trimmed)
-		? trimmed.replace(/[/_\-\s]+/g, ' ')
-		: trimmed;
-	return humanized.replace(/\s+/g, ' ').trim();
-}
-
-export function validateRenameTitle(title: string, toolName: SessionServerToolName.RenameChat): void {
-	if (Array.from(title).length > 200) {
-		throw new Error(`Invalid ${toolName} input: title must not exceed 200 characters.`);
-	}
 }
 
 function parseWorkspaceUri(workspace: string): URI | undefined {
@@ -824,13 +738,31 @@ function resolveChatSession(sessionInput: string, sessions: readonly IAgentSessi
 	return session;
 }
 
+/**
+ * Resolves a model by id/name for `create_chat`, preferring a match within the target
+ * session's own harness (provider) so that a model id shared by several harnesses resolves
+ * to the one that actually belongs to the session being targeted. Falls back to searching
+ * every harness so a model that only exists elsewhere is still found (and then rejected by
+ * the caller's provider-mismatch check) rather than reported as unknown.
+ */
+function resolveModelForSession(modelName: string | undefined, models: readonly IAgentModelInfo[], targetProvider: AgentProvider | undefined): IAgentModelInfo | undefined {
+	if (modelName === undefined) {
+		return undefined;
+	}
+	const matchesName = (candidate: IAgentModelInfo) => candidate.id === modelName || candidate.name === modelName;
+	const model = models.find(candidate => matchesName(candidate) && candidate.provider === targetProvider) ?? models.find(matchesName);
+	if (!model) {
+		throw new Error(`Invalid ${SessionServerToolName.CreateChat} input: model must match an available model id or name.`);
+	}
+	return model;
+}
+
 /** Validates and resolves create-chat arguments; defaults the session to {@link currentSession} when omitted. */
 export function getCreateChatArgs(rawArgs: unknown, sessions: readonly IAgentSessionMetadata[], models: readonly IAgentModelInfo[], currentSession?: URI): { session: URI; prompt: string; title?: string; model?: IAgentModelInfo } {
 	const args = (rawArgs ?? {}) as ICreateChatArgs;
 	const prompt = getRequiredString(args.prompt, 'prompt', SessionServerToolName.CreateChat);
 	const title = getOptionalString(args.title, 'title', SessionServerToolName.CreateChat);
 	const modelName = getOptionalString(args.model, 'model', SessionServerToolName.CreateChat);
-	const model = resolveModel(modelName, models);
 	const sessionInput = getOptionalString(args.session, 'session', SessionServerToolName.CreateChat);
 	let session: URI;
 	if (sessionInput !== undefined) {
@@ -840,6 +772,7 @@ export function getCreateChatArgs(rawArgs: unknown, sessions: readonly IAgentSes
 	} else {
 		throw new Error(`Invalid ${SessionServerToolName.CreateChat} input: no session provided and the current session could not be determined.`);
 	}
+	const model = resolveModelForSession(modelName, models, AgentSession.provider(session));
 	return { session, prompt, ...(title !== undefined ? { title } : {}), ...(model !== undefined ? { model } : {}) };
 }
 
@@ -861,6 +794,9 @@ export async function applyCreateChatTool(accessor: ISessionServerToolAccessor, 
 	}
 	const defaults = source ? accessor.getCreationDefaults(source) : undefined;
 	const targetProvider = AgentSession.provider(args.session);
+	if (args.model !== undefined && args.model.provider !== targetProvider) {
+		throw new Error(`Invalid ${SessionServerToolName.CreateChat} input: model provider ${args.model.provider} does not match session provider ${targetProvider}.`);
+	}
 	const model = args.model !== undefined ? { id: args.model.id } : targetProvider === defaults?.provider ? defaults?.model : undefined;
 	const chatId = generateUuid();
 	const chat = URI.parse(buildChatUri(args.session.toString(), chatId));
@@ -872,128 +808,6 @@ export async function applyCreateChatTool(accessor: ISessionServerToolAccessor, 
 /** Builds the model-facing `create_chat` result. */
 export function formatCreateChatResult(result: ICreateChatResult): string {
 	return `Chat created (${result.openLink}). Reply with one short sentence confirming the chat was created; do not print the URL or mention a button.`;
-}
-
-interface IRenameChatArgs {
-	readonly session?: unknown;
-	readonly chat?: unknown;
-	readonly title?: unknown;
-	readonly automatic?: unknown;
-}
-
-export interface IResolvedRenameChatArgs {
-	readonly session: URI;
-	readonly chat: URI;
-	readonly title: string;
-	readonly chatId: string;
-}
-
-function currentChatUri(toolCallChannel?: ProtocolURI): URI | undefined {
-	if (!toolCallChannel) {
-		return undefined;
-	}
-	const parsed = parseChatUri(toolCallChannel);
-	if (!parsed) {
-		return undefined;
-	}
-	return URI.parse(toolCallChannel);
-}
-
-function normalizeRenameChatTitle(requestedTitle: string, sessions: readonly IAgentSessionMetadata[], session: URI, chat: URI): string {
-	const metadata = sessions.find(candidate => candidate.session.toString() === session.toString());
-	const title = isDefaultChatUri(chat) && metadata?.workingDirectories?.length
-		? normalizeProjectSessionTitle(requestedTitle)
-		: normalizeGeneralChatTitle(requestedTitle);
-	if (!title) {
-		throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: title must contain non-whitespace characters.`);
-	}
-	validateRenameTitle(title, SessionServerToolName.RenameChat);
-	return title;
-}
-
-export function getRenameChatArgs(rawArgs: unknown, sessions: readonly IAgentSessionMetadata[], currentChannel?: ProtocolURI): IResolvedRenameChatArgs {
-	const args = (rawArgs ?? {}) as IRenameChatArgs;
-	const requestedTitle = getRequiredString(args.title, 'title', SessionServerToolName.RenameChat);
-	const sessionInput = getOptionalString(args.session, 'session', SessionServerToolName.RenameChat);
-	const chatInput = getOptionalString(args.chat, 'chat', SessionServerToolName.RenameChat);
-
-	if (chatInput !== undefined) {
-		const session = resolveKnownSession(chatInput, sessions);
-		const chatId = parseOpenSessionLinkChatId(chatInput);
-		if (!session) {
-			throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: chat must be an agent-host-session:// link targeting a known chat.`);
-		}
-		if (sessionInput !== undefined) {
-			const explicitSession = resolveKnownSession(sessionInput, sessions);
-			if (!explicitSession) {
-				throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: session must match the URI of a known session (see list_sessions).`);
-			}
-			if (explicitSession.toString() !== session.toString()) {
-				throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: session must match the owning session of chat.`);
-			}
-		}
-		const chat = URI.parse(chatId ? buildChatUri(session.toString(), chatId) : buildDefaultChatUri(session.toString()));
-		const parsed = parseChatUri(chat);
-		if (!parsed) {
-			throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: chat must target a known chat.`);
-		}
-		const title = normalizeRenameChatTitle(requestedTitle, sessions, session, chat);
-		return { session, chat, title, chatId: parsed.chatId };
-	}
-
-	const currentChat = currentChatUri(currentChannel);
-	if (!currentChat || !currentChannel) {
-		throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: chat must target a known chat, or the tool must run inside that chat.`);
-	}
-	const session = currentSessionUri(currentChannel);
-	if (sessionInput !== undefined) {
-		const explicitSession = resolveKnownSession(sessionInput, sessions);
-		if (!explicitSession) {
-			throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: session must match the URI of a known session (see list_sessions).`);
-		}
-		if (explicitSession.toString() !== session.toString()) {
-			throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: session must match the current chat's owning session.`);
-		}
-	}
-	const parsed = parseChatUri(currentChat.toString());
-	if (!parsed) {
-		throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: current channel is not a chat.`);
-	}
-	const title = normalizeRenameChatTitle(requestedTitle, sessions, session, currentChat);
-	return { session, chat: currentChat, title, chatId: parsed.chatId };
-}
-
-function getRenameChatSession(rawArgs: unknown, currentChannel?: ProtocolURI): URI {
-	const args = (rawArgs ?? {}) as IRenameChatArgs;
-	const chatInput = getOptionalString(args.chat, 'chat', SessionServerToolName.RenameChat);
-	if (chatInput !== undefined) {
-		const session = parseOpenSessionLinkUri(chatInput);
-		if (!session) {
-			throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: chat must be an agent-host-session:// link targeting a known chat.`);
-		}
-		return session;
-	}
-	if (!currentChannel || !currentChatUri(currentChannel)) {
-		throw new Error(`Invalid ${SessionServerToolName.RenameChat} input: chat must target a known chat, or the tool must run inside that chat.`);
-	}
-	return currentSessionUri(currentChannel);
-}
-
-export async function applyRenameChatTool(accessor: ISessionServerToolAccessor, rawArgs: unknown, currentChannel?: ProtocolURI): Promise<string> {
-	const args = (rawArgs ?? {}) as IRenameChatArgs;
-	const isAutomaticTitleRename = getOptionalBoolean(args.automatic, 'automatic', SessionServerToolName.RenameChat) === true;
-	const rename = async (): Promise<IRenameTitleResult> => {
-		const targetSession = getRenameChatSession(rawArgs, currentChannel);
-		const metadata = await accessor.getSession(targetSession);
-		const { session, chat, title } = getRenameChatArgs(rawArgs, metadata ? [metadata] : [], currentChannel);
-		return accessor.renameChat(session, chat, title);
-	};
-	if (isAutomaticTitleRename) {
-		void rename().catch(error => accessor.reportToolError(SessionServerToolName.RenameChat, error));
-		return 'Renaming chat.';
-	}
-	const result = await rename();
-	return `Renamed chat to "${result.title}".`;
 }
 
 interface ISendMessageArgs {
@@ -1244,36 +1058,6 @@ export function serializeCurrentSession(currentSession: URI, sessions: readonly 
 	});
 }
 
-interface IDeleteSessionArgs {
-	readonly session?: unknown;
-}
-
-/**
- * Validates delete-session arguments against current sessions and refuses to
- * delete {@link currentSession} (deleting the session the tool runs in would
- * tear down its own conversation).
- */
-export function getDeleteSessionArgs(rawArgs: unknown, sessions: readonly IAgentSessionMetadata[], currentSession?: URI): URI {
-	const args = (rawArgs ?? {}) as IDeleteSessionArgs;
-	const sessionInput = getRequiredString(args.session, 'session', SessionServerToolName.DeleteSession);
-	const session = resolveKnownSession(sessionInput, sessions);
-	if (!session) {
-		throw new Error(`Invalid ${SessionServerToolName.DeleteSession} input: session must match the URI of a known session (see list_sessions).`);
-	}
-	if (currentSession && session.toString() === currentSession.toString()) {
-		throw new Error(`Invalid ${SessionServerToolName.DeleteSession} input: refusing to delete the current session.`);
-	}
-	return session;
-}
-
-/** Deletes a session and returns the model-facing confirmation. */
-export async function applyDeleteSessionTool(accessor: ISessionServerToolAccessor, rawArgs: unknown, currentSession?: URI): Promise<string> {
-	const sessions = await accessor.listSessions();
-	const session = getDeleteSessionArgs(rawArgs, sessions, currentSession);
-	await accessor.deleteSession(session);
-	return `Deleted session ${session.toString()}. Reply with one short sentence confirming the session was deleted.`;
-}
-
 function getSessionToolDisplay(toolName: string, _args: unknown, _result?: IServerToolDisplayResult): IServerToolDisplay | undefined {
 	switch (toolName) {
 		case SessionServerToolName.ListSessions:
@@ -1292,12 +1076,6 @@ function getSessionToolDisplay(toolName: string, _args: unknown, _result?: IServ
 				displayName: localize('toolName.createChat', "Create Chat"),
 				invocationMessage: localize('toolInvoke.createChat', "Create chat"),
 			};
-		case SessionServerToolName.RenameChat:
-			return {
-				displayName: localize('toolName.renameChat', "Rename Chat"),
-				invocationMessage: localize('toolInvoke.renameChat', "Renaming chat"),
-				pastTenseMessage: localize('toolComplete.renameChat', "Requested chat rename"),
-			};
 		case SessionServerToolName.SendMessage:
 			return {
 				displayName: localize('toolName.sendMessage', "Send Message"),
@@ -1312,12 +1090,6 @@ function getSessionToolDisplay(toolName: string, _args: unknown, _result?: IServ
 			return {
 				displayName: localize('toolName.getCurrentSession', "Get Current Session"),
 				invocationMessage: localize('toolInvoke.getCurrentSession', "Get current session"),
-			};
-		case SessionServerToolName.DeleteSession:
-			return {
-				displayName: localize('toolName.deleteSession', "Delete Session"),
-				invocationMessage: localize('toolInvoke.deleteSession', "Deleting session"),
-				pastTenseMessage: localize('toolComplete.deleteSession', "Deleted session"),
 			};
 		default:
 			return undefined;
@@ -1339,8 +1111,10 @@ export function createSessionServerToolGroup(accessor?: ISessionServerToolAccess
 	let sentMessageCount = 0;
 	const group: IServerToolGroup = {
 		definitions: sessionServerToolDefinitions,
-		isEnabled(toolName: string): boolean {
-			return toolName !== SessionServerToolName.RenameChat || accessor?.isActiveAgentTitleGenerationEnabled() !== false;
+		isEnabled(): boolean {
+			// Every session tool is unconditionally advertised: none of them is
+			// behind a setting.
+			return true;
 		},
 		canRequireConfirmation(toolName: string): boolean {
 			return sessionToolRequiresConfirmation(toolName);
@@ -1377,8 +1151,6 @@ export function createSessionServerToolGroup(accessor?: ISessionServerToolAccess
 					createdChatCount++;
 					return formatCreateChatResult(result);
 				}
-				case SessionServerToolName.RenameChat:
-					return applyRenameChatTool(accessor, rawArgs, currentChannel);
 				case SessionServerToolName.SendMessage: {
 					if (sentMessageCount >= maxSentMessages) {
 						throw new Error(`Refusing to send more than ${maxSentMessages} messages from server tools in this process.`);
@@ -1389,8 +1161,6 @@ export function createSessionServerToolGroup(accessor?: ISessionServerToolAccess
 				}
 				case SessionServerToolName.GetSessionContext:
 					return applyGetSessionContextTool(accessor, rawArgs);
-				case SessionServerToolName.DeleteSession:
-					return applyDeleteSessionTool(accessor, rawArgs, currentSessionUri(currentChannel));
 				default:
 					throw new Error(`Unknown session server tool: ${toolName}`);
 			}

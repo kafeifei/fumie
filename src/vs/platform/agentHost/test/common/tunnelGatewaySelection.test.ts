@@ -37,6 +37,7 @@ function stubLocationPreferenceService(initial?: RemoteAgentHostLocationPreferen
 			store.set(hostKey, preference);
 			setCalls.push({ hostKey, preference });
 		},
+		clearPreference: hostKey => { store.delete(hostKey); },
 	};
 	return { service, setCalls };
 }

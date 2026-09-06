@@ -116,6 +116,41 @@ This is the **most permissive** contrib layer — providers can reach into non-p
 
 Entry points can import from all sessions layers: `sessions/~`, `services/*/~`, `contrib/*/~`, and `contrib/providers/*/~`.
 
+### Entry-point reachability
+
+The two entry points import their own registration files, so a registration the
+web entry never reaches is a silent web-only defect: it compiles, the desktop app
+works, and the browser gets an empty or missing UI.
+
+`src/vs/sessions/test/browser/webEntry.smoke.ts` guards the user-facing side of
+this. It imports `sessions.web.main.ts` — so it sees exactly the registrations
+the web bundle ships — and walks the constructor-injection graph of the Settings
+overlay, the sessions list and the new-session composer, failing with the widget
+and the unregistered service by name. Run it on its own browser page:
+
+```
+npm run test-sessions-web-entry
+```
+
+It is deliberately not named `*.test.ts`: importing the web entry registers the
+real file editor factory, which `workbench/test/browser/workbenchTestServices.ts`
+also registers, and sharing a page with the normal suite would make one of the
+two fail to load.
+
+The other half — a registration put behind the Electron-only door in the first
+place — is caught statically by the `local/code-no-electron-only-registration`
+ESLint rule, which runs on `src/vs/sessions/**/{electron-browser,electron-main,electron-utility,node}/**`.
+It reports a top-level `registerSingleton`, `registerWorkbenchContribution2`,
+`registerWorkbenchContribution` or `registerAction2` whose class comes from a
+`browser/` or `common/` module under `src/vs/sessions/`, or is declared in place
+and needs nothing from Electron. A neutral class from `vs/workbench` or
+`vs/platform` is left alone, because those are usually bridges whose only
+consumer is Electron-only. The rule's own doc comment records the rest of what it
+cannot see; `.eslint-plugin-local/tests/code-no-electron-only-registration-test.ts`
+is its fixture, where each expected report is pinned by an
+`eslint-disable-next-line` that ESLint reports as unused if the rule stops
+firing.
+
 ---
 
 ## Key Constraint

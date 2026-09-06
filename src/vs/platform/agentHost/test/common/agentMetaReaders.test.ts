@@ -12,7 +12,7 @@ import { readAgentCustomizationMeta, toAgentCustomizationMeta } from '../../comm
 import { getCommandArgumentHint, getCompletionAction, readCompletionAttachmentMeta, toCommandCompletionAttachmentMeta, toSkillCompletionAttachmentMeta } from '../../common/meta/agentCompletionAttachmentMeta.js';
 import { CustomizationType, MessageAttachmentKind, ToolCallStatus, hasReportedUsage, readUsageInfoMeta, type AgentCustomization, type ClientPluginCustomization, type ToolCallState, type UsageInfo } from '../../common/state/sessionState.js';
 import type { SessionModelInfo, SimpleMessageAttachment } from '../../common/state/protocol/state.js';
-import { createAgentModelByokMeta, readAgentModelByokIdentifier } from '../../common/agentModelByokMeta.js';
+import { createAgentModelByokMeta, readAgentModelByokHidden, readAgentModelByokIdentifier } from '../../common/agentModelByokMeta.js';
 import { createAgentModelSourceMeta, readAgentModelSourceId } from '../../common/agentModelSource.js';
 import { URI } from '../../../../base/common/uri.js';
 import { hasClientPluginMcpDefaultCwd, hasClientPluginMcpDefaultCwds, readClientPluginMcpDefaultCwd, toClientPluginMcpDefaultCwdsMeta } from '../../common/meta/clientPluginCustomizationMeta.js';
@@ -309,6 +309,33 @@ suite('Agent host _meta readers', () => {
 		test('ignores a wrong-typed identifier value', () => {
 			assert.strictEqual(readAgentModelByokIdentifier(model({ byokModelIdentifier: 42 })), undefined);
 		});
+
+		test('carries the host hidden marker only when the host has the model hidden', () => {
+			// Absent is the same answer as a host too old to publish the key: not hidden.
+			assert.deepStrictEqual({
+				hidden: createAgentModelByokMeta('customendpoint/Example/claude-opus-4-7', true),
+				visible: createAgentModelByokMeta('customendpoint/Example/claude-fable-5', false),
+				unstated: createAgentModelByokMeta('customendpoint/Example/claude-fable-5'),
+			}, {
+				hidden: { byokModelIdentifier: 'customendpoint/Example/claude-opus-4-7', byokModelHidden: true },
+				visible: { byokModelIdentifier: 'customendpoint/Example/claude-fable-5' },
+				unstated: { byokModelIdentifier: 'customendpoint/Example/claude-fable-5' },
+			});
+		});
+
+		test('reads the hidden marker, and only a literal true', () => {
+			assert.deepStrictEqual({
+				marked: readAgentModelByokHidden(model({ byokModelHidden: true })),
+				unmarked: readAgentModelByokHidden(model({ byokModelIdentifier: 'openrouter/gpt-4' })),
+				noBag: readAgentModelByokHidden(model(undefined)),
+				wrongType: readAgentModelByokHidden(model({ byokModelHidden: 'yes' })),
+			}, {
+				marked: true,
+				unmarked: false,
+				noBag: false,
+				wrongType: false,
+			});
+		});
 	});
 
 	suite('agent model source meta', () => {
@@ -372,10 +399,32 @@ suite('Agent host _meta readers', () => {
 		});
 
 		test('totals alone do not make a usage report count as reported consumption', () => {
-			// Totals always accompany per-call tokens or credits, and treating them as
+			// Totals always accustom per-call tokens or credits, and treating them as
 			// consumption on their own would make the restore path skip merging the
 			// richer persisted usage over a token-less stub.
 			assert.strictEqual(hasReportedUsage(usage({ turnTokenTotals: [{ model: 'gpt-5', inputTokens: 7, cachedTokens: 0, outputTokens: 3 }] })), false);
+		});
+
+		test('reads a well-formed backend-reported context window and drops malformed ones', () => {
+			assert.deepStrictEqual(
+				readUsageInfoMeta(usage({ modelContextWindow: { totalTokens: 200_000, maxOutputTokens: 32_000 } })).modelContextWindow,
+				{ totalTokens: 200_000, maxOutputTokens: 32_000 },
+			);
+			// A zero/absent output budget is omitted rather than kept as 0.
+			assert.deepStrictEqual(
+				readUsageInfoMeta(usage({ modelContextWindow: { totalTokens: 200_000, maxOutputTokens: 0 } })).modelContextWindow,
+				{ totalTokens: 200_000 },
+			);
+			// Codex emits the window as a bare number; normalized to the object form.
+			assert.deepStrictEqual(
+				readUsageInfoMeta(usage({ modelContextWindow: 272_000 })).modelContextWindow,
+				{ totalTokens: 272_000 },
+			);
+			assert.strictEqual(readUsageInfoMeta(usage({ modelContextWindow: 0 })).modelContextWindow, undefined);
+			assert.strictEqual(readUsageInfoMeta(usage({ modelContextWindow: { totalTokens: 0 } })).modelContextWindow, undefined);
+			assert.strictEqual(readUsageInfoMeta(usage({ modelContextWindow: { totalTokens: 'huge' } })).modelContextWindow, undefined);
+			assert.strictEqual(readUsageInfoMeta(usage({ modelContextWindow: 'nope' })).modelContextWindow, undefined);
+			assert.strictEqual(readUsageInfoMeta(usage({})).modelContextWindow, undefined);
 		});
 	});
 

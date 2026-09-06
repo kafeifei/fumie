@@ -81,6 +81,7 @@ function defineSuite(config: IAgentHostE2EProviderConfig, options: IDefineOption
 			lease = new AgentHostE2EServerLease(config, {
 				claudeSdkRoot: config.claudeSdkRoot,
 				codexSdkRoot: config.codexSdkRoot,
+				kimiSdkRoot: config.kimiSdkRoot,
 				target: options.target,
 			});
 		});

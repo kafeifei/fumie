@@ -12,7 +12,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import { IDefaultAccountService } from '../../../../../platform/defaultAccount/common/defaultAccount.js';
 import { AuthenticationSession, IAuthenticationService } from '../../../../../workbench/services/authentication/common/authentication.js';
 import { ChatEntitlement } from '../../../../../workbench/services/chat/common/chatEntitlementService.js';
-import { getAccountProfileImageUrl, getAccountTitleBarBadgeKey, getAccountTitleBarState, IAccountTitleBarStateContext, resolveAccountInfo } from '../../../../browser/accountTitleBarState.js';
+import { getAccountProfileImageUrl, getAccountTitleBarBadgeKey, getAccountTitleBarState, getSidebarAccountPresentation, IAccountTitleBarStateContext, resolveAccountInfo } from '../../../../browser/accountTitleBarState.js';
 
 suite('Sessions - Account Title Bar State', () => {
 
@@ -233,5 +233,38 @@ suite('Sessions - Account Title Bar State', () => {
 				accountIcon: URI.parse('https://example.com/default.png'),
 			}
 		);
+	});
+});
+
+suite('Sessions - Sidebar Account Presentation', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('shows a loading label while the OSS account is resolving', () => {
+		assert.deepStrictEqual(getSidebarAccountPresentation(undefined, true), {
+			label: 'Loading Account...',
+			ariaLabel: 'Loading account',
+			signedIn: false,
+		});
+	});
+
+	test('shows the signed-in OSS account name and provider', () => {
+		assert.deepStrictEqual(getSidebarAccountPresentation({
+			accountName: 'octocat',
+			accountProviderId: 'github',
+			accountProviderLabel: 'GitHub',
+		}, false), {
+			label: 'octocat (GitHub)',
+			ariaLabel: 'Signed in as octocat with GitHub',
+			signedIn: true,
+		});
+	});
+
+	test('shows Sign In when no OSS account is available', () => {
+		assert.deepStrictEqual(getSidebarAccountPresentation(undefined, false), {
+			label: 'Sign In',
+			ariaLabel: 'Sign in to your account',
+			signedIn: false,
+		});
 	});
 });

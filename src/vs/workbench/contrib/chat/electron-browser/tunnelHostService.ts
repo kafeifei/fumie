@@ -8,6 +8,7 @@ import {
 	ITunnelAgentHostHostingService,
 	TUNNEL_HOST_CHANNEL,
 	TUNNEL_HOST_LOG_ID,
+	type IMobileClientInfo,
 	type ITunnelHostInfo,
 	type TunnelHostStatus,
 } from '../../../../platform/agentHost/common/tunnelAgentHost.js';
@@ -36,6 +37,14 @@ export class TunnelHostService extends Disposable implements ITunnelHostService 
 	private readonly _onDidChangeStatus = this._register(new Emitter<void>());
 	readonly onDidChangeStatus: Event<void> = this._onDidChangeStatus.event;
 
+	/**
+	 * Handed straight through rather than mirrored into an emitter of our own:
+	 * the shared process only starts sending client changes once something
+	 * subscribes, and a service that subscribed on construction would pay for
+	 * every socket a phone opens whether or not anyone is looking.
+	 */
+	readonly onDidChangeClients: Event<readonly IMobileClientInfo[]>;
+
 	private _isSharing = false;
 	private _isConnecting = false;
 	private _sharingInfo: ITunnelHostInfo | undefined;
@@ -61,6 +70,7 @@ export class TunnelHostService extends Disposable implements ITunnelHostService 
 		this._mainService = ProxyChannel.toService<ITunnelAgentHostHostingService>(
 			sharedProcessService.getChannel(TUNNEL_HOST_CHANNEL),
 		);
+		this.onDidChangeClients = this._mainService.onDidChangeClients;
 
 		this._register(this._mainService.onDidChangeStatus((status: TunnelHostStatus) => {
 			this._isSharing = status.active;
@@ -117,6 +127,26 @@ export class TunnelHostService extends Disposable implements ITunnelHostService 
 		this._isSharing = false;
 		this._sharingInfo = undefined;
 		this._onDidChangeStatus.fire();
+	}
+
+	async rollPhonePairing(): Promise<void> {
+		this._logger.info('Rolling the phone pairing...');
+		// A restart returns fresh addresses; sharing that is off has none to
+		// return, and the status is left exactly as it was.
+		const info = await this._mainService.rollMobileWebPairing();
+		if (info) {
+			this._sharingInfo = info;
+		}
+		this._onDidChangeStatus.fire();
+	}
+
+	listClients(): Promise<readonly IMobileClientInfo[]> {
+		return this._mainService.listClients();
+	}
+
+	async disconnectClient(id: string): Promise<void> {
+		this._logger.info('Disconnecting a connected client...');
+		await this._mainService.disconnectClient(id);
 	}
 
 	private _getEnabledProviders(): readonly ('github' | 'microsoft')[] {

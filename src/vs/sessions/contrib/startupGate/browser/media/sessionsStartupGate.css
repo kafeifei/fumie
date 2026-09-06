@@ -1,0 +1,154 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/* ---- Startup Gate ----
+ * Covers the whole window until the core startup steps have settled. Mirrors
+ * the geometry and fade timing of `.sessions-loading-overlay` in
+ * `sessionsSetUp.css` deliberately, but stays self-contained so the gate can
+ * be removed as one file plus one registration line.
+ */
+
+.sessions-startup-gate {
+	position: absolute;
+	inset: 0;
+	z-index: 150;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: var(--vscode-editor-background);
+	transition: opacity 200ms ease-out;
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+.sessions-startup-gate.sessions-startup-gate-dismissed {
+	opacity: 0;
+	pointer-events: none;
+}
+
+.sessions-startup-gate-inner {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 24px;
+	min-width: 260px;
+	max-width: 420px;
+	padding: 0 24px;
+}
+
+.agent-sessions-workbench .sessions-startup-gate .sessions-startup-gate-icon.codicon {
+	font-size: 64px;
+	color: var(--vscode-foreground);
+	opacity: 0.85;
+	animation: sessions-startup-gate-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes sessions-startup-gate-pulse {
+	0%, 100% { opacity: 0.45; transform: scale(0.96); }
+	50%      { opacity: 0.9;  transform: scale(1.04); }
+}
+
+.sessions-startup-gate-title {
+	font-size: 15px;
+	font-weight: 600;
+	color: var(--vscode-foreground);
+}
+
+.sessions-startup-gate-steps {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	width: 100%;
+}
+
+.sessions-startup-gate-step {
+	display: flex;
+	align-items: flex-start;
+	gap: 10px;
+	font-size: 13px;
+	color: var(--vscode-descriptionForeground);
+	transition: color 120ms ease-out;
+}
+
+.sessions-startup-gate-step.done {
+	color: var(--vscode-foreground);
+}
+
+.sessions-startup-gate-step.failed {
+	color: var(--vscode-errorForeground);
+}
+
+.agent-sessions-workbench .sessions-startup-gate .sessions-startup-gate-step-icon.codicon {
+	font-size: 16px;
+	line-height: 18px;
+	flex: 0 0 auto;
+}
+
+.sessions-startup-gate-step.done .sessions-startup-gate-step-icon {
+	color: var(--vscode-charts-green, var(--vscode-foreground));
+}
+
+.sessions-startup-gate-step.failed .sessions-startup-gate-step-icon {
+	color: var(--vscode-errorForeground);
+}
+
+.sessions-startup-gate-step-body {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+.sessions-startup-gate-step-error {
+	font-size: 12px;
+	color: var(--vscode-errorForeground);
+	opacity: 0.85;
+	overflow-wrap: anywhere;
+}
+
+.sessions-startup-gate-progress {
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+	font-variant-numeric: tabular-nums;
+}
+
+.sessions-startup-gate-escape {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 8px;
+}
+
+.sessions-startup-gate-escape-note {
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+	text-align: center;
+}
+
+.sessions-startup-gate-escape-button {
+	padding: 4px 14px;
+	border: 1px solid var(--vscode-button-border, transparent);
+	border-radius: 4px;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	font-size: 13px;
+	font-family: inherit;
+	cursor: pointer;
+}
+
+.sessions-startup-gate-escape-button:hover {
+	background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.sessions-startup-gate-escape-button:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 2px;
+}
+
+.monaco-reduce-motion .sessions-startup-gate .sessions-startup-gate-icon,
+.agent-sessions-workbench.monaco-reduce-motion .sessions-startup-gate .sessions-startup-gate-icon {
+	animation: none;
+	opacity: 0.75;
+}

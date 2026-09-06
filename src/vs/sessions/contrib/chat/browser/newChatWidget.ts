@@ -13,6 +13,7 @@ import { Disposable, DisposableMap, DisposableStore, IDisposable, MutableDisposa
 import { constObservable, derived, derivedObservableWithCache, autorun, IObservable, observableFromEvent, observableSignalFromEvent } from '../../../../base/common/observable.js';
 import { isWeb } from '../../../../base/common/platform.js';
 import { URI } from '../../../../base/common/uri.js';
+import { ThemeIcon } from '../../../../base/common/themables.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
@@ -35,7 +36,7 @@ import { NoAgentHostEmptyState } from './noAgentHostEmptyState.js';
 import { IChatRequestVariableEntry } from '../../../../workbench/contrib/chat/common/attachments/chatVariableEntries.js';
 import { IAgentHostFilterService } from '../../../services/agentHostFilter/common/agentHostFilter.js';
 import { IChatViewOptions } from '../../../browser/parts/chatView.js';
-import { SessionWorkspacePickerVisibleContext } from '../../../common/contextkeys.js';
+import { IsPhoneLayoutContext, SessionWorkspacePickerVisibleContext } from '../../../common/contextkeys.js';
 import { AGENT_FEEDBACK_NEW_SESSION_RESOURCE, AgentFeedbackState, IAgentFeedback, IAgentFeedbackService } from '../../agentFeedback/browser/agentFeedbackService.js';
 import { buildNewSessionPrompt } from '../../agentFeedback/browser/agentFeedbackAttachmentEntry.js';
 import { SessionInputBannerWidget } from '../../sessionInputBanners/browser/sessionInputBannerWidget.js';
@@ -76,14 +77,6 @@ export class NewChatWidget extends Disposable {
 	 */
 	private _activeEmptyState: NoAgentHostEmptyState | undefined;
 
-	/**
-	 * Whether to render the session type ("harness") picker below the input
-	 * (in the controls) instead of next to the workspace picker. Read once from
-	 * the view options at construction time; the widget does not react to later
-	 * changes of the source observable.
-	 */
-	private readonly _renderHarnessPickerInControls: boolean;
-
 	private readonly _session: IObservable<IActiveSession | undefined>;
 
 	/** Whether the active draft is a workspace-less quick chat (hides the workspace picker). */
@@ -94,12 +87,6 @@ export class NewChatWidget extends Disposable {
 
 	/** In-flight background sends awaiting confirmation before their comments are cleared. */
 	private readonly _pendingBackgroundSends = this._register(new DisposableMap<object>());
-
-	/** The workspace-row container hosting the inline harness picker (desktop, non-quick-chat). */
-	private _workspacePickerRow: HTMLElement | undefined;
-
-	/** The quick-chat header row hosting the inline harness picker (desktop, quick chat). */
-	private _quickChatHeaderPickerHost: HTMLElement | undefined;
 
 	/**
 	 * Tracks whether the workspace picker is currently rendered (vs replaced by
@@ -131,7 +118,6 @@ export class NewChatWidget extends Disposable {
 		super();
 		this._workspacePickerVisibleKey = SessionWorkspacePickerVisibleContext.bindTo(contextKeyService);
 		this._register(toDisposable(() => this._workspacePickerVisibleKey.reset()));
-		this._renderHarnessPickerInControls = this.options.renderSessionTypePickerInControls.get();
 		this._register(this._pendingPreferredUpgrade);
 		this._register(this._newSessionCreation);
 
@@ -145,7 +131,7 @@ export class NewChatWidget extends Disposable {
 		});
 
 		// A quick chat is workspace-less; the composer hides the workspace picker
-		// (nothing to pick) and surfaces the session-type picker in the controls.
+		// (nothing to pick). Harness follows the selected model.
 		this._isQuickChatComposer = derived(this, reader => {
 			const session = this._session.read(reader);
 			return session?.isQuickChat?.read(reader) ?? false;
@@ -216,7 +202,6 @@ export class NewChatWidget extends Disposable {
 			hasAdditionalSendContent: hasFeedback,
 			loading,
 			historyKey: constObservable(undefined), // no persisted history for the new-session view
-			renderSessionTypePickerInControls: this._renderHarnessPickerInControls,
 			supportsBackground: true,
 			deferredNotificationsEnabled,
 			petHostPreferred: this.options.petHostPreferred,
@@ -256,18 +241,20 @@ export class NewChatWidget extends Disposable {
 
 		this._register(this._workspacePicker.onDidSelectWorkspace(async folderUri => {
 			await this._onWorkspaceSelected(folderUri);
-			this._newChatInput.focus();
+			this._focusInputAfterAsyncPicker();
 		}));
 		this._register(this._newChatInput.sessionTypePicker.onDidSelectSessionType(async pick => {
 			// A quick chat has no folder: re-create the draft with the picked
 			// type via openQuickChat (mirrors the folder path's draft recreation).
 			if (this._isQuickChatComposer.get()) {
 				this.sessionsService.openQuickChat(pick ? { providerId: pick.providerId, sessionTypeId: pick.sessionTypeId } : undefined);
+				// This path stays inside the selection gesture, so a phone browser
+				// can still open its keyboard without leaving a fake DOM focus.
 				this._newChatInput.focus();
 				return;
 			}
 			await this._onWorkspaceSelected(this._workspacePicker.selectedFolderUri);
-			this._newChatInput.focus();
+			this._focusInputAfterAsyncPicker();
 		}));
 
 		this._register(this.configurationService.onDidChangeConfiguration(e => {
@@ -368,6 +355,11 @@ export class NewChatWidget extends Disposable {
 		}));
 
 		const workspacePickerContainer = dom.append(chatWidgetContent, dom.$('.new-session-workspace-picker-container'));
+		const mobileIntro = dom.append(workspacePickerContainer, dom.$('.mobile-new-session-intro'));
+		const mobileIntroIcon = dom.append(mobileIntro, dom.$('span.mobile-new-session-intro-icon'));
+		mobileIntroIcon.classList.add(...ThemeIcon.asClassNameArray(Codicon.sparkle));
+		dom.append(mobileIntro, dom.$('h1.mobile-new-session-intro-title')).textContent = localize('mobileNewSessionTitle', "Start a new session");
+		dom.append(mobileIntro, dom.$('p.mobile-new-session-intro-description')).textContent = localize('mobileNewSessionDescription', "Choose a workspace, then send your first message to create the session.");
 		// On web (vscode.dev / insiders.vscode.dev) the workspace picker is
 		// scoped to the currently selected agent host. When no hosts are
 		// known there is nothing for the user to pick, so swap the picker
@@ -379,19 +371,18 @@ export class NewChatWidget extends Disposable {
 			: this._renderWorkspacePicker(workspacePickerContainer));
 
 		// Quick-chat composer header (workspace-less): a top-of-input "New Chat"
-		// label plus the inline session-type picker. Shown only in quick-chat
-		// mode via the `.quick-chat` class on the content (see CSS). On web the
-		// composer is never a quick chat, so it stays empty/hidden there.
-		if (!isWeb && !this._renderHarnessPickerInControls) {
+		// label. Shown only in quick-chat mode via the `.quick-chat` class on
+		// the content (see CSS). On web the composer is never a quick chat, so
+		// it stays empty/hidden there. Harness is an independent composer
+		// control (see NewChatInputWidget), not a header chip.
+		if (!isWeb) {
 			const quickChatHeaderRow = dom.append(chatWidgetContent, dom.$('.new-session-quick-chat-header.session-workspace-picker'));
 			const quickChatHeaderLabel = dom.append(quickChatHeaderRow, dom.$('.session-workspace-picker-label'));
 			quickChatHeaderLabel.textContent = localize('newChatHeader', "New Chat");
-			const quickChatWithLabel = dom.append(quickChatHeaderRow, dom.$('.session-workspace-picker-label.session-workspace-picker-with-label'));
-			quickChatWithLabel.textContent = localize('newSessionWith', "with");
-			this._quickChatHeaderPickerHost = dom.append(quickChatHeaderRow, dom.$('.new-chat-quick-chat-header-picker-host'));
 		}
 
 		this._renderFeedbackBanner(chatWidgetContent);
+
 		this._newChatInput.render(chatWidgetContent, parent);
 
 		// The tip lives in the input's notice slot, so the presenter is created
@@ -434,19 +425,6 @@ export class NewChatWidget extends Disposable {
 			}
 		}));
 
-		// Desktop harness-picker placement: a quick chat renders the session-type
-		// picker in its top-of-input header row; otherwise (including after a
-		// Cmd+N swap out of a quick chat) it re-parents into the workspace row.
-		if (!isWeb && !this._renderHarnessPickerInControls) {
-			this._register(autorun(reader => {
-				const isQuickChat = this._isQuickChatComposer.read(reader);
-				const target = isQuickChat ? this._quickChatHeaderPickerHost : this._workspacePickerRow;
-				if (target) {
-					this._newChatInput.sessionTypePicker.render(target, { className: 'sessions-chat-session-type-picker' });
-				}
-			}));
-		}
-
 		// Create initial session for any workspace already selected at construct time.
 		// If the selection arrives later (provider registers asynchronously), the
 		// picker fires onDidSelectWorkspace and our listener handles it.
@@ -473,6 +451,13 @@ export class NewChatWidget extends Disposable {
 		}
 
 		chatWidgetContainer.classList.add('revealed');
+	}
+
+	/** Phone browsers require a direct user gesture to show the soft keyboard. */
+	private _focusInputAfterAsyncPicker(): void {
+		if (IsPhoneLayoutContext.getValue(this.contextKeyService) !== true) {
+			this._newChatInput.focus();
+		}
 	}
 
 	private _renderChatTip(): void {
@@ -674,23 +659,15 @@ export class NewChatWidget extends Disposable {
 
 		this._workspacePicker.render(pickersRow);
 
-		if (!this._renderHarnessPickerInControls) {
-			const withLabel = dom.append(pickersRow, dom.$('.session-workspace-picker-label.session-workspace-picker-with-label'));
-			withLabel.textContent = localize('newSessionWith', "with");
-			this._workspacePickerRow = pickersRow;
-			// On web the composer is never a quick chat, so keep the harness
-			// picker inline in the workspace row. On desktop the placement is
-			// reactive (controls row for quick chats) — see the render() autorun.
-			if (isWeb) {
-				this._newChatInput.sessionTypePicker.render(pickersRow, { className: 'sessions-chat-session-type-picker' });
-			}
-		}
-		return this._workspacePicker.onDidSelectWorkspace(() => {
+		const store = new DisposableStore();
+		store.add(this._newChatInput.renderRepositoryConfig(pickersRow));
+		store.add(this._workspacePicker.onDidSelectWorkspace(() => {
 			const folderUri = this._workspacePicker.selectedFolderUri;
 			pickersLabel.textContent = folderUri
 				? localize('newSessionIn', "New session in")
 				: localize('newSessionChooseWorkspace', "Start by picking a");
-		});
+		}));
+		return store;
 	}
 
 	private _renderEmptyState(container: HTMLElement): IDisposable {

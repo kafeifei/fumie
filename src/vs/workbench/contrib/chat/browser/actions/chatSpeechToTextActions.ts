@@ -36,6 +36,8 @@ import { cancelDictation, isDictating, startDictation, stopDictation } from '../
 export const ChatSpeechToTextConfigured = ContextKeyExpr.and(ChatContextKeys.enabled, ContextKeyExpr.has(ChatContextKeys.speechToTextConfigured.key));
 /** True while the selected dictation backend is preparing. */
 export const ChatSpeechToTextPreparing = ContextKeyExpr.has(ChatContextKeys.speechToTextPreparing.key);
+export const ChatDictationMenu = new MenuId('ChatDictation');
+
 const ChatSpeechToTextMaiBackend = ContextKeyExpr.equals('config.dictation.model', 'mai');
 /**
  * True unless the user has hidden the chat-input dictation microphone button via
@@ -148,12 +150,12 @@ export class ToggleChatSpeechToTextAction extends Action2 {
 				icon: Codicon.micFilled,
 				title: localize2('chat.speechToText.stop', "Stop Dictation").value,
 			},
-			menu: [{
-				id: MenuId.ChatExecute,
+			menu: [MenuId.ChatExecute, ChatDictationMenu].map(id => ({
+				id,
 				order: -11,
 				when: ContextKeyExpr.and(ChatSpeechToTextConfigured, ChatSpeechToTextButtonShown, ChatSpeechToTextPreparing.negate(), AGENTS_VOICE_CONNECTED.negate(), SegmentedVoiceInputModePillInactive),
 				group: 'navigation',
-			}],
+			})),
 			keybinding: {
 				// Outrank the legacy "Start Voice Chat" action, which binds the
 				// same Cmd+I in the chat input at WorkbenchContrib weight. When
@@ -176,8 +178,8 @@ export class ToggleChatSpeechToTextAction extends Action2 {
 		const context = args[0] as IChatExecuteActionContext | undefined;
 		const widgetService = accessor.get(IChatWidgetService);
 
-		const widget = context?.widget ?? widgetService.lastFocusedWidget;
-		if (!widget) {
+		const editor = context?.inputEditor ?? (context?.widget ?? widgetService.lastFocusedWidget)?.inputEditor;
+		if (!editor) {
 			return;
 		}
 
@@ -186,7 +188,7 @@ export class ToggleChatSpeechToTextAction extends Action2 {
 			keybindingService: accessor.get(IKeybindingService),
 			logService: accessor.get(ILogService),
 			onboardingService: accessor.get(IDictationOnboardingService),
-		}, ToggleChatSpeechToTextAction.ID, widget.inputEditor);
+		}, ToggleChatSpeechToTextAction.ID, editor);
 	}
 }
 
@@ -204,12 +206,12 @@ export class ChatSpeechToTextPreparingAction extends Action2 {
 			f1: false,
 			icon: Codicon.micDownloadCompact,
 			precondition: ChatSpeechToTextPreparing,
-			menu: [{
-				id: MenuId.ChatExecute,
+			menu: [MenuId.ChatExecute, ChatDictationMenu].map(id => ({
+				id,
 				order: -11,
 				when: ContextKeyExpr.and(ChatSpeechToTextConfigured, ChatSpeechToTextButtonShown, ChatSpeechToTextPreparing, ChatSpeechToTextMaiBackend.negate(), AGENTS_VOICE_CONNECTED.negate(), SegmentedVoiceInputModePillInactive),
 				group: 'navigation',
-			}],
+			})),
 		});
 	}
 
@@ -232,12 +234,12 @@ export class ChatSpeechToTextConnectingAction extends Action2 {
 			f1: false,
 			icon: Codicon.loadingCompact,
 			precondition: ChatSpeechToTextPreparing,
-			menu: [{
-				id: MenuId.ChatExecute,
+			menu: [MenuId.ChatExecute, ChatDictationMenu].map(id => ({
+				id,
 				order: -11,
 				when: ContextKeyExpr.and(ChatSpeechToTextConfigured, ChatSpeechToTextButtonShown, ChatSpeechToTextPreparing, ChatSpeechToTextMaiBackend, AGENTS_VOICE_CONNECTED.negate(), SegmentedVoiceInputModePillInactive),
 				group: 'navigation',
-			}],
+			})),
 		});
 	}
 

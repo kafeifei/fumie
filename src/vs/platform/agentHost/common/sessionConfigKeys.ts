@@ -41,6 +41,16 @@ export const enum SessionConfigKey {
 	AgentMergeController = 'agentMerge.controller',
 }
 
+/** Host-owned workspace facts that become immutable once a session is Ready. */
+export const LOCKED_SESSION_WORKSPACE_CONFIG_KEYS: ReadonlySet<string> = new Set([
+	SessionConfigKey.Isolation,
+	SessionConfigKey.Branch,
+	SessionConfigKey.WorktreeBranchPrefix,
+	SessionConfigKey.WorktreeIncludeFiles,
+	SessionConfigKey.WorktreeBranchTrack,
+	SessionConfigKey.WorktreeCreateNewBranch,
+]);
+
 /**
  * The set of enum values the unified permission picker *tolerates* for the
  * {@link SessionConfigKey.AutoApprove} property when deciding whether a

@@ -9,15 +9,30 @@ import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { isIMenuItem, MenuId, MenuRegistry } from '../../../../../platform/actions/common/actions.js';
 import type { ContextKeyExpression, ContextKeyValue } from '../../../../../platform/contextkey/common/contextkey.js';
+import { getSingletonServiceDescriptors } from '../../../../../platform/instantiation/common/extensions.js';
 import { ChatContextKeys } from '../../../../../workbench/contrib/chat/common/actions/chatContextKeys.js';
 import { IsAuxiliaryWindowContext, IsSessionsWindowContext, RemoteNameContext } from '../../../../../workbench/common/contextkeys.js';
+import { ITunnelHostService } from '../../../../../workbench/contrib/chat/common/tunnelHost.js';
 import { Menus } from '../../../../browser/menus.js';
+import { SharingIntentTunnelHostService } from '../../electron-browser/tunnelHostSharingRestore.js';
 
 import '../../electron-browser/tunnelHost.contribution.js';
 
 suite('Sessions - Tunnel Host Contribution', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
+
+	/**
+	 * The wrapper only reaches callers if its registration is the last one for
+	 * `ITunnelHostService`, which it is because this module imports upstream's
+	 * contribution — an ordering nothing else states out loud.
+	 */
+	test('the recording tunnel host is the registration that wins', () => {
+		const registered = getSingletonServiceDescriptors().filter(([id]) => id === ITunnelHostService);
+
+		assert.ok(registered.length > 1, 'expected to be overriding an upstream registration');
+		assert.strictEqual(registered[registered.length - 1][1].ctor, SharingIntentTunnelHostService);
+	});
 
 	test('remote connections toggle is in Agents titlebar and non-Agents chat input', () => {
 		const findToggle = (menu: MenuId) => MenuRegistry.getMenuItems(menu)

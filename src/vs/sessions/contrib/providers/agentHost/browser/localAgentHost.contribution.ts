@@ -14,7 +14,6 @@ import { AgentHostAllowSignedOutWhenUsableContribution } from '../../../../../wo
 import { AgentHostSdkSetupNotificationContribution } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSdkSetupNotification.js';
 import { AgentHostSignedOutModelsNotificationContribution } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSignedOutModelsNotification.js';
 import { ISessionsProvidersService } from '../../../../services/sessions/browser/sessionsProvidersService.js';
-import { SessionStatus } from '../../../../services/sessions/common/session.js';
 import { IAgentHostEnablementService } from '../../../../../platform/agentHost/common/agentHostEnablementService.js';
 import { LocalAgentHostSessionsProvider } from './localAgentHostSessionsProvider.js';
 import './codexCustomizationSettings.contribution.js';
@@ -67,7 +66,13 @@ class LocalAgentHostContribution extends Disposable implements IWorkbenchContrib
 					resolverRegistrations.set(resourceScheme, workingDirectoryResolver.registerResolver(resourceScheme, sessionResource => {
 						return provider.getSessionByResource(sessionResource)?.workspace.get()?.folders[0]?.workingDirectory;
 					}, sessionResource => {
-						return provider.getSessionByResource(sessionResource)?.status.get() === SessionStatus.Untitled;
+						// Not `status === Untitled`: the draft's status flips to
+						// `InProgress` the moment the first send starts, while the
+						// host still has no session for it until `createSession`
+						// lands. Consumers must keep treating it as pre-session for
+						// that whole window or they subscribe to a channel the host
+						// has never heard of.
+						return provider.isClientLocalDraft(sessionResource);
 					}));
 				}
 			};

@@ -6,13 +6,9 @@
 import '../media/sessionsViewPane.css';
 import * as DOM from '../../../../../base/browser/dom.js';
 import { onUnexpectedError } from '../../../../../base/common/errors.js';
-import { Emitter, Event } from '../../../../../base/common/event.js';
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../../base/common/observable.js';
 import { isWeb } from '../../../../../base/common/platform.js';
-import { Orientation } from '../../../../../base/browser/ui/sash/sash.js';
-import { IView, Sizing, SplitView } from '../../../../../base/browser/ui/splitview/splitview.js';
-import { Color } from '../../../../../base/common/color.js';
 import { ContextKeyExpr, IContextKey, IContextKeyService, RawContextKey } from '../../../../../platform/contextkey/common/contextkey.js';
 import { IsAuxiliaryWindowContext, IsSessionsWindowContext } from '../../../../../workbench/common/contextkeys.js';
 import { IContextMenuService } from '../../../../../platform/contextview/browser/contextView.js';
@@ -29,14 +25,12 @@ import { IHoverService } from '../../../../../platform/hover/browser/hover.js';
 import { localize } from '../../../../../nls.js';
 import { SessionsList, SessionsGrouping, SessionsSorting } from './sessionsList.js';
 import { ISession, SessionStatus } from '../../../../services/sessions/common/session.js';
-import { AICustomizationShortcutsWidget } from '../aiCustomizationShortcutsWidget.js';
 import { AgentHostShortcutsWidget } from '../agentHostShortcutsWidget.js';
 import { Action2, MenuId, registerAction2 } from '../../../../../platform/actions/common/actions.js';
 import { agentsBackground } from '../../../../common/theme.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
 import { IHostService } from '../../../../../workbench/services/host/browser/host.js';
 import { IWorkbenchLayoutService, Parts } from '../../../../../workbench/services/layout/browser/layoutService.js';
-import { PANEL_SECTION_BORDER } from '../../../../../workbench/common/theme.js';
 import { ISessionsManagementService } from '../../../../services/sessions/common/sessionsManagement.js';
 import { ISessionsService } from '../../../../services/sessions/browser/sessionsService.js';
 import { HiddenItemStrategy, MenuWorkbenchToolBar } from '../../../../../platform/actions/browser/toolbar.js';
@@ -45,13 +39,19 @@ import { MobileSessionFilterChips } from '../../../../browser/parts/mobile/mobil
 import { IMobileSortGroupSheetItem, showMobileSortGroupSheet } from '../../../../browser/parts/mobile/mobileSortGroupSheet.js';
 import { isPhoneLayout } from '../../../../browser/parts/mobile/mobileLayout.js';
 import { IsPhoneLayoutContext } from '../../../../common/contextkeys.js';
+import { Codicon } from '../../../../../base/common/codicons.js';
+import { ThemeIcon } from '../../../../../base/common/themables.js';
+import { ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { NEW_SESSION_ACTION_ID } from '../../../chat/common/constants.js';
+import { customizationNavId, CUSTOMIZATION_OVERVIEW_SECTION, OPEN_AGENT_SETTINGS_COMMAND_ID } from '../../../settings/browser/agentSettings.js';
+import { ICustomViewService } from '../../../../services/customView/browser/customViewService.js';
+import { AUTOMATIONS_CUSTOM_VIEW_ID } from '../automationsConstants.js';
+import { SessionsMachineFilter } from './sessionsMachineFilter.js';
 
 const $ = DOM.$;
 export const SessionsViewId = 'sessions.workbench.view.sessionsView';
 const GROUPING_STORAGE_KEY = 'sessionsViewPane.grouping';
 const SORTING_STORAGE_KEY = 'sessionsViewPane.sorting';
-const CUSTOMIZATIONS_MIN_HEIGHT = 129;
-const SESSIONS_SECTION_MIN_HEIGHT = 120;
 
 /**
  * Place the given session in the sessions grid to the right of the last
@@ -70,32 +70,26 @@ export async function openSessionToTheSide(sessionsService: ISessionsService, se
 
 export const SessionsViewFilterSubMenu = new MenuId('SessionsViewPaneFilterSubMenu');
 export const SessionsViewFilterOptionsSubMenu = new MenuId('SessionsViewPaneFilterOptionsSubMenu');
-export const SessionsViewGroupingContext = new RawContextKey<string>('sessionsViewPane.grouping', SessionsGrouping.Workspace);
+export const SessionsViewGroupingContext = new RawContextKey<string>('sessionsViewPane.grouping', SessionsGrouping.Date);
 export const SessionsViewSortingContext = new RawContextKey<string>('sessionsViewPane.sorting', SessionsSorting.Created);
 export const IsWorkspaceGroupCappedContext = new RawContextKey<boolean>('sessionsViewPane.workspaceGroupCapped', true);
 
 export class SessionsView extends ViewPane {
 
 	private viewPaneContainer: HTMLElement | undefined;
-	private sidebarSplitViewContainer: HTMLElement | undefined;
-	private sidebarSplitView: SplitView | undefined;
 	private sessionsControlContainer: HTMLElement | undefined;
 	private findWidgetContainer: HTMLElement | undefined;
 	private headerRow: HTMLElement | undefined;
-	private headerLabel: HTMLElement | undefined;
-	private headerActions: HTMLElement | undefined;
+	private automationsNavItem: HTMLElement | undefined;
 	private isFindWidgetOpen = false;
 	sessionsControl: SessionsList | undefined;
-	private _customizationsWidget: AICustomizationShortcutsWidget | undefined;
-	private currentGrouping: SessionsGrouping = SessionsGrouping.Workspace;
+	private currentGrouping: SessionsGrouping = SessionsGrouping.Date;
 	private currentSorting: SessionsSorting = SessionsSorting.Created;
 	private groupingContextKey: IContextKey | undefined;
 	private sortingContextKey: IContextKey | undefined;
 	private workspaceGroupCappedContextKey: IContextKey<boolean> | undefined;
 	private readonly filterContextKeys = new Map<string, { key: IContextKey<boolean>; getDefault: () => boolean }>();
-	private currentBodyHeight = 0;
 	private currentBodyWidth = 0;
-	private didInitializePaneSizes = false;
 
 	constructor(
 		options: IViewPaneOptions,
@@ -113,6 +107,8 @@ export class SessionsView extends ViewPane {
 		@IHostService private readonly hostService: IHostService,
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
 		@IStorageService private readonly storageService: IStorageService,
+		@ICommandService private readonly commandService: ICommandService,
+		@ICustomViewService private readonly customViewService: ICustomViewService,
 	) {
 		super(options, keybindingService, contextMenuService, configurationService, contextKeyService, viewDescriptorService, instantiationService, openerService, themeService, hoverService);
 
@@ -162,42 +158,31 @@ export class SessionsView extends ViewPane {
 
 	private createControls(parent: HTMLElement): void {
 		const sessionsContainer = DOM.append(parent, $('.agent-sessions-container'));
-		this.sidebarSplitViewContainer = DOM.append(sessionsContainer, $('.agent-sessions-sidebar-splitview-container'));
 
-		// Sessions section (top, fills available space)
-		const sessionsSection = DOM.append(this.sidebarSplitViewContainer, $('.agent-sessions-section'));
+		// Sessions section (fills available space above the optional host toolbar)
+		const sessionsSection = DOM.append(sessionsContainer, $('.agent-sessions-section'));
 
 		// Sessions content container
 		const sessionsContent = DOM.append(sessionsSection, $('.agent-sessions-content'));
 
-		// Header row: "Sessions" label (left) + compact "New" button (right)
-		const headerRow = this.headerRow = DOM.append(sessionsContent, $('.agent-sessions-header-row'));
-		const headerLabel = this.headerLabel = DOM.append(headerRow, $('.agent-sessions-header-label'));
-
-		const headerActions = this.headerActions = DOM.append(headerRow, $('.agent-sessions-header-actions'));
-
-		// On phone, the desktop header content (label + new button + filter/find toolbar)
-		// is hidden in favor of the mobile filter chip row + the (+) button in the
-		// MobileTitlebarPart. We still create the row container because the find
-		// widget mounts inside it.
+		// Desktop chrome: sidebar nav, WORKSPACES header (new chat, search,
+		// filter), then an optional find row. Phone hides the nav in favor of filter
+		// chips + the (+) button in MobileTitlebarPart.
 		const phoneLayout = isPhoneLayout(this.layoutService);
-		if (!phoneLayout) {
-			headerLabel.textContent = localize('sessionsHeader', "Sessions");
+		const scopedInstantiationService = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, this.scopedContextKeyService])));
 
-			// Header actions (visual order: New, Filter, Search). The "New" button is
-			// contributed to Menus.SidebarSessionsHeader and rendered as a compact pill
-			// by NewSessionActionViewItem.
-			const scopedInstantiationService = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, this.scopedContextKeyService])));
-			this._register(scopedInstantiationService.createInstance(MenuWorkbenchToolBar, headerActions, Menus.SidebarSessionsHeader, {
-				hiddenItemStrategy: HiddenItemStrategy.NoHide,
-				telemetrySource: 'sessionsView.header',
-				toolbarOptions: { primaryGroup: () => true },
-			}));
+		if (!phoneLayout) {
+			this.createSidebarNav(sessionsContent);
+			this.createWorkspacesHeader(sessionsContent, scopedInstantiationService);
+		}
+
+		const headerRow = this.headerRow = DOM.append(sessionsContent, $('.agent-sessions-header-row'));
+		if (!phoneLayout) {
+			headerRow.classList.add('find-only');
 		} else {
 			headerRow.classList.add('phone-layout-empty');
 		}
 
-		// Container for the tree's find widget (toggled by the toolbar's Find action)
 		const findWidgetContainer = this.findWidgetContainer = DOM.append(headerRow, $('.agent-sessions-find-widget-container'));
 		findWidgetContainer.style.display = 'none';
 
@@ -234,7 +219,7 @@ export class SessionsView extends ViewPane {
 		}));
 		this._register(this.onDidChangeBodyVisibility(visible => sessionsControl.setVisible(visible)));
 
-		// Toggle header label/actions visibility when find widget opens/closes
+		// Swap the find row in when search opens; the WORKSPACES header stays visible.
 		this._register(sessionsControl.onDidChangeFindOpenState(open => {
 			this.isFindWidgetOpen = open;
 			findWidgetContainer.style.display = open ? '' : 'none';
@@ -299,76 +284,11 @@ export class SessionsView extends ViewPane {
 			}
 		}));
 
-		const customizationsSection = DOM.append(this.sidebarSplitViewContainer, $('.agent-sessions-customizations-section'));
-		const customizationsSizeChange = this._register(new Emitter<void>());
-
-		const customizationsWidget = this._customizationsWidget = this._register(this.instantiationService.createInstance(AICustomizationShortcutsWidget, customizationsSection, {
-			onDidChangeLayout: () => {
-				customizationsSizeChange.fire();
-				this.layoutSidebarSplitView();
-			},
-		}));
-
-		this.sidebarSplitView = this._register(new SplitView(this.sidebarSplitViewContainer, {
-			orientation: Orientation.VERTICAL,
-			proportionalLayout: false,
-		}));
-
-		const sessionsPane: IView = {
-			element: sessionsSection,
-			minimumSize: SESSIONS_SECTION_MIN_HEIGHT,
-			maximumSize: Number.POSITIVE_INFINITY,
-			onDidChange: Event.None,
-			layout: height => {
-				sessionsSection.style.height = `${height}px`;
-				this.sessionsControl?.layout(this.sessionsControlContainer?.offsetHeight ?? 0, this.currentBodyWidth);
-			},
-		};
-
-		const customizationsPane: IView = {
-			element: customizationsSection,
-			get minimumSize() { return customizationsWidget.collapsed ? customizationsWidget.collapsedHeight : CUSTOMIZATIONS_MIN_HEIGHT; },
-			get maximumSize() { return customizationsWidget.collapsed ? customizationsWidget.collapsedHeight : Math.max(CUSTOMIZATIONS_MIN_HEIGHT, customizationsWidget.desiredHeight); },
-			onDidChange: Event.map(Event.any(customizationsWidget.onDidChangeHeight, customizationsSizeChange.event), () => this.getCustomizationsPaneHeight()),
-			layout: height => {
-				customizationsSection.style.height = `${height}px`;
-				this._customizationsWidget?.layout(height, this.currentBodyWidth);
-			},
-		};
-
-		this.sidebarSplitView.addView(sessionsPane, Sizing.Distribute, 0, true);
-		this.sidebarSplitView.addView(customizationsPane, this.getCustomizationsPaneHeight(), 1, true);
-
-		let savedCustomizationsPaneHeight = this.getCustomizationsPaneHeight();
-		this._register(customizationsWidget.onDidToggleCollapsed(collapsed => {
-			if (!this.sidebarSplitView) {
-				return;
-			}
-			if (collapsed) {
-				const currentSize = this.sidebarSplitView.getViewSize(1);
-				if (currentSize > customizationsWidget.collapsedHeight) {
-					savedCustomizationsPaneHeight = currentSize;
-				}
-				this.sidebarSplitView.resizeView(1, customizationsWidget.collapsedHeight);
-			} else {
-				this.sidebarSplitView.resizeView(1, savedCustomizationsPaneHeight);
-			}
-			this.layoutSidebarSplitView();
-		}));
-
-		const updateSplitViewStyles = () => {
-			const borderColor = this.themeService.getColorTheme().getColor(PANEL_SECTION_BORDER);
-			this.sidebarSplitView?.style({ separatorBorder: borderColor ?? Color.transparent });
-		};
-		updateSplitViewStyles();
-		this._register(this.themeService.onDidColorThemeChange(updateSplitViewStyles));
-
-		// Agent Host toolbar (bottom, below customizations). Only rendered
-		// in the sessions window on web desktop layouts: electron has no
-		// host picker today (gated out at the menu level), phone layout
-		// uses the mobile titlebar pill instead, and auxiliary windows do
-		// not contribute any host actions — without this gate they would
-		// show an empty toolbar shell.
+		// Agent Host toolbar (bottom). Only rendered in the sessions window on
+		// web desktop layouts: electron has no host picker today (gated out at
+		// the menu level), phone layout uses the mobile titlebar pill instead,
+		// and auxiliary windows do not contribute any host actions — without
+		// this gate they would show an empty toolbar shell.
 		if (isWeb && this.scopedContextKeyService.contextMatchesRules(ContextKeyExpr.and(
 			IsSessionsWindowContext,
 			IsAuxiliaryWindowContext.toNegated(),
@@ -376,16 +296,97 @@ export class SessionsView extends ViewPane {
 		))) {
 			this._register(this.instantiationService.createInstance(AgentHostShortcutsWidget, sessionsContainer, {
 				onDidChangeLayout: () => {
-					this.layoutSidebarSplitView();
+					this.layoutSessionsList();
 				},
 			}));
 		}
 
-		this._register(DOM.scheduleAtNextAnimationFrame(DOM.getWindow(parent), () => this.layoutSidebarSplitView()));
+		this._register(DOM.scheduleAtNextAnimationFrame(DOM.getWindow(parent), () => this.layoutSessionsList()));
 	}
 
-	focusCustomizations(): void {
-		this._customizationsWidget?.focus();
+	private createSidebarNav(parent: HTMLElement): void {
+		const nav = DOM.append(parent, $('.agent-sessions-sidebar-nav'));
+
+		this.appendSidebarNavItem(nav, {
+			id: 'new-chat',
+			label: localize('newChat', "New Chat"),
+			icon: Codicon.send,
+			onClick: () => {
+				this.closeFindIfOpen();
+				this.commandService.executeCommand(NEW_SESSION_ACTION_ID);
+			},
+		});
+
+		// Always shown in the Agents sidebar chrome. Scheduler dispatch remains
+		// gated on `chat.automations.enabled`; this only makes the nav item visible.
+		this.automationsNavItem = this.appendSidebarNavItem(nav, {
+			id: 'automations',
+			label: localize('automations', "Automations"),
+			icon: Codicon.robot,
+			onClick: () => {
+				this.closeFindIfOpen();
+				this.commandService.executeCommand('sessionsView.manageAutomations');
+			},
+		});
+
+		this.appendSidebarNavItem(nav, {
+			id: 'customize',
+			label: localize('customize', "Customize"),
+			icon: Codicon.layout,
+			onClick: () => {
+				this.closeFindIfOpen();
+				this.commandService.executeCommand(OPEN_AGENT_SETTINGS_COMMAND_ID, customizationNavId(CUSTOMIZATION_OVERVIEW_SECTION));
+			},
+		});
+
+		this._register(autorun(reader => {
+			const activeCustomView = this.customViewService.activeCustomView.read(reader);
+			const automationsActive = activeCustomView?.id === AUTOMATIONS_CUSTOM_VIEW_ID;
+			this.automationsNavItem?.classList.toggle('active', automationsActive);
+			this.automationsNavItem?.setAttribute('aria-pressed', String(automationsActive));
+		}));
+	}
+
+	private createWorkspacesHeader(parent: HTMLElement, instantiationService: IInstantiationService): void {
+		const header = DOM.append(parent, $('.agent-sessions-workspaces-header'));
+		if (isWeb) {
+			// Web scopes the whole window to one host via the sidebar host
+			// pill; the machine-filter dropdown is desktop-only until that
+			// picker moves onto the scope API too.
+			const label = DOM.append(header, $('span.agent-sessions-workspaces-label'));
+			label.textContent = localize('workspacesHeader', "Workspaces");
+		} else {
+			this._register(instantiationService.createInstance(SessionsMachineFilter, header, {
+				displayOptionsMenu: SessionsViewFilterSubMenu,
+			}));
+		}
+
+		const actions = DOM.append(header, $('.agent-sessions-workspaces-actions'));
+		this._register(instantiationService.createInstance(MenuWorkbenchToolBar, actions, Menus.SidebarSessionsHeader, {
+			hiddenItemStrategy: HiddenItemStrategy.NoHide,
+			telemetrySource: 'sessionsView.header',
+			toolbarOptions: { primaryGroup: () => true },
+		}));
+	}
+
+	private appendSidebarNavItem(
+		parent: HTMLElement,
+		options: { id: string; label: string; icon: ThemeIcon; onClick: () => void },
+	): HTMLElement {
+		const button = DOM.append(parent, $('button.agent-sessions-nav-item'));
+		button.classList.add(`agent-sessions-nav-item-${options.id}`);
+		button.setAttribute('type', 'button');
+		button.setAttribute('aria-label', options.label);
+		button.setAttribute('aria-pressed', 'false');
+
+		const icon = DOM.append(button, $('span.agent-sessions-nav-icon'));
+		icon.classList.add(...ThemeIcon.asClassNameArray(options.icon));
+
+		const label = DOM.append(button, $('span.agent-sessions-nav-label'));
+		label.textContent = options.label;
+
+		this._register(DOM.addDisposableListener(button, 'click', () => options.onClick()));
+		return button;
 	}
 
 	private restoreLastSelectedSession(): void {
@@ -411,7 +412,10 @@ export class SessionsView extends ViewPane {
 			this.registeredFilterTypeIds.add(type.id);
 
 			const contextKey = new RawContextKey<boolean>(`sessionsViewPane.filterType.${type.id}`, !sessionsControl.isSessionTypeExcluded(type.id));
-			const contextKeyInstance = contextKey.bindTo(this.scopedContextKeyService);
+			// Bind on the window service, not the pane-scoped one. The Filter
+			// submenu opens as an overlay outside the pane element, so scoped
+			// keys are invisible and the checkmarks look unsaved after toggle/reload.
+			const contextKeyInstance = contextKey.bindTo(this.contextKeyService);
 			this.filterContextKeys.set(contextKey.key, { key: contextKeyInstance, getDefault: () => true });
 
 			this._register(registerAction2(class extends Action2 {
@@ -446,7 +450,7 @@ export class SessionsView extends ViewPane {
 		for (let i = 0; i < statusFilters.length; i++) {
 			const { status, label } = statusFilters[i];
 			const contextKey = new RawContextKey<boolean>(`sessionsViewPane.filterStatus.${status}`, !sessionsControl.isStatusExcluded(status));
-			const contextKeyInstance = contextKey.bindTo(this.scopedContextKeyService);
+			const contextKeyInstance = contextKey.bindTo(this.contextKeyService);
 			this.filterContextKeys.set(contextKey.key, { key: contextKeyInstance, getDefault: () => true });
 
 			this._register(registerAction2(class extends Action2 {
@@ -472,7 +476,7 @@ export class SessionsView extends ViewPane {
 
 		// Archived toggle
 		const archivedContextKey = new RawContextKey<boolean>('sessionsViewPane.filter.showArchived', !sessionsControl.isExcludeArchived());
-		const archivedContextKeyInstance = archivedContextKey.bindTo(this.scopedContextKeyService);
+		const archivedContextKeyInstance = archivedContextKey.bindTo(this.contextKeyService);
 		this.filterContextKeys.set(archivedContextKey.key, { key: archivedContextKeyInstance, getDefault: () => false });
 
 		// The archived filter label follows the configured archive action wording,
@@ -509,7 +513,7 @@ export class SessionsView extends ViewPane {
 
 		// Read toggle
 		const readContextKey = new RawContextKey<boolean>('sessionsViewPane.filter.showRead', !sessionsControl.isExcludeRead());
-		const readContextKeyInstance = readContextKey.bindTo(this.scopedContextKeyService);
+		const readContextKeyInstance = readContextKey.bindTo(this.contextKeyService);
 		this.filterContextKeys.set(readContextKey.key, { key: readContextKeyInstance, getDefault: () => true });
 
 		this._register(registerAction2(class extends Action2 {
@@ -560,44 +564,17 @@ export class SessionsView extends ViewPane {
 	protected override layoutBody(height: number, width: number): void {
 		super.layoutBody(height, width);
 
-		this.currentBodyHeight = height;
 		this.currentBodyWidth = width;
 		this.updateHeaderLayout();
-		this.layoutSidebarSplitView();
-
-		if (this.sidebarSplitView || !this.sessionsControl || !this.sessionsControlContainer) {
-			return;
-		}
-
-		this.sessionsControl.layout(this.sessionsControlContainer.offsetHeight, width);
+		this.layoutSessionsList();
 	}
 
-	private layoutSidebarSplitView(): void {
-		if (!this.sidebarSplitView || !this.sidebarSplitViewContainer) {
+	private layoutSessionsList(): void {
+		if (!this.sessionsControl || !this.sessionsControlContainer) {
 			return;
 		}
 
-		const height = this.sidebarSplitViewContainer.offsetHeight || this.currentBodyHeight || this.viewPaneContainer?.offsetHeight || 0;
-		if (height <= 0) {
-			return;
-		}
-
-		if (this.sidebarSplitViewContainer.offsetHeight === 0) {
-			this.sidebarSplitViewContainer.style.height = `${height}px`;
-		}
-		this.sidebarSplitView.layout(height);
-		if (!this.didInitializePaneSizes) {
-			this.didInitializePaneSizes = true;
-			this.sidebarSplitView.resizeView(1, this.getCustomizationsPaneHeight());
-		}
-	}
-
-	private getCustomizationsPaneHeight(): number {
-		if (this._customizationsWidget?.collapsed) {
-			return this._customizationsWidget.collapsedHeight;
-		}
-		const desiredHeight = this._customizationsWidget?.desiredHeight ?? 0;
-		return Math.max(CUSTOMIZATIONS_MIN_HEIGHT, Number.isFinite(desiredHeight) ? desiredHeight : 0);
+		this.sessionsControl.layout(this.sessionsControlContainer.offsetHeight, this.currentBodyWidth);
 	}
 
 	override focus(): void {
@@ -611,6 +588,7 @@ export class SessionsView extends ViewPane {
 	}
 
 	openFind(): void {
+		this.customViewService.hideCustomView();
 		this.isFindWidgetOpen = true;
 		if (this.findWidgetContainer) {
 			// Show container before opening find so the widget can be focused
@@ -620,8 +598,14 @@ export class SessionsView extends ViewPane {
 		this.sessionsControl?.openFind();
 	}
 
+	private closeFindIfOpen(): void {
+		if (this.isFindWidgetOpen) {
+			this.sessionsControl?.closeFind();
+		}
+	}
+
 	private updateHeaderLayout(): void {
-		if (!this.headerRow || !this.headerLabel || !this.headerActions) {
+		if (!this.headerRow) {
 			return;
 		}
 
@@ -632,18 +616,11 @@ export class SessionsView extends ViewPane {
 			return;
 		}
 
-		if (this.isFindWidgetOpen) {
-			this.headerLabel.style.display = 'none';
-			this.headerActions.style.display = 'none';
-			return;
-		}
-
-		this.headerLabel.style.display = '';
-		this.headerActions.style.display = '';
+		this.headerRow.classList.toggle('find-open', this.isFindWidgetOpen);
 	}
 
 	/**
-	 * Phone-only: present a bottom sheet with the four sort/group toggles.
+	 * Phone-only: present a bottom sheet with the sort/group toggles.
 	 * Filtering on phone is performed via the status filter chips, so the
 	 * sheet intentionally omits "Filter", "Show Recent/All Sessions", and
 	 * "Collapse All Groups" actions found in the desktop submenu.
@@ -668,7 +645,7 @@ export class SessionsView extends ViewPane {
 			},
 			{
 				id: SessionsGrouping.Workspace,
-				label: localize('groupByWorkspace', "Group by Workspace"),
+				label: localize('groupByProject', "Group by Project"),
 				checked: this.currentGrouping === SessionsGrouping.Workspace,
 				group: 'group',
 				groupTitle: groupTitle,
@@ -679,6 +656,12 @@ export class SessionsView extends ViewPane {
 				checked: this.currentGrouping === SessionsGrouping.Date,
 				group: 'group',
 			},
+			{
+				id: SessionsGrouping.Agent,
+				label: localize('groupByAgent', "Group by Agent"),
+				checked: this.currentGrouping === SessionsGrouping.Agent,
+				group: 'group',
+			},
 		];
 
 		showMobileSortGroupSheet(this.layoutService.mainContainer, localize('sortGroupSheet.title', "Sort"), items).then(selectedId => {
@@ -687,7 +670,7 @@ export class SessionsView extends ViewPane {
 			}
 			if (selectedId === SessionsSorting.Created || selectedId === SessionsSorting.Updated) {
 				this.setSorting(selectedId);
-			} else if (selectedId === SessionsGrouping.Workspace || selectedId === SessionsGrouping.Date) {
+			} else if (selectedId === SessionsGrouping.Workspace || selectedId === SessionsGrouping.Date || selectedId === SessionsGrouping.Agent) {
 				this.setGrouping(selectedId);
 			}
 		});

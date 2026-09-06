@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Event } from '../../../../base/common/event.js';
-import { ITunnelHostInfo } from '../../../../platform/agentHost/common/tunnelAgentHost.js';
+import { IMobileClientInfo, ITunnelHostInfo } from '../../../../platform/agentHost/common/tunnelAgentHost.js';
 import { ITunnelHostService } from '../../../../workbench/contrib/chat/common/tunnelHost.js';
 
 /**
@@ -36,5 +36,21 @@ export class WebTunnelHostService implements ITunnelHostService {
 
 	async stopSharing(): Promise<void> {
 		// Never sharing on web, so there is nothing to tear down.
+	}
+
+	async rollPhonePairing(): Promise<void> {
+		// The pairing lives beside the server that serves it, and on web there
+		// is neither.
+	}
+
+	/** Never sharing on web, so there is never anybody connected. */
+	readonly onDidChangeClients: Event<readonly IMobileClientInfo[]> = Event.None;
+
+	async listClients(): Promise<readonly IMobileClientInfo[]> {
+		return [];
+	}
+
+	async disconnectClient(_id: string): Promise<void> {
+		// Nobody to disconnect — see listClients.
 	}
 }

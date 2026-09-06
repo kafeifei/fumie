@@ -10,7 +10,7 @@ import { extUriBiasedIgnorePathCase } from '../../../../../../base/common/resour
 import { URI } from '../../../../../../base/common/uri.js';
 import { AgentSession, type IAgentSessionMetadata } from '../../../../../../platform/agentHost/common/agentService.js';
 import { ActionType, type IIsArchivedChangedAction, type IIsReadChangedAction, type INotification, type SessionAction } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
-import { readSessionMatchesByProjectRoot, readSessionMultiRootMetadata, SessionStatus, type SessionSummary } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+import { normalizeSessionSummaryChanges, readSessionMatchesByProjectRoot, readSessionMultiRootMetadata, SessionStatus, type SessionSummary } from '../../../../../../platform/agentHost/common/state/sessionState.js';
 import { IWorkspaceContextService, type IWorkspaceFolder } from '../../../../../../platform/workspace/common/workspace.js';
 import { ILogService } from '../../../../../../platform/log/common/log.js';
 import { Schemas } from '../../../../../../base/common/network.js';
@@ -314,7 +314,11 @@ export class AgentHostSessionListStore extends Disposable {
 				provider,
 				rawId,
 				statusKnown: cached.statusKnown || notification.changes.status !== undefined,
-				summary: { ...cached.summary, ...notification.changes },
+				// Decode before spreading: the diff spells "this field was cleared"
+				// as an explicit `null` (`undefined` cannot survive the wire), and
+				// spreading that raw would leave a `null` in the summary where every
+				// `!== undefined` check reads it as still present.
+				summary: { ...cached.summary, ...normalizeSessionSummaryChanges(notification.changes) },
 			};
 			if (!this._isSessionInWorkspace(updated)) {
 				this._mutationGeneration++;

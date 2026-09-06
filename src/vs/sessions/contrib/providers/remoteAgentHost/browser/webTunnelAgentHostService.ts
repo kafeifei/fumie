@@ -20,6 +20,7 @@ import {
 	TUNNEL_MIN_PROTOCOL_VERSION,
 	TunnelTags,
 	type ICachedTunnel,
+	type ITunnelDiscoveryOptions,
 	type ITunnelInfo,
 	type TunnelAutoConnectMode,
 } from '../../../../../platform/agentHost/common/tunnelAgentHost.js';
@@ -74,7 +75,7 @@ export class WebTunnelAgentHostService extends Disposable implements ITunnelAgen
 
 	// Discovery
 
-	async listTunnels(options?: { silent?: boolean }): Promise<ITunnelInfo[]> {
+	async listTunnels(options?: ITunnelDiscoveryOptions): Promise<ITunnelInfo[]> {
 		if (!this._discoveryProvider) {
 			return [];
 		}
@@ -96,7 +97,7 @@ export class WebTunnelAgentHostService extends Disposable implements ITunnelAgen
 					withoutIds++;
 					continue;
 				}
-				if (info.protocolVersion < TUNNEL_MIN_PROTOCOL_VERSION) {
+				if (!options?.includeAllTunnels && info.protocolVersion < TUNNEL_MIN_PROTOCOL_VERSION) {
 					droppedByProtocolVersion++;
 					this._logService.debug(
 						`${LOG_PREFIX} Dropping tunnel ${info.tunnelId} (protocolVersion=${info.protocolVersion} < ${TUNNEL_MIN_PROTOCOL_VERSION})`
@@ -115,6 +116,15 @@ export class WebTunnelAgentHostService extends Disposable implements ITunnelAgen
 			this._logService.error(`${LOG_PREFIX} Failed to list tunnels`, err);
 			return [];
 		}
+	}
+
+	/**
+	 * The embedder's discovery provider exposes tunnels and nothing else, so
+	 * there is no allowance to report here. `undefined` is how the caller
+	 * learns that, rather than being handed a zero it would show as real.
+	 */
+	async listUserLimits(): Promise<undefined> {
+		return undefined;
 	}
 
 	private _toTunnelInfo(tunnel: IDiscoveredTunnel): ITunnelInfo | undefined {

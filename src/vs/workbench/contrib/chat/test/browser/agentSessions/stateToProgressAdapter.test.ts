@@ -13,14 +13,14 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/
 import { AgentHostAutoReplyAnswer } from '../../../../../../platform/agentHost/common/agentHostSchema.js';
 import { toAgentMessageDelegationMeta } from '../../../../../../platform/agentHost/common/meta/agentMessageDelegationMeta.js';
 import { AgentSystemNotificationKind, AgentSystemNotificationSeverity, toAgentSystemNotificationMeta } from '../../../../../../platform/agentHost/common/meta/agentSystemNotificationMeta.js';
-import { McpAuthRequiredReason } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
+import { McpAuthRequiredReason, type SessionModelInfo } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { createAgentHostResourceUriMapper, fromAgentHostUri, toAgentHostUri } from '../../../../../../platform/agentHost/common/agentHostUri.js';
-import { buildSubagentChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, MessageAttachmentKind, MessageKind, ToolCallContributorKind, ToolCallRiskAssessmentKind, ToolCallRiskAssessmentStatus, ToolCallStatus, ToolCallConfirmationReason, ToolResultContentType, TurnState, ResponsePartKind, readUsageInfoMeta, withMessageHiddenFromTranscript, type ActiveTurn, type ICompletedToolCall, type ToolCallPendingConfirmationState, type ToolCallRunningState, type Turn, type ToolCallResponsePart, ToolCallCancellationReason, type Message, type ToolResultContent } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+import { buildSubagentChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, MessageAttachmentKind, MessageKind, ToolCallContributorKind, ToolCallRiskAssessmentKind, ToolCallRiskAssessmentStatus, ToolCallStatus, ToolCallConfirmationReason, ToolResultContentType, TurnState, ResponsePartKind, readUsageInfoMeta, withMessageHiddenFromTranscript, type ActiveTurn, type ICompletedToolCall, type ToolCallPendingConfirmationState, type ToolCallRunningState, type Turn, type ToolCallResponsePart, ToolCallCancellationReason, type Message, type ToolResultContent, type UsageInfo } from '../../../../../../platform/agentHost/common/state/sessionState.js';
 import { ChatTranscriptContextAttachmentDisplayKind, IChatRequestTranscriptContextVariableEntry, toChatTranscriptContextAttachmentMeta } from '../../../common/attachments/chatVariableEntries.js';
 import { ChatRequestOriginKind } from '../../../common/chatRequestOrigin.js';
 import { IChatToolInvocation, IChatToolInvocationSerialized, ToolConfirmKind, type IChatMarkdownContent, type IChatTerminalToolInvocationData, type IChatThinkingPart, type IChatUsage } from '../../../common/chatService/chatService.js';
 import { isToolResultInputOutputDetails, type IToolResultInputOutputDetails, ToolDataSource, ToolInvocationPresentation } from '../../../common/tools/languageModelToolsService.js';
-import { turnsToHistory as rawTurnsToHistory, activeTurnToProgress as rawActiveTurnToProgress, completedToolCallToSerialized, containsAutomaticReplyAnswer, createInputRequestCarousel, messageAttachmentsToVariableData, shouldObserveSubagentChat, toolCallStateToInvocation as rawToolCallStateToInvocation, toolCallStateToPreparedInvocation as rawToolCallStateToPreparedInvocation, toolCallStateToStreamingInvocation, finalizeToolInvocation as rawFinalizeToolInvocation, updateRunningToolSpecificData as rawUpdateRunningToolSpecificData, updateStreamingToolInvocation, usageInfoToAutoModeResolution, usageInfoToChatUsage, usageInfoToQuotas, formatTurnResponseDetails, rewriteAgentHostLinkTarget, rewriteMarkdownLinks, type TurnModelLookup } from '../../../browser/agentSessions/agentHost/stateToProgressAdapter.js';
+import { turnsToHistory as rawTurnsToHistory, activeTurnToProgress as rawActiveTurnToProgress, completedToolCallToSerialized, containsAutomaticReplyAnswer, createInputRequestCarousel, messageAttachmentsToVariableData, shouldObserveSubagentChat, toolCallStateToInvocation as rawToolCallStateToInvocation, toolCallStateToPreparedInvocation as rawToolCallStateToPreparedInvocation, toolCallStateToStreamingInvocation, finalizeToolInvocation as rawFinalizeToolInvocation, updateRunningToolSpecificData as rawUpdateRunningToolSpecificData, updateStreamingToolInvocation, agentModelContextWindow, usageInfoToAutoModeResolution, usageInfoToChatUsage, usageInfoToQuotas, formatTurnResponseDetails, rewriteAgentHostLinkTarget, rewriteMarkdownLinks, type TurnModelLookup } from '../../../browser/agentSessions/agentHost/stateToProgressAdapter.js';
 
 // ---- Helper factories -------------------------------------------------------
 
@@ -90,20 +90,20 @@ function turnsToHistory(backendSession: Parameters<typeof rawTurnsToHistory>[0],
 
 /**
  * Builds a fake {@link TurnModelLookup} that namespaces ids with a fixed
- * prefix and returns display names from a static map. `fallbackRawModelId`
- * mirrors the real handler's "use summary.model when usage hasn't reported
- * yet" behavior.
+ * prefix and returns display names from a static map. The fallback is the
+ * model the turn itself was dispatched with, mirroring the real handler: a
+ * turn is never named after another turn's model.
  */
-function makeLookup(prefix: string, displayNames: Record<string, string>, fallbackRawModelId?: string): TurnModelLookup {
-	const resolveRaw = (raw: string | undefined): string | undefined => raw ?? fallbackRawModelId;
+function makeLookup(prefix: string, displayNames: Record<string, string>): TurnModelLookup {
+	const resolveRaw = (raw: string | undefined, turnModelId: string | undefined): string | undefined => raw ?? turnModelId;
 	return {
-		toLanguageModelId: (raw) => {
-			const r = resolveRaw(raw);
+		toLanguageModelId: (raw, turnModelId) => {
+			const r = resolveRaw(raw, turnModelId);
 			return r ? `${prefix}${r}` : undefined;
 		},
 		toModelDisplayName: raw => displayNames[raw],
-		toResponseDetails: (raw) => {
-			const r = resolveRaw(raw);
+		toResponseDetails: (raw, _usage, turnModelId) => {
+			const r = resolveRaw(raw, turnModelId);
 			return r ? displayNames[r] : undefined;
 		},
 		toAutoModeResolution: usage => {
@@ -690,9 +690,9 @@ suite('stateToProgressAdapter', () => {
 			}]);
 		});
 
-		test('falls back to session-level model when turn has no usage.model', () => {
-			const turn = createTurn({ message: message('first') });
-			const lookup = makeLookup('agent-host-copilot:', { 'gpt-5': 'GPT-5' }, 'gpt-5');
+		test('falls back to the model the turn was dispatched with when it reported no usage.model', () => {
+			const turn = createTurn({ message: { ...message('first'), model: { id: 'gpt-5' } } });
+			const lookup = makeLookup('agent-host-copilot:', { 'gpt-5': 'GPT-5' });
 			const history = turnsToHistory(URI.file('/'), [turn], 'p', lookup);
 
 			assert.deepStrictEqual(
@@ -702,6 +702,26 @@ suite('stateToProgressAdapter', () => {
 				[
 					{ type: 'request', modelId: 'agent-host-copilot:gpt-5' },
 					{ type: 'response', details: 'GPT-5' },
+				],
+			);
+		});
+
+		// A session the user switched models in: only the last turn reported usage.
+		// Naming the earlier turns after it would rewrite what the user saw happen.
+		test('a turn that named no model of its own is not labelled with another turn\'s', () => {
+			const switched = createTurn({ id: 'turn-1', message: message('first') });
+			const reported = createTurn({ id: 'turn-2', message: message('second'), usage: { model: 'opus-4.7' } });
+			const lookup = makeLookup('agent-host-copilot:', { 'gpt-5': 'GPT-5', 'opus-4.7': 'Claude Opus 4.7' });
+
+			assert.deepStrictEqual(
+				turnsToHistory(URI.file('/'), [switched, reported], 'p', lookup).map(h => h.type === 'request'
+					? { type: h.type, modelId: h.modelId }
+					: { type: h.type, details: h.details }),
+				[
+					{ type: 'request', modelId: undefined },
+					{ type: 'response', details: undefined },
+					{ type: 'request', modelId: 'agent-host-copilot:opus-4.7' },
+					{ type: 'response', details: 'Claude Opus 4.7' },
 				],
 			);
 		});
@@ -740,14 +760,34 @@ suite('stateToProgressAdapter', () => {
 			);
 		});
 
+		// A replayed turn's usage carries token counts but never a context window,
+		// so the gauge on a reopened session has no denominator until the model's
+		// own metadata supplies one.
+		test('restored usage gets its context window from the agent model metadata', () => {
+			const turn = createTurn({
+				usage: { inputTokens: 4_000, outputTokens: 100, model: 'gpt-5' },
+				responseParts: [{ kind: ResponsePartKind.Markdown, id: 'md-1', content: 'Done' }],
+			});
+			const lookup: TurnModelLookup = {
+				...makeLookup('agent-host-copilot:', { 'gpt-5': 'GPT-5' }),
+				toModelContextWindow: raw => raw === 'gpt-5' ? { totalTokens: 400_000, maxOutputTokens: 128_000 } : undefined,
+			};
+
+			const response = turnsToHistory(URI.file('/'), [turn], 'p', lookup)[1];
+			assert.strictEqual(response.type, 'response');
+			if (response.type !== 'response') { return; }
+			const usage = response.parts.find(part => part.kind === 'usage');
+			assert.deepStrictEqual(usage?.kind === 'usage' ? usage.modelContextWindow : undefined, { totalTokens: 400_000, maxOutputTokens: 128_000 });
+		});
+
 		test('request history includes restored model id', () => {
 			const turn = createTurn({
-				message: message('Use restored model'),
+				message: { ...message('Use restored model'), model: { id: 'gpt-5' } },
 				startedAt: '2025-07-08T22:05:21.000Z',
 				duration: 2_500,
 			});
 
-			const lookup = makeLookup('agent-host-copilot:', {}, 'gpt-5');
+			const lookup = makeLookup('agent-host-copilot:', {});
 			const history = turnsToHistory(URI.file('/'), [turn], 'participant-1', lookup);
 
 			assert.deepStrictEqual(history[0], {
@@ -3267,20 +3307,21 @@ suite('stateToProgressAdapter', () => {
 	suite('formatTurnResponseDetails', () => {
 
 		const auto = { name: 'Auto' };
+		const credits = (value: number): UsageInfo => ({ _meta: { copilotUsage: { totalNanoAiu: value * 1_000_000_000 } } });
 
 		test('appends the billed model id when one is supplied', () => {
 			// A pick whose billed model is unregistered (e.g. "Auto" billed as "raptor-mini") shows "Auto (raptor-mini)".
 			const result = {
 				resolvedModel: formatTurnResponseDetails(auto, 'raptor-mini', undefined),
 				withPricing: formatTurnResponseDetails({ ...auto, pricing: '0x' }, 'raptor-mini', undefined),
-				withCredits: formatTurnResponseDetails(auto, 'raptor-mini', { _meta: { cost: 2 } }),
-				oneCredit: formatTurnResponseDetails(auto, 'raptor-mini', { _meta: { cost: 1 } }),
+				withCredits: formatTurnResponseDetails(auto, 'raptor-mini', credits(2)),
+				oneCredit: formatTurnResponseDetails(auto, 'raptor-mini', credits(1)),
 				noBilledModel: formatTurnResponseDetails(auto, undefined, undefined),
 			};
 
 			assert.deepStrictEqual(result, {
 				resolvedModel: 'Auto (raptor-mini)',
-				withPricing: 'Auto (raptor-mini) · 0x',
+				withPricing: 'Auto (raptor-mini) • 0x',
 				withCredits: 'Auto (raptor-mini) • 2 credits',
 				oneCredit: 'Auto (raptor-mini) • 1 credit',
 				noBilledModel: 'Auto',
@@ -3291,14 +3332,52 @@ suite('stateToProgressAdapter', () => {
 			const sonnet = { name: 'Claude Sonnet 4.5', pricing: '1x' };
 			const result = {
 				concrete: formatTurnResponseDetails(sonnet, undefined, undefined),
-				concreteWithCredits: formatTurnResponseDetails(sonnet, undefined, { _meta: { cost: 2 } }),
-				unknown: formatTurnResponseDetails(undefined, 'raptor-mini', { _meta: { cost: 2 } }),
+				concreteWithCredits: formatTurnResponseDetails(sonnet, undefined, credits(2)),
+				unknown: formatTurnResponseDetails(undefined, 'raptor-mini', credits(2)),
 			};
 
 			assert.deepStrictEqual(result, {
-				concrete: 'Claude Sonnet 4.5 · 1x',
+				concrete: 'Claude Sonnet 4.5 • 1x',
 				concreteWithCredits: 'Claude Sonnet 4.5 • 2 credits',
 				unknown: undefined,
+			});
+		});
+
+		// `_meta.cost` is an open-bag number whose unit no producer agrees on (the
+		// Copilot harness forwards a currency amount there; the key is documented as
+		// a credit count). Rendering it through the credit formatter stamped
+		// "N credits" onto whatever it happened to measure, so a turn that reports
+		// only `cost` now reports no credits at all and falls back to the model's
+		// published pricing.
+		// The footer is a statement about one response. A model that only came from
+		// the session's current selection describes the newest turn, so on an earlier
+		// one it is another turn's model wearing this one's timestamp — stated as
+		// fact, with nothing on screen to mark it as a guess.
+		test('does not state a model that only came from the session-wide selection', () => {
+			const fable = { name: 'Fable', pricing: '1x' } as const;
+			assert.deepStrictEqual({
+				reported: formatTurnResponseDetails({ ...fable, resolvedFrom: 'reported' }, undefined, undefined),
+				submittedWithThisTurn: formatTurnResponseDetails({ ...fable, resolvedFrom: 'turn' }, undefined, undefined),
+				sessionWide: formatTurnResponseDetails({ ...fable, resolvedFrom: 'session' }, undefined, undefined),
+				// A reported id to disclose turns the guess into context, so it stands.
+				sessionWideWithBilledId: formatTurnResponseDetails({ ...fable, resolvedFrom: 'session' }, 'claude-opus-5[1m]', undefined),
+			}, {
+				reported: 'Fable • 1x',
+				submittedWithThisTurn: 'Fable • 1x',
+				sessionWide: undefined,
+				sessionWideWithBilledId: 'Fable (claude-opus-5[1m]) • 1x',
+			});
+		});
+
+		test('a bare `cost` is not rendered as credits', () => {
+			assert.deepStrictEqual({
+				withPricing: formatTurnResponseDetails({ name: 'Claude Sonnet 4.5', pricing: '1x' }, undefined, { _meta: { cost: 0.2 } }),
+				withoutPricing: formatTurnResponseDetails({ name: 'Fable' }, undefined, { _meta: { cost: 0.2 } }),
+				credits: usageInfoToChatUsage({ inputTokens: 1, outputTokens: 1, _meta: { cost: 0.2 } })?.copilotCredits,
+			}, {
+				withPricing: 'Claude Sonnet 4.5 • 1x',
+				withoutPricing: 'Fable',
+				credits: undefined,
 			});
 		});
 	});
@@ -3314,15 +3393,185 @@ suite('stateToProgressAdapter', () => {
 				kind: 'usage',
 				promptTokens: 30,
 				completionTokens: 40,
+				cachedPromptTokens: undefined,
 				copilotCredits: undefined,
 				sessionCopilotCredits: undefined,
 				promptTokenDetails: undefined,
+				modelContextWindow: undefined,
 				modelTotals: [{ ...turnTokenTotals[0], model: 'Claude Opus 4.8' }],
 			} satisfies IChatUsage);
 		});
 
 		test('reports no totals when the provider did not supply any', () => {
 			assert.strictEqual(usageInfoToChatUsage({ inputTokens: 30, outputTokens: 40 })?.modelTotals, undefined);
+		});
+
+		// The one place the prompt's three parts are added up. Mappers
+		// transcribe them apart (see `usageAccountingConformance.test.ts`);
+		// if this fold ever moved back into a mapper the providers would drift
+		// apart again.
+		test('folds fresh, cache-read and cache-write input into one occupancy', () => {
+			const usage = usageInfoToChatUsage({ inputTokens: 500, cacheReadTokens: 40_000, outputTokens: 300, _meta: { cacheCreationTokens: 2_000 } });
+			assert.strictEqual(usage?.promptTokens, 42_500);
+			// The popup's cached row still reads the cache-read share alone.
+			assert.strictEqual(usage?.cachedPromptTokens, 40_000);
+			assert.strictEqual(usage?.completionTokens, 300);
+		});
+
+		test('a first turn\'s cache write counts toward occupancy', () => {
+			// Nothing read from cache, the whole prompt written to it: dropping
+			// the cache-write count would show an almost empty window.
+			assert.strictEqual(usageInfoToChatUsage({ inputTokens: 800, cacheReadTokens: 0, outputTokens: 120, _meta: { cacheCreationTokens: 30_000 } })?.promptTokens, 30_800);
+		});
+
+		test('a usage with no token fields at all stays undefined rather than reading as zero occupancy', () => {
+			assert.strictEqual(usageInfoToChatUsage(undefined), undefined);
+			assert.strictEqual(usageInfoToChatUsage({}), undefined);
+			assert.strictEqual(usageInfoToChatUsage({ model: 'claude-opus-4.8' }), undefined);
+		});
+
+		test('carries the backend-reported context window through to the chat usage', () => {
+			const usage = usageInfoToChatUsage({
+				inputTokens: 71_500, outputTokens: 200,
+				_meta: { modelContextWindow: { totalTokens: 200_000, maxOutputTokens: 32_000 } },
+			});
+			assert.deepStrictEqual(usage?.modelContextWindow, { totalTokens: 200_000, maxOutputTokens: 32_000 });
+		});
+
+		test('drops a malformed backend-reported context window', () => {
+			const usage = usageInfoToChatUsage({
+				inputTokens: 1, outputTokens: 2,
+				_meta: { modelContextWindow: { totalTokens: 'huge' } },
+			});
+			assert.strictEqual(usage?.modelContextWindow, undefined);
+		});
+
+		// A turn replayed from a transcript never reports a window — the transcript
+		// has no such field — so the gauge on a reopened session has nothing to
+		// divide by until the model's own metadata supplies it.
+		suite('context window fallback', () => {
+			const published = new Map([['moonshotai/kimi-k2.6', { totalTokens: 1_000_000, maxOutputTokens: 32_000 }]]);
+			const fromAgentModels = (rawModelId: string | undefined) => published.get(rawModelId ?? '');
+
+			test('fills a replayed usage that reports no window from the model the agent published', () => {
+				assert.deepStrictEqual(usageInfoToChatUsage(
+					{ inputTokens: 4_000, outputTokens: 100, model: 'moonshotai/kimi-k2.6' },
+					undefined,
+					fromAgentModels,
+				)?.modelContextWindow, { totalTokens: 1_000_000, maxOutputTokens: 32_000 });
+			});
+
+			test('leaves a usage that reports its own window untouched', () => {
+				assert.deepStrictEqual(usageInfoToChatUsage(
+					{
+						inputTokens: 4_000, outputTokens: 100, model: 'moonshotai/kimi-k2.6',
+						_meta: { modelContextWindow: { totalTokens: 200_000 } },
+					},
+					undefined,
+					fromAgentModels,
+				)?.modelContextWindow, { totalTokens: 200_000 });
+			});
+
+			test('reports no window for a model the agent does not publish, or none at all', () => {
+				assert.deepStrictEqual({
+					unknownModel: usageInfoToChatUsage({ inputTokens: 1, outputTokens: 2, model: 'not-a-model' }, undefined, fromAgentModels)?.modelContextWindow,
+					noModel: usageInfoToChatUsage({ inputTokens: 1, outputTokens: 2 }, undefined, fromAgentModels)?.modelContextWindow,
+					noResolver: usageInfoToChatUsage({ inputTokens: 1, outputTokens: 2, model: 'moonshotai/kimi-k2.6' })?.modelContextWindow,
+				}, {
+					unknownModel: undefined,
+					noModel: undefined,
+					noResolver: undefined,
+				});
+			});
+		});
+
+		// What the resolver above is built from. A Claude catalog publishes each
+		// model under a decorated id while the SDK keeps reporting the bare one in
+		// transcripts and usage, so a replayed turn's model can only be found
+		// through the underlying id the agent publishes alongside.
+		suite('agentModelContextWindow', () => {
+			const decorated: SessionModelInfo = {
+				id: '@provider=anthropic:claude-opus-4-8',
+				underlyingModelId: 'claude-opus-4-8',
+				provider: 'claude',
+				name: 'Claude Opus 4.8',
+				maxContextWindow: 1_000_000,
+				maxOutputTokens: 64_000,
+			};
+			const sessionModel: SessionModelInfo = {
+				id: '@provider=anthropic:claude-haiku-4-5',
+				underlyingModelId: 'claude-haiku-4-5',
+				provider: 'claude',
+				name: 'Claude Haiku 4.5',
+				maxContextWindow: 200_000,
+			};
+
+			test('finds the row a replayed turn\'s bare model id names, and the decorated id still works', () => {
+				assert.deepStrictEqual({
+					bare: agentModelContextWindow([decorated], 'claude-opus-4-8'),
+					decorated: agentModelContextWindow([decorated], '@provider=anthropic:claude-opus-4-8'),
+				}, {
+					bare: { totalTokens: 1_000_000, maxOutputTokens: 64_000 },
+					decorated: { totalTokens: 1_000_000, maxOutputTokens: 64_000 },
+				});
+			});
+
+			test('an id that names nothing falls through to the session\'s own model', () => {
+				assert.deepStrictEqual(
+					agentModelContextWindow([decorated, sessionModel], 'a-model-since-dropped', 'claude-haiku-4-5'),
+					{ totalTokens: 200_000 },
+				);
+			});
+
+			test('a named model that published no window is the answer, not a reason to fall through', () => {
+				// Reporting the session model's denominator for a turn that ran a
+				// different model would size the gauge against the wrong window.
+				const windowless: SessionModelInfo = { id: 'claude-opus-4-8', provider: 'claude', name: 'Opus' };
+				assert.strictEqual(agentModelContextWindow([windowless, sessionModel], 'claude-opus-4-8', 'claude-haiku-4-5'), undefined);
+			});
+
+			test('no ids match, no models at all, and no id given each report nothing', () => {
+				assert.deepStrictEqual({
+					noMatch: agentModelContextWindow([decorated], 'gpt-5', 'gpt-4'),
+					noModels: agentModelContextWindow(undefined, 'claude-opus-4-8'),
+					noIds: agentModelContextWindow([decorated], undefined),
+				}, {
+					noMatch: undefined,
+					noModels: undefined,
+					noIds: undefined,
+				});
+			});
+
+			test('a bare id several rows answer to names none of them, and the session\'s own is used instead', () => {
+				// A subscription and a BYOK provider both routing `claude-fable-5`:
+				// picking either would size the gauge against a window the turn may
+				// never have had. The session's own id is decorated, so it still names
+				// exactly one row.
+				const subscription: SessionModelInfo = {
+					id: '@provider=anthropic:claude-fable-5[1m]',
+					underlyingModelId: 'claude-fable-5[1m]',
+					provider: 'claude',
+					name: 'Fable',
+					maxContextWindow: 1_000_000,
+				};
+				const byok: SessionModelInfo = {
+					id: 'customendpoint/Example/claude-fable-5',
+					underlyingModelId: 'claude-fable-5',
+					provider: 'claude',
+					name: 'claude-fable-5',
+					maxContextWindow: 128_000,
+				};
+				assert.deepStrictEqual({
+					ambiguousAlone: agentModelContextWindow([subscription, byok], 'claude-fable-5'),
+					ambiguousThenSession: agentModelContextWindow([subscription, byok], 'claude-fable-5', '@provider=anthropic:claude-fable-5[1m]'),
+					// One provider alone is not ambiguous.
+					byokOnly: agentModelContextWindow([byok], 'claude-fable-5'),
+				}, {
+					ambiguousAlone: undefined,
+					ambiguousThenSession: { totalTokens: 1_000_000 },
+					byokOnly: { totalTokens: 128_000 },
+				});
+			});
 		});
 	});
 });

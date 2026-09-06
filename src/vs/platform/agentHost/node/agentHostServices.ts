@@ -30,6 +30,7 @@ import { AgentPluginManager } from './agentPluginManager.js';
 import { AgentSdkDownloader, IAgentSdkDownloader } from './agentSdkDownloader.js';
 import { IByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
 import { ClaudeAgentSdkService, IClaudeAgentSdkService } from './claude/claudeAgentSdkService.js';
+import { ClaudeBackingStore, IClaudeBackingStore } from './claude/claudeBackingStore.js';
 import { ClaudeProxyService, IClaudeProxyService } from './claude/claudeProxyService.js';
 import { ByokLmProxyService, IByokLmProxyService, NullByokLmProxyService } from './copilot/byokLmProxyService.js';
 import { CodexProxyService, ICodexProxyService } from './codex/codexProxyService.js';
@@ -54,6 +55,12 @@ import { AgentHostOctoKitService, IAgentHostOctoKitService } from './shared/agen
 import { EditArcReporterService, IEditArcReporterService } from './shared/editArcReporter.js';
 import { EditSurvivalReporterFactory, IEditSurvivalReporterFactory } from './shared/editSurvivalReporter.js';
 import { IAgentHostWorktreeIsolation, WorktreeIsolation } from './shared/worktreeIsolation.js';
+import { INativeModelProviderProxyService, NativeModelProviderProxyService, NullNativeModelProviderProxyService } from './nativeModelProviderProxyService.js';
+import { IKimiCodeSdkService, KimiCodeSdkService } from './kimi/kimiCodeSdkService.js';
+import { IDeepSeekSdkService, DeepSeekSdkService } from './deepseek/deepseekSdkService.js';
+import { IOpencodeServerService, OpencodeServerService } from './opencode/opencodeServerService.js';
+import { IPiSdkService, PiSdkService } from './pi/piSdkService.js';
+import { ChatGptSubscriptionService, IChatGptSubscriptionService } from './chatGptSubscription.js';
 
 /**
  * The process-local Agent Host service collection. Sealing is opt-in while the
@@ -143,8 +150,20 @@ export function registerAgentHostHostServices(services: AgentHostServiceCollecti
 	registerService(services, ids, IAgentPluginManager, new SyncDescriptor(AgentPluginManager, [inputs.userDataPath]));
 	registerService(services, ids, IAgentSdkDownloader, new SyncDescriptor(AgentSdkDownloader));
 	registerService(services, ids, IClaudeAgentSdkService, new SyncDescriptor(ClaudeAgentSdkService));
+	registerService(services, ids, IClaudeBackingStore, new SyncDescriptor(ClaudeBackingStore));
 	registerService(services, ids, IClaudeProxyService, new SyncDescriptor(ClaudeProxyService));
 	registerService(services, ids, ICodexProxyService, new SyncDescriptor(CodexProxyService));
+	registerService(services, ids, IChatGptSubscriptionService, new SyncDescriptor(ChatGptSubscriptionService));
+	registerService(
+		services,
+		ids,
+		INativeModelProviderProxyService,
+		inputs.byok.kind === 'renderer' ? new SyncDescriptor(NativeModelProviderProxyService) : new NullNativeModelProviderProxyService(),
+	);
+	registerService(services, ids, IKimiCodeSdkService, new SyncDescriptor(KimiCodeSdkService));
+	registerService(services, ids, IDeepSeekSdkService, new SyncDescriptor(DeepSeekSdkService));
+	registerService(services, ids, IPiSdkService, new SyncDescriptor(PiSdkService));
+	registerService(services, ids, IOpencodeServerService, new SyncDescriptor(OpencodeServerService));
 	registerService(services, ids, IAgentHostOTelService, new SyncDescriptor(AgentHostOTelService, [inputs.fetchFn]));
 	registerService(services, ids, IAgentHostWorktreeIsolation, new SyncDescriptor(WorktreeIsolation, [undefined]));
 	registerService(

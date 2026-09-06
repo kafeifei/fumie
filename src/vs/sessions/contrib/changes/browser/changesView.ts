@@ -7,7 +7,7 @@ import './media/changesView.css';
 import * as dom from '../../../../base/browser/dom.js';
 import { ActionViewItem, BaseActionViewItem, IActionViewItemOptions } from '../../../../base/browser/ui/actionbar/actionViewItems.js';
 import { Schemas } from '../../../../base/common/network.js';
-import { renderLabelWithIcons } from '../../../../base/browser/ui/iconLabel/iconLabels.js';
+import { renderIcon, renderLabelWithIcons } from '../../../../base/browser/ui/iconLabel/iconLabels.js';
 import { IListVirtualDelegate } from '../../../../base/browser/ui/list/list.js';
 import { IObjectTreeElement, ITreeSorter } from '../../../../base/browser/ui/tree/tree.js';
 import { ActionRunner, IAction, Separator, SubmenuAction, toAction } from '../../../../base/common/actions.js';
@@ -511,12 +511,17 @@ class ChangesActionViewItemsContribution extends Disposable implements IWorkbenc
 			return instantiationService.createInstance(SinglePaneChangesDiffStatsActionItem, action, options);
 		}, onDidRegister.event));
 
-		this._register(actionViewItemService.register(Menus.TitleBarSessionMenu, CHANGES_HEADER_ACTIONS_ID, (action, options, instantiationService) => {
+		// The same button bar in either place the session status lives: the title
+		// bar while the side pane is open, the floating status card once it is
+		// hidden. The menu items gate on opposite side-pane visibility.
+		const createActionsBar = (action: IAction, options: IActionViewItemOptions, instantiationService: IInstantiationService) => {
 			if (!(action instanceof MenuItemAction)) {
 				return undefined;
 			}
 			return instantiationService.createInstance(ChangesActionsBarActionViewItem, action, options);
-		}, onDidRegister.event));
+		};
+		this._register(actionViewItemService.register(Menus.TitleBarSessionMenu, CHANGES_HEADER_ACTIONS_ID, createActionsBar, onDidRegister.event));
+		this._register(actionViewItemService.register(Menus.SidebarStatusOverlay, CHANGES_HEADER_ACTIONS_ID, createActionsBar, onDidRegister.event));
 
 		onDidRegister.fire();
 	}
@@ -696,8 +701,15 @@ export class ChangesViewPane extends ViewPane {
 		this.welcomeContainer = dom.append(this.contentContainer, $('.changes-welcome'));
 		this.welcomeContainer.style.display = 'none';
 
+		const welcomeIcon = dom.append(this.welcomeContainer, $('.changes-welcome-icon'));
+		welcomeIcon.appendChild(renderIcon(Codicon.diffMultiple));
+		welcomeIcon.setAttribute('aria-hidden', 'true');
+
+		const welcomeTitle = dom.append(this.welcomeContainer, $('.changes-welcome-title'));
+		welcomeTitle.textContent = localize('changesView.emptyTitle', "No changes yet");
+
 		const welcomeMessage = dom.append(this.welcomeContainer, $('.changes-welcome-message'));
-		welcomeMessage.textContent = localize('changesView.noChanges', "Changed files and other session artifacts will appear here.");
+		welcomeMessage.textContent = localize('changesView.noChanges', "Edits from this session will show up here for review.");
 
 		// Other Files widget - middle pane (files edited outside the workspace)
 		this.sessionFilesWidget = this._register(this.scopedInstantiationService.createInstance(SessionFilesWidget, this.splitViewContainer));

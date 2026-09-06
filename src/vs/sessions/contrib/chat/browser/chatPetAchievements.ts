@@ -26,3 +26,12 @@ export class SessionsChatPetAchievementContribution extends Disposable implement
 		}));
 	}
 }
+
+export class ChatPetAgentsWindowAchievementContribution implements IWorkbenchContribution {
+
+	static readonly ID = 'sessions.contrib.chatPetAgentsWindowAchievement';
+
+	constructor(@IChatPetService chatPetService: IChatPetService) {
+		chatPetService.unlockAchievement(ChatPetAchievementIds.AgentsWindowOpened);
+	}
+}

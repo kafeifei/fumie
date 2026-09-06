@@ -100,6 +100,51 @@ export interface ITunnelInfo {
 	readonly hostConnectionCount: number;
 }
 
+/**
+ * One of the account's Dev Tunnels allowances and how much of it is in use,
+ * mapped from the SDK's `listUserLimits`. `TunnelsPerUserPerCluster` is the
+ * one that fails the creation of the next tunnel once it is reached.
+ */
+export interface ITunnelUserLimit {
+	/** The service's own name for the limit, e.g. `TunnelsPerUserPerCluster`. */
+	readonly name?: string;
+	/** How much of the allowance is in use. */
+	readonly current: number;
+	/** The allowance itself; absent when the service enforces none. */
+	readonly limit?: number;
+}
+
+/**
+ * Whether a listing covers the tunnels this app can connect to, or every
+ * tunnel the account is holding.
+ *
+ * Dev Tunnels caps how many tunnels one account may keep in a cluster, and it
+ * counts every one of them — including the tunnel Fumie opens for the mobile
+ * web client, which carries its own label and no agent-host protocol tag. A
+ * caller that is about to connect wants the narrow list; one that is
+ * accounting for the cap wants all of them.
+ */
+export interface IIncludeAllTunnelsOption {
+	/**
+	 * Return every tunnel on the account rather than only agent-host ones.
+	 * The extra tunnels are not connectable — they are reported so the user
+	 * can see what is using the allowance up.
+	 */
+	readonly includeAllTunnels?: boolean;
+}
+
+/** Options for {@link ITunnelAgentHostMainService.listTunnels}. */
+export interface ITunnelListOptions extends IIncludeAllTunnelsOption {
+	/** Tunnel names to look up in addition to the account-wide enumeration. */
+	readonly additionalTunnelNames?: readonly string[];
+}
+
+/** Options for {@link ITunnelAgentHostService.listTunnels}. */
+export interface ITunnelDiscoveryOptions extends IIncludeAllTunnelsOption {
+	/** Use cached credentials only, never raising a sign-in prompt. */
+	readonly silent?: boolean;
+}
+
 /** How startup auto-connect should establish a tunnel connection. */
 export type TunnelAutoConnectMode = 'background' | 'prompt';
 
@@ -351,16 +396,25 @@ export interface ITunnelAgentHostMainService {
 	readonly onDidRelayClose: Event<string /* connectionId */>;
 
 	/**
-	 * List dev tunnels associated with the user's account that have
-	 * the `vscode-server-launcher` label and a protocol version tag
-	 * of at least {@link TUNNEL_MIN_PROTOCOL_VERSION}.
+	 * List dev tunnels associated with the user's account. By default only
+	 * tunnels that can host an agent are returned — see
+	 * {@link ITunnelListOptions.includeAllTunnels} for the rest.
+	 *
+	 * Rejects when the account-wide enumeration fails, rather than reporting
+	 * an account that holds nothing.
 	 *
 	 * @param token The user's access token (GitHub or Microsoft).
 	 * @param authProvider The auth provider that issued the token.
-	 * @param additionalTunnelNames Optional tunnel names to look up
-	 *   in addition to the account-wide enumeration.
+	 * @param options What the listing should cover.
 	 */
-	listTunnels(token: string, authProvider: 'github' | 'microsoft', additionalTunnelNames?: string[]): Promise<ITunnelInfo[]>;
+	listTunnels(token: string, authProvider: 'github' | 'microsoft', options?: ITunnelListOptions): Promise<ITunnelInfo[]>;
+
+	/**
+	 * The account's Dev Tunnels allowances and how much of each is in use — a
+	 * passthrough of the SDK's own limits call, which is the only place a real
+	 * quota figure can come from.
+	 */
+	listUserLimits(token: string, authProvider: 'github' | 'microsoft'): Promise<ITunnelUserLimit[]>;
 
 	/** Delete a dev tunnel and close any associated relay connections. */
 	deleteTunnel(token: string, authProvider: 'github' | 'microsoft', tunnelId: string, clusterId: string): Promise<void>;
@@ -442,10 +496,21 @@ export interface ITunnelAgentHostService {
 
 	/**
 	 * Enumerate available dev tunnels with agent host support.
-	 * When {@link options.silent} is `true`, uses cached tokens without
-	 * prompting the user. Returns an empty array if no cached token.
+	 * When {@link ITunnelDiscoveryOptions.silent} is `true`, uses cached tokens
+	 * without prompting the user. Returns an empty array if no cached token,
+	 * and rejects if the enumeration itself fails. See
+	 * {@link IIncludeAllTunnelsOption} for listing the account's other tunnels
+	 * too.
 	 */
-	listTunnels(options?: { silent?: boolean }): Promise<ITunnelInfo[]>;
+	listTunnels(options?: ITunnelDiscoveryOptions): Promise<ITunnelInfo[]>;
+
+	/**
+	 * The account's Dev Tunnels allowances, or `undefined` when this client
+	 * cannot ask for them — an embedder-proxied web client has no limits API
+	 * to reach. Rejects when the lookup itself fails, so a caller never
+	 * mistakes a broken call for an account with no limits.
+	 */
+	listUserLimits(options?: { silent?: boolean }): Promise<readonly ITunnelUserLimit[] | undefined>;
 
 	/**
 	 * Determine whether startup auto-connect can run silently or must first ask
@@ -519,6 +584,45 @@ export interface ITunnelHostInfo {
 	readonly tunnelId?: string;
 	/** Set when remote session access is being provided by full Remote Tunnel Access rather than a dedicated agent host tunnel. */
 	readonly viaRemoteTunnelAccess?: boolean;
+	/** Public URL for the mobile web interface, reachable from another device through the dev tunnel. */
+	readonly mobileUrl?: string;
+	/** Loopback URL for the same mobile web interface, reachable only from this machine. */
+	readonly mobileLocalUrl?: string;
+	/**
+	 * Why {@link mobileUrl} is absent while the mobile interface is otherwise hosted.
+	 *
+	 * Set only once the dev tunnel has actually been tried and failed, so an
+	 * empty value while {@link mobileLocalUrl} is present still means "not
+	 * finished yet" rather than "will never arrive".
+	 */
+	readonly mobileUrlUnavailableReason?: string;
+}
+
+/**
+ * One client currently bridged onto this machine through the mobile web server.
+ *
+ * Everything here is for showing and for disconnecting. Nothing in it is a
+ * credential, and nothing about a client is trusted on the strength of it: what
+ * actually lets a client in is the capability in its address and the session
+ * cookie derived from it.
+ */
+export interface IMobileClientInfo {
+	/**
+	 * Identifies the client for {@link ITunnelAgentHostHostingService.disconnectClient}.
+	 *
+	 * Stable for as long as the client's browser keeps the session cookie it was
+	 * issued, so the phone that drops its bridge every time the relay times a
+	 * quiet socket out comes back as the same row rather than a new one.
+	 * Deliberately not the cookie itself — the cookie is half of what authorises
+	 * the client, and this id travels to the renderer.
+	 */
+	readonly id: string;
+	/** What to call the client, e.g. `iPhone (Safari)`, derived from its User-Agent. */
+	readonly label: string;
+	/** When the client first opened a bridge, in epoch milliseconds. */
+	readonly connectedAt: number;
+	/** Whether the client reached this machine through the dev tunnel or from this machine itself. */
+	readonly transport: 'local' | 'tunnel';
 }
 
 /** Whether a discovered tunnel is the hosted tunnel, preferring its stable identity over its display name. */
@@ -557,6 +661,36 @@ export interface ITunnelAgentHostHostingService {
 
 	/** Stop hosting and clean up the tunnel. */
 	stopHosting(): Promise<void>;
+
+	/**
+	 * Replace the secret the mobile web address carries, so every address
+	 * handed out before now stops working.
+	 *
+	 * Returns the refreshed host info when hosting was running and had to be
+	 * restarted onto the new secret, and `undefined` when there was nothing
+	 * live to restart — rewriting the pairing is the whole job then, and the
+	 * next start picks it up.
+	 */
+	rollMobileWebPairing(): Promise<ITunnelHostInfo | undefined>;
+
+	/** Fires with the whole list whenever a client connects, reconnects or goes away. */
+	readonly onDidChangeClients: Event<readonly IMobileClientInfo[]>;
+
+	/** The clients currently bridged onto this machine, empty when nothing is hosted. */
+	listClients(): Promise<readonly IMobileClientInfo[]>;
+
+	/**
+	 * Close a client's bridge and revoke the session cookie it was holding, so
+	 * the reconnect its page attempts the moment the socket dies is refused.
+	 *
+	 * Not a ban: the address is the credential, and a device that still has the
+	 * link can load the page again and be issued a new session. Taking the
+	 * address itself back is {@link rollMobileWebPairing}.
+	 *
+	 * Unknown ids are ignored — a client that left on its own between the list
+	 * being rendered and the button being pressed is the common case.
+	 */
+	disconnectClient(id: string): Promise<void>;
 
 	/** Get the current hosting status. */
 	getStatus(): Promise<TunnelHostStatus>;

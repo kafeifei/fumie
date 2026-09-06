@@ -14,6 +14,7 @@ import { IAgentConnection } from '../../../../../../platform/agentHost/common/ag
 import { buildTurnChangesetUri } from '../../../../../../platform/agentHost/common/changesetUri.js';
 import { fromAgentHostUri } from '../../../../../../platform/agentHost/common/agentHostUri.js';
 import { IAgentSubscription } from '../../../../../../platform/agentHost/common/state/agentSubscription.js';
+import { INotification, NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
 import {
 	buildDefaultChatUri,
 	ChangesetStatus,
@@ -38,6 +39,10 @@ class FakeAgentConnection extends mock<IAgentConnection>() {
 	private readonly _emitters = new Map<string, Emitter<unknown>>();
 	private readonly _values = new Map<string, unknown>();
 	private readonly _subscriptionCounts = new Map<string, number>();
+	private readonly _unmanaged = new Set<string>();
+	private readonly _onDidNotification = new Emitter<INotification>();
+
+	override readonly onDidNotification: Event<INotification> = this._onDidNotification.event;
 
 	setState(resource: string, value: unknown): void {
 		this._values.set(resource, value);
@@ -46,6 +51,26 @@ class FakeAgentConnection extends mock<IAgentConnection>() {
 
 	getSubscriptionCount(resource: string): number {
 		return this._subscriptionCounts.get(resource) ?? 0;
+	}
+
+	/** Pretends someone else already holds a live subscription to `resource`. */
+	addUnmanagedSubscription(resource: string): void {
+		this._unmanaged.add(resource);
+	}
+
+	fireSessionAdded(resource: string): void {
+		this._onDidNotification.fire({ type: NotificationType.SessionAdded, summary: { resource } } as unknown as INotification);
+	}
+
+	override getSubscriptionUnmanaged<T extends StateComponents>(_kind: T, resource: URI): IAgentSubscription<never> | undefined {
+		if (!this._unmanaged.has(resource.toString())) {
+			return undefined;
+		}
+		const self = this;
+		return {
+			get value() { return self._values.get(resource.toString()); },
+			onDidChange: Event.None,
+		} as unknown as IAgentSubscription<never>;
 	}
 
 	override getSubscription<T extends StateComponents>(_kind: T, resource: URI, _owner: string): IReference<IAgentSubscription<never>> {
@@ -350,6 +375,83 @@ suite('AgentHostResponseFileChangesProvider', () => {
 			provider.getChangesForRequest(chatResource, 't1'),
 			provider.getChangesForRequest(chatResource, 't1')
 		);
+	});
+
+	test('defers every subscription for a pending session until the host announces it', () => {
+		const ds = store.add(new DisposableStore());
+		const conn = new FakeAgentConnection();
+		const defaultChatUri = URI.parse(buildDefaultChatUri(backendSession.toString()));
+		const provider = ds.add(new AgentHostResponseFileChangesProvider(conn, authority, () => backendSession, undefined, () => true));
+
+		const changesObs = provider.getChangesForRequest(chatResource, 't1')!;
+		const fileEditsObs = provider.getFileEditsForRequest(chatResource, 't1')!;
+		let latestChanges: readonly IEditSessionEntryDiff[] = [];
+		let latestFileEdits: readonly IChatResponseFileEdit[] = [];
+		ds.add(autorun(reader => { latestChanges = changesObs.read(reader); }));
+		ds.add(autorun(reader => { latestFileEdits = fileEditsObs.read(reader); }));
+
+		const subscribed = () => ({
+			session: conn.getSubscriptionCount(backendSession.toString()) > 0,
+			chat: conn.getSubscriptionCount(defaultChatUri.toString()) > 0,
+			changeset: conn.getSubscriptionCount(turnChangesetUri('t1')) > 0,
+		});
+		const beforeAnnouncement = subscribed();
+		const beforeChanges = latestChanges.length;
+		const beforeFileEdits = latestFileEdits.length;
+
+		conn.setState(backendSession.toString(), sessionStateWithTurnSupport());
+		conn.setState(turnChangesetUri('t1'), {
+			status: ChangesetStatus.Ready,
+			files: [{ id: '1', edit: { after: { uri: URI.file('/repo/a.ts').toString(), content: { uri: 'git-blob://a-after' } }, diff: { added: 2, removed: 0 } } }],
+		} satisfies ChangesetState);
+		conn.fireSessionAdded(backendSession.toString());
+
+		assert.deepStrictEqual({
+			beforeAnnouncement,
+			beforeChanges,
+			beforeFileEdits,
+			afterAnnouncement: subscribed(),
+			afterChanges: latestChanges.map(diff => diff.modifiedURI.path),
+		}, {
+			beforeAnnouncement: { session: false, chat: false, changeset: false },
+			beforeChanges: 0,
+			beforeFileEdits: 0,
+			afterAnnouncement: { session: true, chat: true, changeset: true },
+			afterChanges: ['/repo/a.ts'],
+		});
+	});
+
+	test('subscribes right away for a session that is not pending', () => {
+		const ds = store.add(new DisposableStore());
+		const conn = new FakeAgentConnection();
+		const defaultChatUri = URI.parse(buildDefaultChatUri(backendSession.toString()));
+		const provider = ds.add(new AgentHostResponseFileChangesProvider(conn, authority, () => backendSession, undefined, () => false));
+
+		conn.setState(backendSession.toString(), sessionStateWithTurnSupport());
+		observe(provider, ds);
+
+		assert.deepStrictEqual({
+			session: conn.getSubscriptionCount(backendSession.toString()) > 0,
+			chat: conn.getSubscriptionCount(defaultChatUri.toString()) > 0,
+			changeset: conn.getSubscriptionCount(turnChangesetUri('t1')) > 0,
+		}, { session: true, chat: true, changeset: true });
+	});
+
+	test('subscribes right away for a pending session the connection already holds', () => {
+		const ds = store.add(new DisposableStore());
+		const conn = new FakeAgentConnection();
+		const defaultChatUri = URI.parse(buildDefaultChatUri(backendSession.toString()));
+		const provider = ds.add(new AgentHostResponseFileChangesProvider(conn, authority, () => backendSession, undefined, () => true));
+
+		conn.addUnmanagedSubscription(backendSession.toString());
+		conn.setState(backendSession.toString(), sessionStateWithTurnSupport());
+		observe(provider, ds);
+
+		assert.deepStrictEqual({
+			session: conn.getSubscriptionCount(backendSession.toString()) > 0,
+			chat: conn.getSubscriptionCount(defaultChatUri.toString()) > 0,
+			changeset: conn.getSubscriptionCount(turnChangesetUri('t1')) > 0,
+		}, { session: true, chat: true, changeset: true });
 	});
 
 	test('returns undefined when the backend session cannot be resolved', () => {

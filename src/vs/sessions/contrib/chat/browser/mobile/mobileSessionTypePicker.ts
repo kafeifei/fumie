@@ -10,7 +10,7 @@ import { ITelemetryService } from '../../../../../platform/telemetry/common/tele
 import { IWorkbenchLayoutService } from '../../../../../workbench/services/layout/browser/layoutService.js';
 import { IChatSessionsService } from '../../../../../workbench/contrib/chat/common/chatSessionsService.js';
 import { ILanguageModelsService } from '../../../../../workbench/contrib/chat/common/languageModels.js';
-import { getSessionTypeAvailability, getSessionTypeUnavailableLabel, SessionTypeAvailability } from '../../../../../workbench/contrib/chat/browser/agentSessions/sessionTypeAvailability.js';
+import { getSessionTypeAvailability, getSessionTypeUnavailableLabel } from '../../../../../workbench/contrib/chat/browser/agentSessions/sessionTypeAvailability.js';
 import { IChatEntitlementService } from '../../../../../workbench/services/chat/common/chatEntitlementService.js';
 import { IChatInputNotificationService } from '../../../../../workbench/contrib/chat/browser/widget/input/chatInputNotificationService.js';
 import { IProviderSessionType, ISessionsManagementService } from '../../../../services/sessions/common/sessionsManagement.js';
@@ -105,7 +105,7 @@ export class MobileSessionTypePicker extends SessionTypePicker {
 					label: sessionType.label,
 					icon: sessionType.icon,
 					checked: providerId === this._picked?.providerId && sessionType.id === this._picked?.sessionTypeId,
-					disabled: availability !== SessionTypeAvailability.Available,
+					disabled: this._isSessionTypeDisabled(sessionType, availability),
 					description: getSessionTypeUnavailableLabel(availability),
 					sectionTitle: showSectionHeaders && isFirstInGroup ? groupTitle : undefined,
 				});

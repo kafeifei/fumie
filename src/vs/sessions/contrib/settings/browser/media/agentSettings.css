@@ -1,0 +1,265 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.agent-settings {
+	display: flex;
+	height: 100%;
+	min-height: 0;
+	color: var(--session-view-foreground);
+}
+
+.agent-settings-nav {
+	flex: 0 0 200px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 8px 12px 24px 0;
+	overflow: auto;
+	border-right: 1px solid color-mix(in srgb, var(--session-view-foreground) 10%, transparent);
+}
+
+.agent-settings-nav-heading {
+	margin: 16px 8px 6px;
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-nav-heading:first-child {
+	margin-top: 8px;
+}
+
+.agent-settings-nav-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	padding: 6px 8px;
+	border: none;
+	border-radius: 6px;
+	background: transparent;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+	font-size: 13px;
+}
+
+.agent-settings-nav-item:hover {
+	background: color-mix(in srgb, var(--session-view-foreground) 8%, transparent);
+}
+
+.agent-settings-nav-item.selected {
+	background: color-mix(in srgb, var(--session-view-foreground) 12%, transparent);
+	font-weight: 600;
+}
+
+.agent-settings-nav-item:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.agent-settings-nav-item .codicon {
+	font-size: 16px;
+}
+
+.agent-settings-body {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: auto;
+	padding: 8px 8px 32px 28px;
+}
+
+.agent-settings-customizations {
+	display: none;
+	flex: 1 1 auto;
+	min-width: 0;
+	min-height: 0;
+}
+
+/* Mirrors `.ai-models-management-editor`, the container the upstream models editor gives `ChatModelsWidget`. */
+.agent-settings-models {
+	display: none;
+	box-sizing: border-box;
+	flex: 1 1 auto;
+	min-width: 0;
+	min-height: 0;
+	max-width: 1400px;
+	overflow: hidden;
+	padding: 15px 0 0 24px;
+}
+
+.agent-settings.showing-customizations .agent-settings-body,
+.agent-settings.showing-models .agent-settings-body {
+	display: none;
+}
+
+.agent-settings.showing-models .agent-settings-models {
+	display: block;
+}
+
+.agent-settings-models-toolbar {
+	display: flex;
+	justify-content: flex-end;
+	padding: 0 24px 8px 0;
+}
+
+.agent-settings-models-toolbar .monaco-button {
+	width: auto;
+	padding: 4px 12px;
+}
+
+.agent-settings.showing-customizations .agent-settings-customizations {
+	display: flex;
+	flex-direction: column;
+}
+
+.agent-settings-customizations .content-inner {
+	flex: 1 1 auto;
+	min-height: 0;
+}
+
+.agent-settings-title {
+	margin: 0 0 4px;
+	font-size: 22px;
+	font-weight: 600;
+	line-height: 28px;
+}
+
+.agent-settings-intro,
+.agent-settings-section-description,
+.agent-settings-description {
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-intro,
+.agent-settings-section-description {
+	margin: 0 0 20px;
+	font-size: 13px;
+	line-height: 18px;
+}
+
+.agent-settings-section {
+	margin-top: 24px;
+}
+
+.agent-settings-section-title {
+	margin: 0 0 4px;
+	font-size: 15px;
+	font-weight: 600;
+	line-height: 22px;
+}
+
+.agent-settings-row {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 12px 0;
+	border-bottom: 1px solid color-mix(in srgb, var(--session-view-foreground) 8%, transparent);
+}
+
+.agent-settings-labels {
+	min-width: 0;
+	flex: 1 1 auto;
+}
+
+.agent-settings-label {
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 18px;
+}
+
+.agent-settings-description {
+	margin-top: 4px;
+	font-size: 12px;
+	line-height: 16px;
+}
+
+.agent-settings-control,
+.agent-settings-select,
+.agent-settings-input,
+.agent-settings-checkbox-host,
+.agent-settings-inline-actions,
+.agent-settings-button-host {
+	flex: 0 0 auto;
+	min-width: 180px;
+}
+
+.agent-settings-row:has(.agent-settings-multiline) {
+	flex-direction: column;
+	align-items: stretch;
+}
+
+.agent-settings-control:has(.agent-settings-multiline) {
+	flex: 1 1 auto;
+	width: 100%;
+}
+
+.agent-settings-textarea {
+	box-sizing: border-box;
+	display: block;
+	width: 100%;
+	min-height: 76px;
+	margin-top: var(--vscode-spacing-size80);
+	padding: var(--vscode-spacing-size60) var(--vscode-spacing-size80);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: var(--vscode-cornerRadius-xSmall);
+	outline: none;
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+	font-family: inherit;
+	font-size: 13px;
+	resize: vertical;
+}
+
+.agent-settings-textarea:focus {
+	border-color: var(--vscode-focusBorder);
+}
+
+.agent-settings-multiline-actions {
+	display: flex;
+	justify-content: flex-end;
+	margin-top: var(--vscode-spacing-size80);
+}
+
+.agent-settings-multiline-actions .monaco-button {
+	flex: none;
+	width: auto;
+}
+
+.agent-settings-actions,
+.agent-settings-inline-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.agent-settings-notice {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 12px 0;
+	border-bottom: 1px solid color-mix(in srgb, var(--session-view-foreground) 8%, transparent);
+}
+
+.agent-settings-notice > .codicon {
+	flex: 0 0 auto;
+	color: var(--vscode-notificationsWarningIcon-foreground);
+}
+
+.agent-settings-notice-text {
+	flex: 1 1 auto;
+	min-width: 0;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.agent-settings-button-host .monaco-button,
+.agent-settings-inline-actions .monaco-button {
+	padding: 4px 12px;
+}

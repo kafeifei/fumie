@@ -12,7 +12,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { IFileService } from '../../../files/common/files.js';
 import { ILogService, LogLevel } from '../../../log/common/log.js';
 import { AgentSession } from '../../common/agent.js';
-import { getByokLmSelectionModelId, resolveByokLmEnablement, type IByokLmModelInfo } from '../../common/agentHostByokLm.js';
+import { getByokLmSelectionModelId, resolveByokLmEnablement, visibleByokLmModels, type IByokLmModelInfo } from '../../common/agentHostByokLm.js';
 import { AgentHostByokModelsEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, platformRootSchema, type AgentHostMcpServers } from '../../common/agentHostSchema.js';
 import { CopilotCliConfigKey, copilotCliConfigSchema, normalizeModelFamilyAlias, normalizeToolSearchDeferThreshold, resolveModelCapabilityOverrideField } from '../../common/copilotCliConfig.js';
 import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
@@ -35,7 +35,9 @@ import { isGpt56Model } from './modelIdentifiers.js';
 import { EPHEMERAL_DISABLED_COPILOT_TOOLS } from './copilotToolDisplay.js';
 import './prompts/allPrompts.js';
 import { agentHostPromptRegistry, type IAgentHostPromptContext } from './prompts/promptRegistry.js';
-import { describeSystemMessageConfig } from './prompts/systemMessage.js';
+import { appendSystemMessageContent, describeSystemMessageConfig } from './prompts/systemMessage.js';
+import { composeSessionHostContext } from '../../common/sessionHostContext.js';
+import { IProductService } from '../../../product/common/productService.js';
 import { buildSandboxConfigForSdk, type SandboxConfig } from './sandboxConfigForSdk.js';
 import { CLIENT_TOOL_SEARCH_REFERENCE_NAME, agentHostModelSupportsToolSearch } from './toolSearchDeferral.js';
 
@@ -466,7 +468,7 @@ export async function resolveByokSessionConfig(
 	// one (see `IByokLmBridgeRegistry`) and the proxy routes inference there.
 	let byokModels: IByokLmModelInfo[];
 	try {
-		byokModels = [...bridgeRegistry.getModels()];
+		byokModels = [...visibleByokLmModels(bridgeRegistry.getModels())];
 	} catch (err) {
 		logService.warn(`[Copilot:${sessionId}] Failed to enumerate BYOK models from renderer bridges`, err);
 		return {};
@@ -536,6 +538,7 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 		@IByokLmProxyService private readonly _byokLmProxyService: IByokLmProxyService,
 		@IByokLmBridgeRegistry private readonly _byokLmBridgeRegistry: IByokLmBridgeRegistry,
 		@IAgentHostOTelService private readonly _otelService: IAgentHostOTelService,
+		@IProductService private readonly _productService: IProductService,
 	) { }
 
 	async launch(plan: CopilotSessionLaunchPlan, runtime: ICopilotSessionRuntime): Promise<CopilotSessionWrapper> {
@@ -815,7 +818,12 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 		// Resolved once per (re)launch — the SDK has no mid-session system-message
 		// update, so this reflects the model/tools/settings at launch time. Log a
 		// summary at info for prompt observability; the full config at trace.
-		const systemMessage = agentHostPromptRegistry.resolveSystemMessageConfig(effectiveModel, promptContext);
+		const resolvedSystemMessage = agentHostPromptRegistry.resolveSystemMessageConfig(effectiveModel, promptContext);
+		// The session-constant host briefing rides the session-level system
+		// message — copilot's system-prompt channel — so it reaches the model
+		// once per session instead of riding every turn as additional context.
+		const hostContext = composeSessionHostContext(this._productService);
+		const systemMessage = hostContext ? appendSystemMessageContent(resolvedSystemMessage, hostContext) : resolvedSystemMessage;
 		this._logService.info(`[Copilot:${plan.sessionId}] Resolved system message: ${describeSystemMessageConfig(systemMessage)}`);
 		const additionalDisabledMcpServers = plan.isEphemeral ? [
 			...plugins.flatMap(plugin => plugin.mcpServers.map(server => server.name)),

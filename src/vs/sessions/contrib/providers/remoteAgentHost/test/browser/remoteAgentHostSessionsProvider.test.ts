@@ -44,6 +44,7 @@ import { CopilotCLISessionType } from '../../../agentHost/browser/baseAgentHostS
 import { IObservable, constObservable } from '../../../../../../base/common/observable.js';
 import { IActiveSession } from '../../../../../services/sessions/common/sessionsManagement.js';
 import { ISessionsService } from '../../../../../services/sessions/browser/sessionsService.js';
+import { IProductService } from '../../../../../../platform/product/common/productService.js';
 
 // ---- Mock connection --------------------------------------------------------
 
@@ -194,16 +195,20 @@ function createSession(id: string, opts?: { provider?: string; summary?: string;
 	};
 }
 
-function createProvider(disposables: DisposableStore, connection: MockAgentConnection, overrides?: { address?: string; preferenceKey?: string; connectionName?: string | undefined; sendRequest?: (resource: URI, message: string, options?: IChatSendRequestOptions) => Promise<ChatSendResult>; openSession?: boolean; storageService?: IStorageService; noConnection?: boolean; isWebPlatform?: boolean; workspaceTrusted?: boolean; omitHostFromWorkspaceLabel?: boolean; workspaceTypeIcon?: ThemeIcon }): RemoteAgentHostSessionsProvider {
+function createProvider(disposables: DisposableStore, connection: MockAgentConnection, overrides?: { address?: string; preferenceKey?: string; connectionName?: string | undefined; sendRequest?: (resource: URI, message: string, options?: IChatSendRequestOptions) => Promise<ChatSendResult>; openSession?: boolean; storageService?: IStorageService; noConnection?: boolean; isWebPlatform?: boolean; omitHostFromWorkspaceLabel?: boolean; workspaceTypeIcon?: ThemeIcon }): RemoteAgentHostSessionsProvider {
 	const instantiationService = disposables.add(new TestInstantiationService());
 
 	instantiationService.stub(IFileDialogService, {});
 	instantiationService.stub(IDialogService, { confirm: async () => ({ confirmed: true }) });
 	instantiationService.stub(IConfigurationService, new TestConfigurationService());
 	instantiationService.stub(INotificationService, { error: () => { } });
+	// Remote agent hosts advertise whatever the host reports; there's no
+	// product-driven restriction for this provider, so tests get an
+	// unrestricted allowlist by default.
+	instantiationService.stub(IProductService, { _serviceBrand: undefined, sessionsAllowedAgentHostProviders: undefined } as IProductService);
 	instantiationService.stub(IWorkspaceTrustManagementService, new class extends mock<IWorkspaceTrustManagementService>() {
-		override isWorkspaceTrusted(): boolean { return overrides?.workspaceTrusted ?? true; }
-		override async getUriTrustInfo(uri: URI) { return { uri, trusted: overrides?.workspaceTrusted ?? true }; }
+		override isWorkspaceTrusted(): boolean { return true; }
+		override async getUriTrustInfo(uri: URI) { return { uri, trusted: true }; }
 	});
 	instantiationService.stub(IChatSessionsService, {
 		getChatSessionContribution: () => ({ type: 'remote-test-copilot', name: 'test', displayName: 'Test', description: 'test', icon: undefined }),
@@ -391,7 +396,10 @@ suite('RemoteAgentHostSessionsProvider', () => {
 		connection.setAgents([
 			{ provider: 'copilotcli', displayName: 'Copilot', description: '', models: [] } as AgentInfo,
 			{ provider: 'claude', displayName: 'Claude', description: '', models: [] } as AgentInfo,
-			{ provider: 'openai', displayName: 'OpenAI', description: '', models: [] } as AgentInfo,
+			{ provider: 'codex', displayName: 'Codex', description: '', models: [] } as AgentInfo,
+			{ provider: 'kimi', displayName: 'Kimi', description: '', models: [] } as AgentInfo,
+			{ provider: 'deepseek', displayName: 'DeepSeek', description: '', models: [] } as AgentInfo,
+			{ provider: 'pi', displayName: 'Pi', description: '', models: [] } as AgentInfo,
 			{ provider: 'unknown-agent', displayName: 'Unknown', description: '', models: [] } as AgentInfo,
 		]);
 		const provider = createProvider(disposables, connection, { address: '10.0.0.1:8080', connectionName: 'My Host' });
@@ -400,7 +408,10 @@ suite('RemoteAgentHostSessionsProvider', () => {
 			[
 				{ id: CopilotCLISessionType.id, icon: 'copilot' },
 				{ id: 'claude', icon: 'claude' },
-				{ id: 'openai', icon: 'openai' },
+				{ id: 'codex', icon: 'openai' },
+				{ id: 'kimi', icon: 'kimi' },
+				{ id: 'deepseek', icon: 'sessions-agent-deepseek' },
+				{ id: 'pi', icon: 'sessions-agent-pi' },
 				{ id: 'unknown-agent', icon: 'remote' },
 			],
 		);
@@ -419,31 +430,18 @@ suite('RemoteAgentHostSessionsProvider', () => {
 		assert.strictEqual(ws.folders[0].root.toString(), uri.toString());
 	});
 
-	test('createNewSession eagerly creates the backend session in a trusted folder', async () => {
+	test('createNewSession creates nothing on the agent host for the draft', async () => {
 		const provider = createProvider(disposables, connection);
-		const session = provider.createNewSession(URI.parse('vscode-agent-host://localhost__4321/home/user/trusted-project'), provider.sessionTypes[0].id);
-		provider.setAuthenticationPending(false); // eager create only runs once auth settles
-		await timeout(0); // let the eager createSession promise resolve
+		provider.createNewSession(URI.parse('vscode-agent-host://localhost__4321/home/user/trusted-project'), provider.sessionTypes[0].id);
+		provider.setAuthenticationPending(false); // the draft's config resolve only runs once auth settles
+		await timeout(0);
 
-		const rawId = session.resource.path.substring(1);
-		const expectedBackendUri = AgentSession.uri(provider.sessionTypes[0].id, rawId);
-		assert.deepStrictEqual(
-			connection.createdSessionUris.map(u => u.toString()),
-			[expectedBackendUri.toString()],
-			'eager createSession should be invoked with the client-allocated URI',
-		);
-	});
-
-	test('createNewSession does not eagerly create the backend session in an untrusted folder', async () => {
-		const provider = createProvider(disposables, connection, { workspaceTrusted: false });
-		provider.createNewSession(URI.parse('vscode-agent-host://localhost__4321/home/user/untrusted-project'), provider.sessionTypes[0].id);
-		provider.setAuthenticationPending(false); // settle auth so only trust can gate the eager create
-		await timeout(0); // let the (suppressed) eager createSession path settle
-
+		// The composer draft is client-local: the remote host first hears about
+		// the session when the first message is sent.
 		assert.deepStrictEqual(
 			connection.createdSessionUris.map(u => u.toString()),
 			[],
-			'no eager createSession should be invoked for an untrusted folder',
+			'no session should be created for an unsent draft',
 		);
 	});
 
@@ -1068,7 +1066,7 @@ suite('RemoteAgentHostSessionsProvider', () => {
 		assert.strictEqual(session!.workspace.get(), undefined);
 	}));
 
-	test('session adapter uses raw ID as fallback title', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+	test('session adapter uses localized "New Session" as fallback title', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		connection.addSession(createSession('abcdef1234567890'));
 
 		const provider = createProvider(disposables, connection);
@@ -1078,7 +1076,7 @@ suite('RemoteAgentHostSessionsProvider', () => {
 		const sessions = provider.getSessions();
 		const session = sessions[0];
 		assert.ok(session);
-		assert.strictEqual(session.title.get(), 'Session abcdef12');
+		assert.strictEqual(session.title.get(), 'New Session');
 	}));
 
 	// ---- Refresh on turnComplete -------

@@ -67,6 +67,7 @@ export class NullAgentHostService implements IAgentHostService {
 	async startWebSocketServer(): Promise<IAgentHostSocketInfo> { return notSupported(); }
 	async getInspectInfo(_tryEnable: boolean): Promise<IAgentHostInspectInfo | undefined> { return undefined; }
 	async disposeSession(_session: URI): Promise<void> { }
+	async setSessionArchived(_session: URI, _isArchived: boolean, _preserveChanges?: boolean): Promise<void> { notSupported(); }
 	async createChat(_session: URI, _chat: URI): Promise<void> { notSupported(); }
 	async disposeChat(_chat: URI): Promise<void> { }
 	async createTerminal(_params: CreateTerminalParams): Promise<void> { notSupported(); }

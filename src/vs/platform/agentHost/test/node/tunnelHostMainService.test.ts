@@ -8,10 +8,11 @@ import { Emitter, Event } from '../../../../base/common/event.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { INativeEnvironmentService } from '../../../environment/common/environment.js';
-import { LogLevel, NullLoggerService } from '../../../log/common/log.js';
+import { LogLevel, NullLoggerService, NullLogService } from '../../../log/common/log.js';
+import { IProductService } from '../../../product/common/productService.js';
 import { IAgentHostSharingRequest, ITunnelProcessCoordinator, ITunnelProcessMachineStatus, ITunnelProcessOutput, ITunnelProcessStatus } from '../../../remoteTunnel/node/tunnelProcessCoordinator.js';
 import { TunnelMode, TunnelStatus } from '../../../remoteTunnel/common/remoteTunnel.js';
-import { TunnelHostMainService } from '../../node/tunnelHostMainService.js';
+import { TunnelHostMainService, withMobileAddresses } from '../../node/tunnelHostMainService.js';
 
 class TestTunnelProcessCoordinator implements ITunnelProcessCoordinator {
 	declare readonly _serviceBrand: undefined;
@@ -76,7 +77,9 @@ suite('TunnelHostMainService', () => {
 		const service = new TunnelHostMainService(
 			loggerService,
 			{ logsHome: URI.file('logs') } as INativeEnvironmentService,
+			new NullLogService(),
 			coordinator,
+			{ agentHostDefaultFumieHome: undefined } as IProductService,
 		);
 		try {
 			const startHosting = service.startHosting('token', 'github');
@@ -95,7 +98,9 @@ suite('TunnelHostMainService', () => {
 		const service = new TunnelHostMainService(
 			loggerService,
 			{ logsHome: URI.file('logs') } as INativeEnvironmentService,
+			new NullLogService(),
 			coordinator,
+			{ agentHostDefaultFumieHome: undefined } as IProductService,
 		);
 		try {
 			const startHosting = service.startHosting('token', 'microsoft');
@@ -118,7 +123,9 @@ suite('TunnelHostMainService', () => {
 		const service = new TunnelHostMainService(
 			loggerService,
 			{ logsHome: URI.file('logs') } as INativeEnvironmentService,
+			new NullLogService(),
 			coordinator,
+			{ agentHostDefaultFumieHome: undefined } as IProductService,
 		);
 		try {
 			const startHosting = service.startHosting('token', 'github');
@@ -137,7 +144,9 @@ suite('TunnelHostMainService', () => {
 		const service = new TunnelHostMainService(
 			loggerService,
 			{ logsHome: URI.file('logs') } as INativeEnvironmentService,
+			new NullLogService(),
 			coordinator,
+			{ agentHostDefaultFumieHome: undefined } as IProductService,
 		);
 		try {
 			const startHosting = service.startHosting('token', 'github');
@@ -160,7 +169,9 @@ suite('TunnelHostMainService', () => {
 		const service = new TunnelHostMainService(
 			loggerService,
 			{ logsHome: URI.file('logs') } as INativeEnvironmentService,
+			new NullLogService(),
 			coordinator,
+			{ agentHostDefaultFumieHome: undefined } as IProductService,
 		);
 		try {
 			coordinator.failNextSharingRequest = true;
@@ -179,7 +190,9 @@ suite('TunnelHostMainService', () => {
 		const service = new TunnelHostMainService(
 			loggerService,
 			{ logsHome: URI.file('logs') } as INativeEnvironmentService,
+			new NullLogService(),
 			coordinator,
+			{ agentHostDefaultFumieHome: undefined } as IProductService,
 		);
 		try {
 			const withoutRequest = await service.getStatus();
@@ -215,5 +228,69 @@ suite('TunnelHostMainService', () => {
 			coordinator.dispose();
 			loggerService.dispose();
 		}
+	});
+
+	test('offers the loopback and the tunnel address separately', () => {
+		assert.deepStrictEqual(
+			withMobileAddresses({ tunnelName: 'agent' }, {
+				active: true,
+				localUrl: 'http://127.0.0.1:5000/m/cap',
+				publicUrl: 'https://x-5000.usw3.devtunnels.ms/m/cap',
+			}),
+			{
+				tunnelName: 'agent',
+				mobileUrl: 'https://x-5000.usw3.devtunnels.ms/m/cap',
+				mobileLocalUrl: 'http://127.0.0.1:5000/m/cap',
+			});
+	});
+
+	/**
+	 * A loopback address once stood in for the remote one when the tunnel
+	 * failed, which sent the user to copy 127.0.0.1 onto a phone.
+	 */
+	test('does not pass the loopback address off as the remote one', () => {
+		assert.deepStrictEqual(
+			withMobileAddresses({ tunnelName: 'agent' }, { active: true, localUrl: 'http://127.0.0.1:5000/m/cap' }),
+			{ tunnelName: 'agent', mobileLocalUrl: 'http://127.0.0.1:5000/m/cap' });
+	});
+
+	test('reports no address at all when mobile hosting never started', () => {
+		assert.deepStrictEqual(withMobileAddresses({ tunnelName: 'agent' }, undefined), { tunnelName: 'agent' });
+		assert.deepStrictEqual(withMobileAddresses({ tunnelName: 'agent' }, { active: false }), { tunnelName: 'agent' });
+	});
+
+	/**
+	 * The settings page cannot tell "the tunnel is still coming" from "the tunnel
+	 * will never come" unless the failure travels with the addresses. Without the
+	 * reason it dropped the remote row entirely, which read as the feature not
+	 * existing rather than as one address being unavailable.
+	 */
+	test('carries why the remote address is missing when the tunnel failed', () => {
+		assert.deepStrictEqual(
+			withMobileAddresses({ tunnelName: 'agent' }, {
+				active: true,
+				localUrl: 'http://127.0.0.1:5000/m/cap',
+				publicUrlError: 'Resource limit exceeded for TunnelsPerUserPerCluster (10).',
+			}),
+			{
+				tunnelName: 'agent',
+				mobileLocalUrl: 'http://127.0.0.1:5000/m/cap',
+				mobileUrlUnavailableReason: 'Resource limit exceeded for TunnelsPerUserPerCluster (10).',
+			});
+	});
+
+	test('a remote address that did arrive carries no failure reason', () => {
+		assert.deepStrictEqual(
+			withMobileAddresses({ tunnelName: 'agent' }, {
+				active: true,
+				localUrl: 'http://127.0.0.1:5000/m/cap',
+				publicUrl: 'https://x-5000.usw3.devtunnels.ms/m/cap',
+				publicUrlError: 'stale failure from an earlier attempt',
+			}),
+			{
+				tunnelName: 'agent',
+				mobileUrl: 'https://x-5000.usw3.devtunnels.ms/m/cap',
+				mobileLocalUrl: 'http://127.0.0.1:5000/m/cap',
+			});
 	});
 });

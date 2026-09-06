@@ -6,6 +6,9 @@
 import { Event, Emitter } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Action, IAction, SubmenuAction, toAction } from '../../../../base/common/actions.js';
+import { Codicon } from '../../../../base/common/codicons.js';
+import Severity from '../../../../base/common/severity.js';
+import { ThemeIcon } from '../../../../base/common/themables.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
 import { CODEX_ACCOUNT_SIGN_IN_REQUEST_KEY, CODEX_ACCOUNT_SIGN_OUT_REQUEST_KEY, ICodexAccountInfo, readCodexAccountInfo } from '../../../../platform/agentHost/common/codexAccount.js';
@@ -17,6 +20,7 @@ import { ROOT_STATE_URI } from '../../../../platform/agentHost/common/state/sess
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
+import { IAgentHostModelProviderPresentation } from './agentHostModelProviderPresentation.js';
 
 interface ICodexAccountVisibilityConfiguration {
 	getValue<T>(section: string): T | undefined;
@@ -71,6 +75,43 @@ export function createCodexAccountMenuActions(service: ICodexAccountService, vis
 		return [new Action('codex.signInToChatGPT', localize('signInToChatGPT', "Sign in to ChatGPT"), undefined, true, () => service.signIn())];
 	}
 	return [];
+}
+
+export function createCodexModelProviderPresentation(service: ICodexAccountService): IAgentHostModelProviderPresentation {
+	const signInAction = (retry: boolean): IAction => toAction({
+		id: retry ? 'codex.retryChatGPTSignInFromModels' : 'codex.signInToChatGPTFromModels',
+		label: retry
+			? localize('retryChatGPTSignInFromModels', "Retry ChatGPT sign-in")
+			: localize('signInToChatGPTFromModels', "Sign in to ChatGPT"),
+		class: ThemeIcon.asClassName(Codicon.account),
+		run: () => service.signIn(),
+	});
+
+	return {
+		onDidChange: Event.map(service.onDidChangeAccount, () => undefined),
+		provideStatus: () => {
+			switch (service.account.status) {
+				case 'unknown':
+				case 'signedOut':
+					return {
+						message: localize('codexModels.signIn', "Sign in to ChatGPT to load Codex models"),
+						severity: Severity.Warning,
+						action: signInAction(false),
+					};
+				case 'error':
+					return {
+						message: localize('codexModels.signInError', "ChatGPT sign-in needs attention"),
+						severity: Severity.Error,
+						action: signInAction(true),
+					};
+				case 'downloading':
+					return { message: localize('codexModels.downloading', "Downloading Codex agent…"), severity: Severity.Info };
+				case 'signedIn':
+				case 'unavailable':
+					return undefined;
+			}
+		},
+	};
 }
 
 export function openCodexAuthUrl(openerService: Pick<IOpenerService, 'open'>, authUrl: string): Promise<boolean> {
@@ -128,3 +169,7 @@ class CodexAccountService extends Disposable implements ICodexAccountService {
 }
 
 registerSingleton(ICodexAccountService, CodexAccountService, InstantiationType.Delayed);
+
+// No registration on the `codex` agent vendor — see the note in
+// `claudeAccountService`. The Codex Subscription provider builds this
+// presentation for the row the account actually belongs to.

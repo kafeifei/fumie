@@ -6,6 +6,7 @@
 import { DisposableMap, DisposableStore, combinedDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { autorun, observableFromEvent, observableSignalFromEvent } from '../../../../base/common/observable.js';
 import { Event } from '../../../../base/common/event.js';
+import { URI } from '../../../../base/common/uri.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { ServiceCollection } from '../../../../platform/instantiation/common/serviceCollection.js';
@@ -19,6 +20,9 @@ import { getActiveResourceCandidates } from './agentFeedbackEditorUtils.js';
 import { Menus } from '../../../browser/menus.js';
 import { ICodeReviewService } from '../../codeReview/browser/codeReviewService.js';
 import { EmptyFileEditorInput } from '../../editor/browser/emptyFileEditorInput.js';
+import { ISessionChangesService } from '../../changes/browser/sessionChangesService.js';
+import { SessionChangesEditorInput } from '../../changes/browser/sessionChangesEditorInput.js';
+import { MultiDiffEditorInput } from '../../../../workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.js';
 import { getAcceptedAgentFeedbackCommentCount, getSessionEditorComments } from './sessionEditorComments.js';
 
 export interface IAgentFeedbackOverlayEditorGroup extends IEditorGroup {
@@ -27,6 +31,16 @@ export interface IAgentFeedbackOverlayEditorGroup extends IEditorGroup {
 
 export function getAgentFeedbackOverlayResourceCandidates(input: Parameters<typeof getActiveResourceCandidates>[0]): ReturnType<typeof getActiveResourceCandidates> {
 	return input instanceof EmptyFileEditorInput ? [] : getActiveResourceCandidates(input);
+}
+
+export function getAgentFeedbackOverlaySessionResource(
+	input: Parameters<typeof getActiveResourceCandidates>[0],
+	sessionChangesService: ISessionChangesService,
+): URI | undefined {
+	const multiDiffSource = input instanceof SessionChangesEditorInput || input instanceof MultiDiffEditorInput
+		? input.multiDiffSource
+		: undefined;
+	return multiDiffSource ? sessionChangesService.getSessionResource(multiDiffSource) : undefined;
 }
 
 export class AgentFeedbackOverlayController {
@@ -40,6 +54,7 @@ export class AgentFeedbackOverlayController {
 		@IInstantiationService instaService: IInstantiationService,
 		@IContextKeyService contextKeyService: IContextKeyService,
 		@ICodeReviewService codeReviewService: ICodeReviewService,
+		@ISessionChangesService sessionChangesService: ISessionChangesService,
 	) {
 		const container = group.editorPaneContainer;
 		container.classList.add('agent-feedback-editor-overlay-host');
@@ -90,15 +105,19 @@ export class AgentFeedbackOverlayController {
 			activeSignal.read(r);
 
 			const activeInput = group.activeEditorPane?.input;
-			const candidates = getAgentFeedbackOverlayResourceCandidates(activeInput);
+			const directSessionResource = getAgentFeedbackOverlaySessionResource(activeInput, sessionChangesService);
+			const sessionResources: URI[] = directSessionResource ? [directSessionResource] : [];
+			if (!directSessionResource) {
+				for (const candidate of getAgentFeedbackOverlayResourceCandidates(activeInput)) {
+					const sessionResource = agentFeedbackService.getFeedbackSessionResource(candidate);
+					if (sessionResource) {
+						sessionResources.push(sessionResource);
+					}
+				}
+			}
 			let navigationBearings = undefined;
 			let acceptedFeedbackCount = 0;
-			for (const candidate of candidates) {
-				const sessionResource = agentFeedbackService.getFeedbackSessionResource(candidate);
-				if (!sessionResource) {
-					continue;
-				}
-
+			for (const sessionResource of sessionResources) {
 				const comments = getSessionEditorComments(
 					sessionResource,
 					agentFeedbackService.getFeedback(sessionResource),

@@ -8,7 +8,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { CLAUDE_AGENT_PROVIDER_ID, IAgentModelInfo } from '../../common/agent.js';
 import { AGENT_MODEL_GROUP_ID_META_KEY } from '../../common/agentModelSource.js';
 import { CLAUDE_PROVIDER_ANTHROPIC, CLAUDE_PROVIDER_COPILOT } from '../../common/claudeProviders.js';
-import { claudeTransportForProvider, mergeClaudeModelCatalogs, parseClaudeModelSelection, resolveClaudeSessionTransport, toClaudeModelSelectionId, toClaudeSdkModelId } from '../../node/claude/claudeModelSelection.js';
+import { claudeTransportForProvider, mergeClaudeModelCatalogs, parseClaudeByokSelection, parseClaudeModelSelection, resolveClaudeSessionTransport, toClaudeModelSelectionId, toClaudeSdkModelId } from '../../node/claude/claudeModelSelection.js';
 
 suite('claudeModelSelection', () => {
 
@@ -47,7 +47,7 @@ suite('claudeModelSelection', () => {
 		);
 	});
 
-	test('provider maps to transport: anthropic is native, everything else (incl. copilot/unknown) is proxy', () => {
+	test('provider maps to transport: anthropic is native; copilot/unknown are proxy', () => {
 		assert.deepStrictEqual(
 			[
 				claudeTransportForProvider(CLAUDE_PROVIDER_ANTHROPIC),
@@ -55,6 +55,27 @@ suite('claudeModelSelection', () => {
 				claudeTransportForProvider('something-else'),
 			],
 			['native', 'proxy', 'proxy'],
+		);
+	});
+
+	test('a BYOK id splits into vendor + provider-local id; qualified and bare ids are not BYOK', () => {
+		assert.deepStrictEqual(
+			[
+				// allow-any-unicode-next-line
+				parseClaudeByokSelection({ id: 'customendpoint/示例/claude-opus-4-6' }),
+				parseClaudeByokSelection({ id: 'customendpoint/claude-opus-4-6' }),
+				parseClaudeByokSelection({ id: 'claude-opus-4-6' }),
+				parseClaudeByokSelection({ id: toClaudeModelSelectionId(CLAUDE_PROVIDER_ANTHROPIC, 'org/model') }),
+				parseClaudeByokSelection(undefined),
+			],
+			[
+				// allow-any-unicode-next-line
+				{ vendor: 'customendpoint', modelId: '示例/claude-opus-4-6' },
+				{ vendor: 'customendpoint', modelId: 'claude-opus-4-6' },
+				undefined,
+				undefined,
+				undefined,
+			],
 		);
 	});
 
@@ -73,9 +94,23 @@ suite('claudeModelSelection', () => {
 			// `_meta` (`modelGroupId`) so the picker groups Copilot-routed and native
 			// Anthropic models into separate buckets without misrouting `create_session`.
 			assert.deepStrictEqual(merged, [
-				{ provider: CLAUDE_AGENT_PROVIDER_ID, id: '@provider=copilot:claude-opus-4-8', name: 'Claude Opus 4.8', supportsVision: true, _meta: { [AGENT_MODEL_GROUP_ID_META_KEY]: CLAUDE_PROVIDER_COPILOT } },
-				{ provider: CLAUDE_AGENT_PROVIDER_ID, id: '@provider=anthropic:claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5', supportsVision: false, _meta: { [AGENT_MODEL_GROUP_ID_META_KEY]: CLAUDE_PROVIDER_ANTHROPIC } },
+				{ provider: CLAUDE_AGENT_PROVIDER_ID, id: '@provider=copilot:claude-opus-4-8', underlyingModelId: 'claude-opus-4-8', name: 'Claude Opus 4.8', supportsVision: true, _meta: { [AGENT_MODEL_GROUP_ID_META_KEY]: CLAUDE_PROVIDER_COPILOT } },
+				{ provider: CLAUDE_AGENT_PROVIDER_ID, id: '@provider=anthropic:claude-sonnet-4-5-20250929', underlyingModelId: 'claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5', supportsVision: false, _meta: { [AGENT_MODEL_GROUP_ID_META_KEY]: CLAUDE_PROVIDER_ANTHROPIC } },
 			]);
+		});
+
+		// The qualification is ours; the SDK keeps naming the bare model in
+		// transcripts and usage. Without the pre-qualification id published
+		// alongside, nothing can match a replayed turn's model back to this catalog.
+		test('keeps each pre-qualification id as the underlying model id, whichever provider qualified it', () => {
+			assert.deepStrictEqual(
+				mergeClaudeModelCatalogs([model('claude-opus-4-8', 'Opus')], [model('claude-opus-4-8', 'Opus')])
+					.map(m => ({ id: m.id, underlyingModelId: m.underlyingModelId })),
+				[
+					{ id: '@provider=copilot:claude-opus-4-8', underlyingModelId: 'claude-opus-4-8' },
+					{ id: '@provider=anthropic:claude-opus-4-8', underlyingModelId: 'claude-opus-4-8' },
+				],
+			);
 		});
 
 		test('one empty source does not blank the other (a single failed fetch keeps the other provider)', () => {
@@ -116,8 +151,10 @@ suite('claudeModelSelection', () => {
 				[
 					resolveClaudeSessionTransport({ model: { id: toClaudeModelSelectionId(CLAUDE_PROVIDER_ANTHROPIC, 'claude-opus-4-8') }, defaultMode: 'proxy' }),
 					resolveClaudeSessionTransport({ model: { id: toClaudeModelSelectionId(CLAUDE_PROVIDER_COPILOT, 'claude-opus-4-8') }, defaultMode: 'native' }),
+					// allow-any-unicode-next-line
+					resolveClaudeSessionTransport({ model: { id: 'customendpoint/示例/claude-opus-4-6' }, defaultMode: 'proxy' }),
 				],
-				['native', 'proxy'],
+				['native', 'proxy', 'byok'],
 			);
 		});
 
@@ -149,9 +186,13 @@ suite('claudeModelSelection', () => {
 					toClaudeSdkModelId({ id: toClaudeModelSelectionId(CLAUDE_PROVIDER_ANTHROPIC, 'claude-sonnet-4-5-20250929') }),
 					toClaudeSdkModelId({ id: toClaudeModelSelectionId(CLAUDE_PROVIDER_COPILOT, 'claude-opus-4.6') }),
 					toClaudeSdkModelId({ id: 'claude-opus-4.6' }),
+					// A BYOK id keeps the provider's own slug, unnormalized.
+					// allow-any-unicode-next-line
+					toClaudeSdkModelId({ id: 'customendpoint/Example/claude-opus-4.6' }),
 					toClaudeSdkModelId(undefined),
 				],
-				['claude-sonnet-4-5', 'claude-opus-4-6', 'claude-opus-4-6', undefined],
+				// allow-any-unicode-next-line
+				['claude-sonnet-4-5', 'claude-opus-4-6', 'claude-opus-4-6', 'customendpoint/Example/claude-opus-4.6', undefined],
 			);
 		});
 	});

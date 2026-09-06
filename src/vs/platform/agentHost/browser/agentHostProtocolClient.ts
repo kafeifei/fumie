@@ -5,6 +5,8 @@
 
 // Protocol client for communicating with an agent host process.
 
+import { addDisposableListener } from '../../../base/browser/dom.js';
+import { mainWindow } from '../../../base/browser/window.js';
 import { DeferredPromise, TimeoutTimer } from '../../../base/common/async.js';
 import { CancellationError } from '../../../base/common/errors.js';
 import { Emitter, Event } from '../../../base/common/event.js';
@@ -16,8 +18,8 @@ import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogService } from '../../log/common/log.js';
 import { FileSystemProviderErrorCode, toFileSystemProviderErrorCode } from '../../files/common/files.js';
 import { ConfigurationTargetToString, IConfigurationService } from '../../configuration/common/configuration.js';
-import { AgentSession, IAgentCreateChatOptions, IAgentCreateSessionConfig, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, IMcpNotification } from '../common/agent.js';
-import { AGENT_HOST_DEBUG_LOGS_CHUNK_BYTES, AGENT_HOST_DEBUG_LOGS_MAX_ENTRIES, IAgentConnection, IAgentHostManagedSettingsDiagnostics, IAgentHostNetworkDiagnosticsInfo, IAgentHostNetworkFetchResult, type AgentHostDebugLogsArtifactKind, type IAgentHostDebugLogsArtifact, type IAgentHostDebugLogsChunk } from '../common/agentService.js';
+import { AgentSession, IAgentCreateChatOptions, IAgentCreateSessionConfig, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, AuthenticateParams, AuthenticateResult, IMcpNotification } from '../common/agent.js';
+import { AGENT_HOST_DEBUG_LOGS_CHUNK_BYTES, AGENT_HOST_DEBUG_LOGS_MAX_ENTRIES, IAgentConnection, IAgentHostManagedSettingsDiagnostics, IAgentHostNetworkDiagnosticsInfo, IAgentHostNetworkFetchResult, type AgentHostDebugLogsArtifactKind, type IAgentHostDebugLogsArtifact, type IAgentHostDebugLogsChunk, type IAgentSessionList } from '../common/agentService.js';
 import { CollectAgentHostDebugLogsExtensionMethod, GetAgentHostSessionStateFileExtensionMethod, ReadAgentHostDebugLogsChunkExtensionMethod, type IAgentHostExtensionCommandMap } from '../common/agentHostExtensionProtocol.js';
 import { AMBIENT_AGENT_HOST_AUTHORITY } from '../common/agentHostConnectionsService.js';
 import { createRemoteWatchHandle, type IRemoteWatchHandle } from '../common/agentHostFileSystemProvider.js';
@@ -47,7 +49,7 @@ import type { TelemetryCapabilities } from '../common/state/protocol/channels-ot
 import type { Implementation, InitializeResult } from '../common/state/protocol/common/commands.js';
 import { dirname } from '../../../base/common/resources.js';
 import { observableValue, type IObservable } from '../../../base/common/observable.js';
-import { isFileResourceRead } from '../common/resourceReadLogging.js';
+import { isFileResourceProbe } from '../common/resourceReadLogging.js';
 import { ResourceSet } from '../../../base/common/map.js';
 
 const AHP_CLIENT_CONNECTION_CLOSED = -32000;
@@ -96,6 +98,25 @@ function connectionDisposedError(address: string): ProtocolError {
 
 function transportLostError(address: string): ProtocolError {
 	return new ProtocolError(AHP_CLIENT_CONNECTION_CLOSED, `Transport lost (reconnecting): ${address}`);
+}
+
+/**
+ * Render a JSON-RPC error into the log line itself. Handed to a logger as
+ * an extra argument, the error object reaches the console as a bare
+ * `Object` and takes the reason with it.
+ */
+function describeJsonRpcError(error: JsonRpcErrorResponse['error']): string {
+	const described = `${error.code} ${error.message}`;
+	if (error.data === undefined) {
+		return described;
+	}
+	let data: string;
+	try {
+		data = JSON.stringify(error.data);
+	} catch {
+		data = String(error.data);
+	}
+	return `${described} (${data})`;
 }
 
 interface IRemoteAgentHostExtensionNotificationMap {
@@ -389,6 +410,18 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
 			}
 		}));
 
+		// The two things a browser tells us about a connection it did not tell
+		// us was broken. Neither is a guarantee that the host is reachable —
+		// they only say the guess behind the current backoff is out of date.
+		this._register(addDisposableListener(mainWindow, 'online', () => {
+			this._reconnectNow('The browser came back online');
+		}));
+		this._register(addDisposableListener(mainWindow.document, 'visibilitychange', () => {
+			if (!mainWindow.document.hidden) {
+				this._reconnectNow('The page became visible again');
+			}
+		}));
+
 		if (!isClientTransport(this._transport)) {
 			// Passive transports are already connected when constructed.
 			this._resetLivenessTimers();
@@ -596,6 +629,37 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
 		this._cancelLivenessTimers();
 		this._scheduleReconnect();
 		return true;
+	}
+
+	/**
+	 * Abandon the backoff we are waiting out and retry now.
+	 *
+	 * The delay in {@link _scheduleReconnect} is a guess about a network that
+	 * has just been replaced: a phone that was locked, or a laptop whose lid
+	 * was closed, comes back with a dead socket and however many failed
+	 * attempts it accumulated on the way down. Waiting those out means a user
+	 * who unlocks their phone watches a dead client for up to
+	 * {@link RECONNECT_MAX_DELAY_MS}. Coming back online, or coming back to the
+	 * tab, is fresh evidence that the guess is stale, so drop it and start the
+	 * ladder over.
+	 *
+	 * No-op unless a delay is actually pending: an attempt already in flight
+	 * would race a second one onto two transports, and the states either side
+	 * of {@link AgentHostClientState.Reconnecting} have nothing to retry.
+	 */
+	private _reconnectNow(reason: string): void {
+		if (this._state.kind !== AgentHostClientState.Reconnecting || !this._transportFactory) {
+			return;
+		}
+		const reconnect = this._state.reconnect;
+		if (reconnect.timeoutHandle === undefined) {
+			return;
+		}
+		clearTimeout(reconnect.timeoutHandle);
+		reconnect.timeoutHandle = undefined;
+		reconnect.attempt = 0;
+		this._logService.info(`[RemoteAgentHostProtocol] ${reason}; retrying ${this._address} now instead of waiting out the backoff.`);
+		void this._attemptReconnect();
 	}
 
 	/**
@@ -1027,6 +1091,10 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
 			channel: session.toString(),
 			_meta: config?._meta,
 			provider,
+			// The model decides how the provider authenticates this session, so a
+			// remote client that dropped it would leave the host guessing with a
+			// default it may hold no credentials for. Older hosts ignore the field.
+			model: config?.model,
 			workingDirectories: config?.workingDirectories?.map(d => fromAgentHostUri(d).toString()),
 			config: config?.config,
 			activeClient: config?.activeClient,
@@ -1220,6 +1288,14 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
 		await this._sendRequest('disposeSession', { channel: session.toString() });
 	}
 
+	async setSessionArchived(session: URI, isArchived: boolean, preserveChanges?: boolean): Promise<void> {
+		await this._sendRequest('setSessionArchived', {
+			channel: session.toString(),
+			isArchived,
+			...(preserveChanges === true ? { preserveChanges: true } : {}),
+		});
+	}
+
 	async createChat(session: URI, chat: URI, options?: IAgentCreateChatOptions): Promise<void> {
 		await this._sendRequest('createChat', {
 			channel: session.toString(),
@@ -1271,9 +1347,9 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
 	/**
 	 * List all sessions from the remote agent host.
 	 */
-	async listSessions(): Promise<IAgentSessionMetadata[]> {
+	async listSessions(): Promise<IAgentSessionList> {
 		const result = await this._sendRequest('listSessions', { channel: ROOT_STATE_URI });
-		return result.items.map((s: SessionSummary) => ({
+		const sessions: IAgentSessionList = result.items.map((s: SessionSummary) => ({
 			session: URI.parse(s.resource),
 			startTime: Date.parse(s.createdAt),
 			modifiedTime: Date.parse(s.modifiedAt),
@@ -1292,6 +1368,10 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
 			// Carry durable host provenance for sessions first materialized from a listing.
 			...(s._meta !== undefined ? { _meta: s._meta } : {}),
 		}));
+		if (result.providers) {
+			Object.assign(sessions, { providers: result.providers });
+		}
+		return sessions;
 	}
 
 	private _toLocalProjectUri(uri: URI): URI {
@@ -1452,8 +1532,11 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
 			if (pending) {
 				this._pendingRequests.delete(msg.id);
 				if (hasKey(msg, { error: true })) {
-					if (this._shouldLogFailedRequest(pending, msg.error)) {
-						this._logService.warn(`[RemoteAgentHostProtocol] Request ${msg.id} failed:`, msg.error);
+					const line = `[RemoteAgentHostProtocol] Request ${msg.id} failed: ${describeJsonRpcError(msg.error)}`;
+					if (this._isExpectedAbsence(pending, msg.error)) {
+						this._logService.trace(line);
+					} else {
+						this._logService.warn(line);
 					}
 					pending.deferred.error(this._toProtocolError(msg.error));
 				} else {
@@ -1818,18 +1901,22 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
 	private _createRequest<TResult>(method: string, params: unknown): { request: JsonRpcRequest; result: Promise<TResult> } {
 		const id = this._nextRequestId++;
 		const deferred = new DeferredPromise<unknown>();
-		this._pendingRequests.set(id, { deferred, suppressNotFoundWarning: isFileResourceRead(method, params), sentAt: Date.now() });
+		this._pendingRequests.set(id, { deferred, suppressNotFoundWarning: isFileResourceProbe(method, params), sentAt: Date.now() });
 		return {
 			request: { jsonrpc: '2.0', id, method, params },
 			result: deferred.p as Promise<TResult>,
 		};
 	}
 
-	private _shouldLogFailedRequest(request: IPendingRequest, error: JsonRpcErrorResponse['error']): boolean {
-		if (error.code === AhpErrorCodes.NotFound && request.suppressNotFoundWarning) {
-			return false;
-		}
-		return true;
+	/**
+	 * Whether a failed request is an answer rather than a fault: a probe for an
+	 * optional file that is simply not there. Those are not warnings — eight of
+	 * them ride along with opening a single session — but they are still
+	 * written down at trace, because a line no logger keeps is a line nobody
+	 * can find when the next question needs it.
+	 */
+	private _isExpectedAbsence(request: IPendingRequest, error: JsonRpcErrorResponse['error']): boolean {
+		return error.code === AhpErrorCodes.NotFound && request.suppressNotFoundWarning;
 	}
 
 	private _toProtocolError(error: JsonRpcErrorResponse['error']): ProtocolError {

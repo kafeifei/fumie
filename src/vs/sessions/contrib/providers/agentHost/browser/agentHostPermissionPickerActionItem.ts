@@ -22,8 +22,7 @@ import { AgentHostPermissionPickerDelegate } from './agentHostPermissionPickerDe
 
 /**
  * Agent host wrapper around the workbench {@link PermissionPickerActionItem}
- * for use in the running chat widget's secondary toolbar
- * (`MenuId.ChatInputSecondary`). Owns its
+ * for the desktop new-session and running-session composer toolbars. Owns its
  * {@link AgentHostPermissionPickerDelegate} and reactively hides itself when
  * the active session's `autoApprove` schema doesn't match the well-known
  * shape.

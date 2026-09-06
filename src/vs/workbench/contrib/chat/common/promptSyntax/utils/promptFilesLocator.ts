@@ -692,6 +692,9 @@ export class PromptFilesLocator {
 		} catch (e) {
 			if (e instanceof FileOperationError && e.fileOperationResult === FileOperationResult.FILE_NOT_FOUND) {
 				// ignore
+			} else if (isCancellationError(e)) {
+				// ignore: cancelling the token is how a superseded scan is called off,
+				// and the check above already treats it as an ordinary early return
 			} else {
 				this.logService.error(`Failed to resolve files at location: ${location.toString()}`, e);
 			}

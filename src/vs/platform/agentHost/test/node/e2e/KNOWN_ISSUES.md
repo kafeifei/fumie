@@ -621,19 +621,6 @@ With Claude, that detailed history omits the arguments of a previous `list_sessi
 - Gate: `supportsFullSessionContext` in `serverToolsSuite.ts`.
 - Reproduce: record the exact test with the Claude provider.
 
-### Claude reports that another session was deleted but leaves it available
-
-The `delete_session` tool lets an agent delete a different Agent Host session. Claude reports that this operation succeeded, but the supposedly deleted session remains in the session list.
-
-For users, this means a request to clean up an obsolete session may appear successful even though nothing was removed. The stale session can remain visible and available for later operations, contradicting the agent's confirmation.
-
-- Test: `server tool: delete_session removes a non-current session`.
-- Scope: Claude.
-- Expected: after the tool reports success, the target no longer appears in `listSessions`.
-- Observed: the target is still listed after the tool completes and remains listed after repeated checks.
-- Gate: `supportsCrossSessionDelete` in `serverToolsSuite.ts`.
-- Reproduce: record the exact test with the Claude provider.
-
 ### Claude can send a message to the chat that is already running the tool
 
 The `send_message` tool is intended for contacting another session or chat. The host rejects attempts to target the same chat that is currently invoking the tool, because doing so can recursively start more work in an already active conversation.
@@ -647,28 +634,27 @@ Claude bypasses that protection and starts another turn in the current chat. A u
 - Gate: `supportsSelfSendRejection` in `serverToolsSuite.ts`.
 - Reproduce: record the exact test with the Claude provider.
 
-For all three Claude tests:
+For both Claude tests:
 
 ```bash
 AGENT_HOST_REPLAY_RECORD=1 ./scripts/test-integration.sh --run \
   src/vs/platform/agentHost/test/node/e2e/providers/claudeAgentHostE2E.integrationTest.ts \
-  --grep "server tool: (get_session_context full|delete_session removes|send_message refuses)"
+  --grep "server tool: (get_session_context full|send_message refuses)"
 ```
 
 ### Codex cannot complete several workflows that refer to another session
 
-Agent Host gives sessions stable links so an agent can look up a particular session, send work to another session, or delete another session. In the affected Codex workflows, the provider fails a model request with `Authorization header is badly formatted` before the requested session tool can run.
+Agent Host gives sessions stable links so an agent can look up a particular session or send work to another session. In the affected Codex workflows, the provider fails a model request with `Authorization header is badly formatted` before the requested session tool can run.
 
-Users may be unable to use session links or ask a Codex agent to coordinate with or remove another session. The failure currently appears as an authentication error rather than a useful explanation of which cross-session operation could not be completed. It is not yet known whether the malformed authorization originates in Codex's handling of additional sessions or in the Agent Host integration.
+Users may be unable to use session links or ask a Codex agent to coordinate with another session. The failure currently appears as an authentication error rather than a useful explanation of which cross-session operation could not be completed. It is not yet known whether the malformed authorization originates in Codex's handling of additional sessions or in the Agent Host integration.
 
 - Tests:
   - `server tool: list_sessions direct lookup accepts an open-session link`
   - `server tool: send_message starts a turn in another session`
-  - `server tool: delete_session removes a non-current session`
 - Scope: Codex.
 - Expected: Codex completes the model turn and invokes the requested session tool with the referenced session.
-- Observed: direct lookup fails its first model request; send and delete fail while preparing the additional target session. Each failure reports `Authorization header is badly formatted`.
-- Gates: `supportsDirectSessionLookup`, `supportsCrossSessionSend`, and `supportsCrossSessionDelete` in `serverToolsSuite.ts`.
+- Observed: direct lookup fails its first model request; send fails while preparing the additional target session. Each failure reports `Authorization header is badly formatted`.
+- Gates: `supportsDirectSessionLookup` and `supportsCrossSessionSend` in `serverToolsSuite.ts`.
 - Reproduce: record the affected tests with the Codex provider.
 
 ### Codex can send a message to the chat that is already running the tool
@@ -689,7 +675,7 @@ For the affected Codex tests:
 ```bash
 AGENT_HOST_REPLAY_RECORD=1 ./scripts/test-integration.sh --run \
   src/vs/platform/agentHost/test/node/e2e/providers/codexAgentHostE2E.integrationTest.ts \
-  --grep "server tool: (list_sessions direct lookup|send_message|delete_session removes)"
+  --grep "server tool: (list_sessions direct lookup|send_message)"
 ```
 
 ### Claude provider-context fork

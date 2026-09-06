@@ -3,92 +3,35 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { BaseActionViewItem, IActionViewItemOptions } from '../../../../../base/browser/ui/actionbar/actionViewItems.js';
-import { Disposable, DisposableStore, IDisposable, MutableDisposable } from '../../../../../base/common/lifecycle.js';
+import { Disposable, MutableDisposable } from '../../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../../base/common/observable.js';
-import * as nls from '../../../../../nls.js';
-import { IActionViewItemService } from '../../../../../platform/actions/browser/actionViewItemService.js';
-import { Action2, MenuId, registerAction2 } from '../../../../../platform/actions/common/actions.js';
 import { agentHostAgentPickerStorageKey, resolveAgentHostAgent } from '../../../../../platform/agentHost/common/customAgents.js';
-import { ContextKeyExpr } from '../../../../../platform/contextkey/common/contextkey.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
 import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../../../workbench/common/contributions.js';
 import { IChatWidgetService } from '../../../../../workbench/contrib/chat/browser/chat.js';
-import { ChatContextKeyExprs, ChatContextKeys } from '../../../../../workbench/contrib/chat/common/actions/chatContextKeys.js';
-import { ChatMode, IChatMode } from '../../../../../workbench/contrib/chat/common/chatModes.js';
+import { ChatMode } from '../../../../../workbench/contrib/chat/common/chatModes.js';
 import { IChatService } from '../../../../../workbench/contrib/chat/common/chatService/chatService.js';
 import { logChangesToStateModel } from '../../../../../workbench/contrib/chat/common/model/chatModel.js';
 import { ChatModeKind } from '../../../../../workbench/contrib/chat/common/constants.js';
-import { Menus } from '../../../../browser/menus.js';
-import { IAgentHostSessionsProvider, isAgentHostProvider, LOCAL_AGENT_HOST_PROVIDER_ID, REMOTE_AGENT_HOST_PROVIDER_RE } from '../../../../common/agentHostSessionsProvider.js';
-import { SessionProviderIdContext, IsPhoneLayoutContext } from '../../../../common/contextkeys.js';
-import { IsSessionsWindowContext } from '../../../../../workbench/common/contextkeys.js';
+import { IAgentHostSessionsProvider, isAgentHostProvider } from '../../../../common/agentHostSessionsProvider.js';
 import { ISessionsProvidersService } from '../../../../services/sessions/browser/sessionsProvidersService.js';
 import { ISession, ISessionAgentRef, SessionStatus } from '../../../../services/sessions/common/session.js';
 import { ISessionsService } from '../../../../services/sessions/browser/sessionsService.js';
-import { ModePicker, ModePickerModel } from '../../copilotChatSessions/browser/modePicker.js';
-import { ISessionContext } from '../../../../services/sessions/browser/sessionContext.js';
-import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
-import { IAction } from '../../../../../base/common/actions.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 
-const IsActiveSessionAgentHost = ContextKeyExpr.or(
-	ContextKeyExpr.equals(SessionProviderIdContext.key, LOCAL_AGENT_HOST_PROVIDER_ID),
-	ContextKeyExpr.regex(SessionProviderIdContext.key, REMOTE_AGENT_HOST_PROVIDER_RE),
-);
+/** Former composer action id. Kept so tests can assert it is not on the Agents menus. */
+export const AGENT_HOST_AGENT_PICKER_ACTION_ID = 'sessions.agentHost.agentPicker';
 
-// -- Agent Host Agent Picker Action --
-
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: 'sessions.agentHost.agentPicker',
-			title: nls.localize2('agentHostAgentPicker', "Agent"),
-			f1: false,
-			menu: [{
-				id: Menus.NewSessionConfig,
-				group: 'navigation',
-				order: -1,
-				when: ContextKeyExpr.and(IsActiveSessionAgentHost, IsPhoneLayoutContext.negate()),
-			}, {
-				// Running-session input bar — only inside the dedicated
-				// Agents Window. The regular VS Code chat editor uses the
-				// built-in mode picker for Agent Host custom agents.
-				id: MenuId.ChatInput,
-				group: 'navigation',
-				order: 1,
-				// Hide the agent picker while a delegation (continue in) target is pending.
-				when: ContextKeyExpr.and(ChatContextKeyExprs.isAgentHostSession, IsSessionsWindowContext, IsPhoneLayoutContext.negate(), ChatContextKeys.hasPendingDelegationTarget.negate()),
-			}],
-		});
-	}
-	override async run(): Promise<void> { /* handled by action view item */ }
-});
-
-class AgentHostModePickerActionViewItem extends BaseActionViewItem {
-	constructor(private readonly picker: ModePicker, disposable: IDisposable) {
-		super(undefined, { id: '', label: '', enabled: true, class: undefined, tooltip: '', run: () => { } });
-		this._register(disposable);
-	}
-
-	override render(container: HTMLElement): void {
-		container.classList.add('chat-input-picker-item', 'chat-agent-picker-item');
-		this.picker.render(container);
-	}
-
-	override dispose(): void {
-		this.picker.dispose();
-		super.dispose();
-	}
-}
-
+/**
+ * Restores a stored custom agent onto untitled agent-host sessions and keeps
+ * chat input-model mode in sync. The Agents composer no longer shows an
+ * "Agent" chip for this — custom agents live in AI Customizations.
+ */
 class AgentHostAgentPickerContribution extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'sessions.contrib.agentHostAgentPicker';
 
 	constructor(
-		@IActionViewItemService actionViewItemService: IActionViewItemService,
-		@IInstantiationService instantiationService: IInstantiationService,
 		@ISessionsService sessionsService: ISessionsService,
 		@ISessionsProvidersService sessionsProvidersService: ISessionsProvidersService,
 		@IChatService private readonly chatService: IChatService,
@@ -97,7 +40,6 @@ class AgentHostAgentPickerContribution extends Disposable implements IWorkbenchC
 		@ILogService private readonly logService: ILogService,
 	) {
 		super();
-		const modePickerModel = this._register(instantiationService.createInstance(ModePickerModel));
 		let settingAgentInternally = false;
 
 		const initAgentFromActiveSession = () => {
@@ -112,11 +54,7 @@ class AgentHostAgentPickerContribution extends Disposable implements IWorkbenchC
 
 		this._register(autorun(reader => {
 			const session = sessionsService.activeSession.read(reader);
-			const provider = this._getProvider(session, sessionsProvidersService);
 			const selectedAgentUri = session?.mode.read(reader)?.id;
-
-			modePickerModel.setSession(provider ? session : undefined, selectedAgentUri);
-
 			const isUntitled = session?.status.read(reader) === SessionStatus.Untitled;
 			this._syncChatInputMode(session, selectedAgentUri, sessionsProvidersService);
 			this._initAgent(session, selectedAgentUri, isUntitled, sessionsProvidersService, () => settingAgentInternally = true, () => settingAgentInternally = false);
@@ -138,20 +76,6 @@ class AgentHostAgentPickerContribution extends Disposable implements IWorkbenchC
 				}
 			});
 		}));
-
-		const factory = (_action: IAction, _options: IActionViewItemOptions, scopedInstantiationService: IInstantiationService) => {
-			const { session } = scopedInstantiationService.invokeFunction(accessor => accessor.get(ISessionContext));
-			const picker = scopedInstantiationService.createInstance(ModePicker, modePickerModel, session);
-			const disposableStore = new DisposableStore();
-
-			disposableStore.add(picker.onDidSelect(mode => {
-				this._selectMode(mode, session.get(), sessionsProvidersService);
-			}));
-			return scopedInstantiationService.createInstance(AgentHostModePickerActionViewItem, picker, disposableStore);
-		};
-
-		this._register(actionViewItemService.register(Menus.NewSessionConfig, 'sessions.agentHost.agentPicker', factory));
-		this._register(actionViewItemService.register(MenuId.ChatInput, 'sessions.agentHost.agentPicker', factory));
 	}
 
 	private _getProvider(session: ISession | undefined, sessionsProvidersService: ISessionsProvidersService): IAgentHostSessionsProvider | undefined {
@@ -242,22 +166,6 @@ class AgentHostAgentPickerContribution extends Disposable implements IWorkbenchC
 			} finally {
 				endInternalSet();
 			}
-		}
-	}
-
-	private _selectMode(mode: IChatMode, session: ISession | undefined, sessionsProvidersService: ISessionsProvidersService): void {
-		if (!session) {
-			return;
-		}
-		const provider = sessionsProvidersService.getProvider(session.providerId);
-		if (!provider || !isAgentHostProvider(provider)) {
-			return;
-		}
-		if (mode.id === ChatMode.Agent.id) {
-			this._setAgent(session, provider, undefined);
-		} else {
-			const rawAgentUri = mode.id;
-			this._setAgent(session, provider, { uri: rawAgentUri, name: mode.name.get() });
 		}
 	}
 

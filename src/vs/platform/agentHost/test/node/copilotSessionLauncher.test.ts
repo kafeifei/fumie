@@ -21,6 +21,7 @@ import type { IAgentHostManagedSettingsPermissions } from '../../common/agentHos
 import { toClientPluginMcpDefaultCwdsMeta } from '../../common/meta/clientPluginCustomizationMeta.js';
 import { CopilotCliConfigKey, copilotCliConfigSchema } from '../../common/copilotCliConfig.js';
 import type { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
+import { IProductService } from '../../../product/common/productService.js';
 import { reasoningEffortLevels } from '../../common/reasoningEffort.js';
 import { SEMANTIC_SEARCH_TOOL_NAME } from '../../common/semanticSearchConstants.js';
 import { CustomizationType, McpServerStatus, type ClientPluginCustomization, type ModelSelection } from '../../common/state/protocol/state.js';
@@ -82,6 +83,7 @@ function createTestLauncher(managedSettingsPermissions?: IAgentHostManagedSettin
 			releaseSessionTraceContext: () => { },
 			withTraceContext: <T>(_context: undefined, fn: () => T): T => fn(),
 		} as unknown as IAgentHostOTelService,
+		{ _serviceBrand: undefined } as IProductService,
 	);
 }
 
@@ -186,6 +188,30 @@ suite('resolveByokSessionConfig', () => {
 				{ id: 'claude', provider: 'acme', name: 'Acme Claude', maxContextWindowTokens: 200000 },
 				{ id: 'gpt', provider: 'acme' },
 				{ id: 'llama', provider: 'globex', name: 'Globex Llama' },
+			],
+		});
+	});
+
+	test('leaves out the models the serving window has hidden, and the providers only they reached', async () => {
+		// The bridge reports a hidden row so a client can render it greyed; nothing may
+		// offer it. A provider whose every model is hidden is not worth a route either.
+		const registry = new ByokLmBridgeRegistry();
+		const registration = registry.register('client-1', connectionOf([
+			{ vendor: 'acme', id: 'claude', name: 'Acme Claude', maxContextWindowTokens: 200000 },
+			{ vendor: 'acme', id: 'gpt', name: 'Acme GPT', hidden: true },
+			{ vendor: 'globex', id: 'llama', name: 'Globex Llama', hidden: true },
+		]));
+		const proxy = countingProxy();
+
+		const config = await resolveByokSessionConfig(sessionId, registry, proxy.startProxy, log);
+		registration.dispose();
+
+		assert.deepStrictEqual(config, {
+			providers: [
+				{ name: 'acme', type: 'openai', wireApi: 'responses', baseUrl: 'http://127.0.0.1:1/v/acme', bearerToken: 'NONCE.sess-1' },
+			],
+			models: [
+				{ id: 'claude', provider: 'acme', name: 'Acme Claude', maxContextWindowTokens: 200000 },
 			],
 		});
 	});
@@ -309,6 +335,7 @@ suite('CopilotSessionLauncher BYOK proxy lifecycle', () => {
 	function createLauncher(store: DisposableStore, proxy: IByokLmProxyService, registry: IByokLmBridgeRegistry, byokModelsEnabled = true): CopilotSessionLauncher {
 		const services = new ServiceCollection();
 		services.set(ILogService, new NullLogService());
+		services.set(IProductService, { _serviceBrand: undefined } as IProductService);
 		services.set(IByokLmProxyService, proxy);
 		services.set(IByokLmBridgeRegistry, registry);
 		services.set(IAgentConfigurationService, {
@@ -1072,6 +1099,7 @@ suite('CopilotSessionLauncher resume config', () => {
 	function createLauncher(store: DisposableStore, values: SchemaValues<typeof copilotCliConfigSchema.definition>): CopilotSessionLauncher {
 		const services = new ServiceCollection();
 		services.set(ILogService, new NullLogService());
+		services.set(IProductService, { _serviceBrand: undefined } as IProductService);
 		services.set(IByokLmBridgeRegistry, new ByokLmBridgeRegistry());
 		services.set(IAgentHostManagedSettingsService, store.add(new AgentHostManagedSettingsService()));
 		services.set(IAgentConfigurationService, {

@@ -182,6 +182,29 @@ suite('resolveResponseSelection', () => {
 		assert.strictEqual(resolveResponseSelection(widget), undefined);
 	});
 
+	test('resolves a selection inside a selectable markdown code block', () => {
+		const { store, doc, widgetDomNode } = setup();
+		const markdown = doc.createElement('div');
+		markdown.classList.add('chat-markdown-part');
+		const pre = doc.createElement('pre');
+		pre.classList.add('fumie-chat-code');
+		const textNode = doc.createTextNode('const x = 1;');
+		pre.appendChild(textNode);
+		markdown.appendChild(pre);
+		widgetDomNode.appendChild(markdown);
+
+		const response = makeResponse('turn-1');
+		stubSelection(store, textNode, textNode, 'const x = 1;');
+		const widget = upcastPartial<IChatWidget>({
+			domNode: widgetDomNode,
+			getElementFromNode: () => response,
+		});
+
+		const resolved = resolveResponseSelection(widget);
+		assert.ok(resolved);
+		assert.strictEqual(resolved!.text, 'const x = 1;');
+	});
+
 	test('rejects a selection inside tool-invocation UI', () => {
 		const { store, doc, widgetDomNode } = setup();
 		const markdown = doc.createElement('div');

@@ -104,11 +104,21 @@ suite('ByokLmProxyService', () => {
 		await withProxy(
 			async () => ({ output: [] }),
 			async (handle) => {
-				const response = await fetch(`${handle.baseUrl}/v/acme/chat/completions`, {
+				const response = await fetch(`${handle.baseUrl}/v/acme/embeddings`, {
 					method: 'POST',
 					headers: authHeaders(handle),
 					body: '{}',
 				});
+				assert.strictEqual(response.status, 404);
+			},
+		);
+	});
+
+	test('returns 404 when a known route is called with the wrong method', async () => {
+		await withProxy(
+			async () => ({ output: [] }),
+			async (handle) => {
+				const response = await fetch(`${handle.baseUrl}/v/acme/v1/messages`, { headers: authHeaders(handle) });
 				assert.strictEqual(response.status, 404);
 			},
 		);

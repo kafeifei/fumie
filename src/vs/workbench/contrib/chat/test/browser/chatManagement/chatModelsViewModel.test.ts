@@ -4,22 +4,24 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { IAction } from '../../../../../../base/common/actions.js';
+import { IAction, toAction } from '../../../../../../base/common/actions.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
 import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { IDisposable } from '../../../../../../base/common/lifecycle.js';
 import { observableValue } from '../../../../../../base/common/observable.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
 import { IModelsControlManifest, ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatSelector, ILanguageModelsGroup, ILanguageModelsService, IUserFriendlyLanguageModel, ILanguageModelProviderDescriptor } from '../../../common/languageModels.js';
-import { ChatModelsViewModel, getManageModelsProviderLabel, ILanguageModelEntry, ILanguageModelProviderEntry, isLanguageModelProviderEntry, isLanguageModelGroupEntry } from '../../../browser/chatManagement/chatModelsViewModel.js';
+import { canManageProviderGroup, ChatModelsViewModel, getManageModelsProviderLabel, ILanguageModelEntry, ILanguageModelProviderEntry, isLanguageModelProviderEntry, isLanguageModelGroupEntry } from '../../../browser/chatManagement/chatModelsViewModel.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 import { IStringDictionary } from '../../../../../../base/common/collections.js';
 import { ILanguageModelsProviderGroup } from '../../../common/languageModelsConfiguration.js';
 import { ChatAgentLocation } from '../../../common/constants.js';
 import { languageModelSourcePresentationRegistry } from '../../../common/languageModelSourcePresentation.js';
+import Severity from '../../../../../../base/common/severity.js';
 
 class MockLanguageModelsService implements ILanguageModelsService {
 	_serviceBrand: undefined;
+	readonly whenReady = Promise.resolve();
 
 	private vendors: IUserFriendlyLanguageModel[] = [];
 	private models = new Map<string, ILanguageModelChatMetadata>();
@@ -48,21 +50,29 @@ class MockLanguageModelsService implements ILanguageModelsService {
 		models.push(identifier);
 		this.modelsByVendor.set(vendorId, models);
 
-		// Add to model groups - create a single default group per vendor
+		// A named group models a configured entry (it carries `group`, as the real
+		// service returns for a user-added provider group); no name models the
+		// group-less resolution an unconfigured agent vendor gets back, which has no
+		// `group`. The distinction matters: a group-less row is where Manage Models
+		// may derive a display group from a model's `modelGroup`.
 		const groups = this.modelGroups.get(vendorId) || [];
-		let group = groupName ? groups.find(candidate => candidate.group?.name === groupName) : groups[0];
+		let group = groupName ? groups.find(candidate => candidate.group?.name === groupName) : groups.find(candidate => !candidate.group);
 		if (!group) {
 			group = {
-				group: {
-					vendor: vendorId,
-					name: groupName ?? (this.vendors.find(v => v.vendor === vendorId)?.displayName || 'Default')
-				},
+				...(groupName ? { group: { vendor: vendorId, name: groupName } } : {}),
 				modelIdentifiers: []
 			};
 			groups.push(group);
 		}
 		group.modelIdentifiers.push(identifier);
 		this.modelGroups.set(vendorId, groups);
+	}
+
+	setStatus(vendorId: string, message: string, severity: Severity, action?: IAction): void {
+		this.modelGroups.set(vendorId, [{
+			modelIdentifiers: [],
+			status: { message, severity, action },
+		}]);
 	}
 
 	registerLanguageModelProvider(vendor: string, provider: ILanguageModelChatProvider): IDisposable {
@@ -159,6 +169,10 @@ class MockLanguageModelsService implements ILanguageModelsService {
 		return this.modelGroups.get(vendor) || [];
 	}
 
+	async resolveLanguageModelProviderGroup(): Promise<undefined> {
+		return undefined;
+	}
+
 	hasResolvedVendor(vendor: string): boolean {
 		return this.modelGroups.has(vendor);
 	}
@@ -196,6 +210,15 @@ class MockLanguageModelsService implements ILanguageModelsService {
 	onDidChangeModelVisibility = Event.None;
 	getModelsControlManifest(): IModelsControlManifest { return { free: {}, paid: {} }; }
 	restrictedChatParticipants = observableValue('restrictedChatParticipants', Object.create(null));
+}
+
+function expandProviderGroups(viewModel: ChatModelsViewModel): void {
+	// Exercise the same public action as the provider row's Expand button.
+	for (const entry of viewModel.viewModelEntries.filter(isLanguageModelProviderEntry)) {
+		if (entry.collapsed) {
+			viewModel.toggleCollapsed(entry);
+		}
+	}
 }
 
 suite('ChatModelsViewModel', () => {
@@ -315,7 +338,20 @@ suite('ChatModelsViewModel', () => {
 		await viewModel.refresh();
 	});
 
+	test('provider groups start collapsed and keep their headers visible', () => {
+		const entries = viewModel.filter('');
+		assert.deepStrictEqual(entries.filter(isLanguageModelProviderEntry).map(entry => ({
+			label: entry.label,
+			collapsed: entry.collapsed,
+		})), [
+			{ label: 'GitHub Copilot', collapsed: true },
+			{ label: 'OpenAI', collapsed: true },
+		]);
+		assert.ok(entries.every(isLanguageModelProviderEntry), 'Collapsed groups must not show model rows');
+	});
+
 	test('should fetch all models without filters', () => {
+		expandProviderGroups(viewModel);
 		const results = viewModel.filter('');
 
 		// Should have 2 vendor entries and 4 model entries (grouped by vendor)
@@ -326,6 +362,158 @@ suite('ChatModelsViewModel', () => {
 
 		const models = results.filter(r => !isLanguageModelProviderEntry(r) && !isLanguageModelGroupEntry(r)) as ILanguageModelEntry[];
 		assert.strictEqual(models.length, 4);
+	});
+
+	test('shows a provider whose only entry is a status', async () => {
+		const action = toAction({ id: 'connect-empty-provider', label: 'Connect', run: () => undefined });
+		languageModelsService.addVendor({
+			vendor: 'empty-provider',
+			displayName: 'Empty Provider',
+			managementCommand: undefined,
+			when: undefined,
+			configuration: undefined,
+		});
+		languageModelsService.setStatus('empty-provider', 'No models available', Severity.Warning, action);
+
+		await viewModel.refresh();
+		expandProviderGroups(viewModel);
+		const entries = viewModel.filter('');
+
+		assert.deepStrictEqual({
+			providerLabels: entries.filter(isLanguageModelProviderEntry).map(entry => entry.label),
+			statuses: entries.filter(entry => entry.type === 'status').map(entry => entry.message),
+		}, {
+			providerLabels: ['GitHub Copilot', 'Empty Provider', 'OpenAI'],
+			statuses: ['No models available'],
+		});
+		assert.strictEqual(entries.find(entry => entry.type === 'status')?.action, action);
+	});
+
+	test('a subscription vendor keeps its models under its configured group, while a group-less agent vendor still derives one', async () => {
+		const service = new MockLanguageModelsService();
+		// A subscription provider the user added: a configurable vendor with one
+		// real group. Its model carries the ChatGPT transport group, which must not
+		// become a row of its own — the model belongs under the added entry.
+		service.addVendor({ vendor: 'codex-subscription', displayName: 'Codex Subscription', managementCommand: undefined, when: undefined, configuration: { type: 'object', properties: {} } });
+		service.addModel('codex-subscription', 'codex-subscription:@provider=openai:gpt-5.6-sol', {
+			extension: new ExtensionIdentifier('vscode.codex'),
+			id: '@provider=openai:gpt-5.6-sol', name: 'GPT-5.6 Sol', family: 'gpt-5.6-sol', version: '1.0', vendor: 'codex-subscription',
+			maxInputTokens: 1, maxOutputTokens: 1, isDefaultForLocation: {},
+			targetChatSessionType: 'agent-host-codex',
+			modelGroup: { id: 'chatgpt', sourceId: 'chatgptSubscription' },
+		}, 'Codex Subscription');
+		// An agent vendor with no configuration and group-less models of the same
+		// shape. Here the derived "ChatGPT" group is the only sensible row — there
+		// is no configured group to fall into — so the derivation must still happen.
+		service.addVendor({ vendor: 'codex', displayName: 'Codex', managementCommand: undefined, when: undefined, configuration: undefined });
+		service.addModel('codex', 'codex:@provider=openai:gpt-5.6-sol', {
+			extension: new ExtensionIdentifier('vscode.codex'),
+			id: '@provider=openai:gpt-5.6-sol', name: 'GPT-5.6 Sol', family: 'gpt-5.6-sol', version: '1.0', vendor: 'codex',
+			maxInputTokens: 1, maxOutputTokens: 1, isDefaultForLocation: {},
+			targetChatSessionType: 'agent-host-codex',
+			modelGroup: { id: 'chatgpt', sourceId: 'chatgptSubscription' },
+		});
+
+		const model = store.add(new ChatModelsViewModel(service));
+		await model.refresh();
+		const rows = model.viewModelEntries.filter(isLanguageModelProviderEntry);
+		const row = (label: string, vendorId: string) => rows.find(r => r.label === label && r.vendorEntry.vendor.vendor === vendorId);
+
+		const subscriptionRow = row('Codex Subscription', 'codex-subscription')!;
+		const derivedRow = row('ChatGPT', 'codex')!;
+
+		assert.deepStrictEqual({
+			// The subscription's model is under its own configured, manageable row —
+			// not stranded in a phantom "ChatGPT" row belonging to that vendor.
+			subscriptionModels: model.getModelsForGroup(subscriptionRow).map(m => m.identifier),
+			subscriptionManageable: canManageProviderGroup(subscriptionRow.vendorEntry),
+			noPhantomRowFromSubscription: !rows.some(r => r.label === 'ChatGPT' && r.vendorEntry.vendor.vendor === 'codex-subscription'),
+			// The group-less agent vendor still derives its ChatGPT row, and that
+			// derived row is inert (no configured group to rename or delete).
+			derivedModels: model.getModelsForGroup(derivedRow).map(m => m.identifier),
+			derivedIsConfigured: !!derivedRow.vendorEntry.isConfiguredGroup,
+			derivedManageable: canManageProviderGroup(derivedRow.vendorEntry),
+		}, {
+			subscriptionModels: ['codex-subscription:@provider=openai:gpt-5.6-sol'],
+			subscriptionManageable: true,
+			noPhantomRowFromSubscription: true,
+			derivedModels: ['codex:@provider=openai:gpt-5.6-sol'],
+			derivedIsConfigured: false,
+			derivedManageable: false,
+		});
+	});
+
+	test('a configured vendor with no group of its own gets no group commands either', () => {
+		// The vendor's own display name stands in for a group that was never
+		// configured, so Delete would address an entry the file does not have.
+		const vendor = { vendor: 'openai', displayName: 'OpenAI', isDefault: false, managementCommand: undefined, when: undefined, configuration: { type: 'object', properties: { apiKey: {} } } } as ILanguageModelProviderDescriptor;
+		assert.deepStrictEqual({
+			synthesized: canManageProviderGroup({ vendor, group: { vendor: 'openai', name: 'OpenAI' } }),
+			real: canManageProviderGroup({ vendor, group: { vendor: 'openai', name: 'My OpenAI' }, isConfiguredGroup: true }),
+		}, {
+			synthesized: false,
+			real: true,
+		});
+	});
+
+	test('a vendor hidden from management takes its models, its status and its derived groups with it', async () => {
+		const service = new MockLanguageModelsService();
+		// The agent host's own vendor: routes models, is not the user's to manage.
+		service.addVendor({ vendor: 'agent-host-codex', displayName: 'Codex', managementCommand: undefined, when: undefined, configuration: undefined, hiddenFromManagement: true });
+		service.addVendor({ vendor: 'custom', displayName: 'Custom', managementCommand: undefined, when: undefined, configuration: undefined });
+		// Carries a source id, so without the hiding it would also manufacture a
+		// "ChatGPT" group row of its own.
+		service.addModel('agent-host-codex', 'agent-host-codex:gpt-5.6', {
+			extension: new ExtensionIdentifier('vscode.codex'),
+			id: 'gpt-5.6',
+			name: 'GPT-5.6',
+			family: 'gpt-5.6',
+			version: '1.0',
+			vendor: 'agent-host-codex',
+			maxInputTokens: 8192,
+			maxOutputTokens: 4096,
+			isDefaultForLocation: {},
+			targetChatSessionType: 'agent-host-codex',
+			modelGroup: { id: 'chatgpt', sourceId: 'chatgptSubscription' },
+		});
+		service.addModel('custom', 'custom:my-model', {
+			extension: new ExtensionIdentifier('example.custom'),
+			id: 'my-model',
+			name: 'My Model',
+			family: 'my-model',
+			version: '1.0',
+			vendor: 'custom',
+			maxInputTokens: 8192,
+			maxOutputTokens: 4096,
+			isDefaultForLocation: {},
+		});
+
+		const model = store.add(new ChatModelsViewModel(service));
+		await model.refresh();
+		const entries = model.filter('');
+
+		assert.deepStrictEqual({
+			vendors: model.getVendors().map(vendor => vendor.vendor),
+			// Nothing the hidden vendor contributed survives: not its own row, not
+			// its models, and not the "ChatGPT" group its models would have derived.
+			hiddenVendorRows: entries.filter(isLanguageModelProviderEntry).map(entry => entry.label).filter(label => label === 'Codex' || label === 'ChatGPT'),
+			hiddenVendorModels: entries.filter(entry => entry.type === 'model').map(entry => (entry as ILanguageModelEntry).model.identifier).filter(identifier => identifier.startsWith('agent-host-codex:')),
+		}, {
+			vendors: ['custom'],
+			hiddenVendorRows: [],
+			hiddenVendorModels: [],
+		});
+	});
+
+	test('a hidden vendor keeps its status out of the list too', async () => {
+		const service = new MockLanguageModelsService();
+		service.addVendor({ vendor: 'agent-host-claude', displayName: 'Claude', managementCommand: undefined, when: undefined, configuration: undefined, hiddenFromManagement: true });
+		service.setStatus('agent-host-claude', 'Sign in to Claude to load native models', Severity.Warning);
+
+		const model = store.add(new ChatModelsViewModel(service));
+		await model.refresh();
+
+		assert.deepStrictEqual(model.filter('').map(entry => entry.type), []);
 	});
 
 	test('distinguishes the ChatGPT subscription from a custom group with the same name', async () => {
@@ -343,6 +531,7 @@ suite('ChatModelsViewModel', () => {
 			maxInputTokens: 8192,
 			maxOutputTokens: 4096,
 			isDefaultForLocation: {},
+			targetChatSessionType: 'agent-host-codex',
 			modelGroup: { id: 'chatgpt', sourceId: 'chatgptSubscription' },
 		});
 		service.addModel('custom', 'custom:gpt-5.6', {
@@ -359,6 +548,7 @@ suite('ChatModelsViewModel', () => {
 
 		const model = store.add(new ChatModelsViewModel(service));
 		await model.refresh();
+		expandProviderGroups(model);
 		const entries = model.filter('');
 		const groups = entries.filter(isLanguageModelProviderEntry).map(entry => ({
 			id: entry.id,
@@ -399,6 +589,7 @@ suite('ChatModelsViewModel', () => {
 		const model = store.add(new ChatModelsViewModel(service));
 		await model.refresh();
 
+		expandProviderGroups(model);
 		assert.deepStrictEqual(model.filter('').map(entry => ({
 			type: entry.type,
 			label: isLanguageModelProviderEntry(entry) ? entry.label : undefined,
@@ -619,6 +810,12 @@ suite('ChatModelsViewModel', () => {
 
 	test('should toggle vendor collapsed state', () => {
 		const vendorEntry = viewModel.viewModelEntries.find(r => isLanguageModelProviderEntry(r) && r.vendorEntry.vendor.vendor === 'copilot') as ILanguageModelProviderEntry;
+		assert.strictEqual(vendorEntry.collapsed, true);
+		viewModel.toggleCollapsed(vendorEntry);
+		assert.strictEqual(vendorEntry.collapsed, false);
+		assert.strictEqual(viewModel.filter('').filter(entry => entry.type === 'model' && entry.model.provider.vendor.vendor === 'copilot').length, 2);
+
+		// Collapse the explicitly expanded group, then expand it again.
 		viewModel.toggleCollapsed(vendorEntry);
 
 		const results = viewModel.filter('');
@@ -781,6 +978,7 @@ suite('ChatModelsViewModel', () => {
 
 	test('should show vendor headers when multiple vendors exist', () => {
 		// This is the existing behavior test
+		expandProviderGroups(viewModel);
 		const results = viewModel.filter('');
 
 		// Should have 2 vendor entries and 4 model entries (grouped by vendor)
@@ -932,6 +1130,7 @@ suite('ChatModelsViewModel', () => {
 
 	test('should collapse all groups and models', () => {
 		// Expand everything first
+		expandProviderGroups(viewModel);
 		const results1 = viewModel.filter('');
 		let models = results1.filter(r => !isLanguageModelProviderEntry(r) && !isLanguageModelGroupEntry(r)) as ILanguageModelEntry[];
 		assert.ok(models.length > 0);
@@ -970,6 +1169,7 @@ suite('ChatModelsViewModel', () => {
 	});
 
 	test('should handle empty search returning all results', () => {
+		expandProviderGroups(viewModel);
 		const results = viewModel.filter('');
 		assert.ok(results.length > 0);
 
@@ -993,44 +1193,72 @@ suite('ChatModelsViewModel', () => {
 		assert.strictEqual(models.length, 0);
 	});
 
-	test('should filter out agent-host BYOK model copies but keep native agent-host models', async () => {
-		// An agent host (e.g. Copilot CLI) surfaces the user's own BYOK models as copies
-		// under its own vendor. Those copies carry `byokModelIdentifier` — the id of the
-		// original BYOK model — so they must not appear in Manage Models: they already show
-		// under their real provider group, and listing them again duplicates the whole BYOK
-		// catalogue under the agent host.
+	test('should keep native subscription models under their Agent without duplicating BYOK copies', async () => {
 		const service = new MockLanguageModelsService();
-		service.addVendor({ vendor: 'agent-host-copilotcli', displayName: 'Copilot', managementCommand: undefined, when: undefined, configuration: undefined });
+		service.addVendor({ vendor: 'agent-host-claude', displayName: 'Claude', managementCommand: undefined, when: undefined, configuration: undefined });
 
-		// Native agent-host model — no `byokModelIdentifier`; kept.
-		service.addModel('agent-host-copilotcli', 'agent-host-copilotcli:claude-haiku-4.5', {
+		// Native Claude subscription rows keep their transport grouping in the picker,
+		// but Models presents them under the owning Agent instead of manufacturing
+		// Copilot and Anthropic Provider entries.
+		service.addModel('agent-host-claude', 'agent-host-claude:@provider=copilot:claude-haiku-4.5', {
 			extension: new ExtensionIdentifier('vscode.chat'),
-			id: 'claude-haiku-4.5',
-			name: 'Claude Haiku 4.5',
+			id: '@provider=copilot:claude-haiku-4.5',
+			name: 'Claude Haiku 4.5 (Copilot)',
 			family: 'claude-haiku-4.5',
 			version: '1.0',
-			vendor: 'agent-host-copilotcli',
+			vendor: 'agent-host-claude',
 			maxInputTokens: 128000,
 			maxOutputTokens: 4096,
 			isUserSelectable: true,
-			targetChatSessionType: 'agent-host-copilotcli',
-			modelGroup: { id: 'copilotcli' },
+			targetChatSessionType: 'agent-host-claude',
+			modelGroup: { id: 'copilot' },
+			capabilities: { toolCalling: true, vision: false, agentMode: true },
+			isDefaultForLocation: {},
+		});
+		service.addModel('agent-host-claude', 'agent-host-claude:@provider=anthropic:claude-haiku-4.5', {
+			extension: new ExtensionIdentifier('vscode.chat'),
+			id: '@provider=anthropic:claude-haiku-4.5',
+			name: 'Claude Haiku 4.5',
+			family: 'claude-haiku-4.5',
+			version: '1.0',
+			vendor: 'agent-host-claude',
+			maxInputTokens: 128000,
+			maxOutputTokens: 4096,
+			isUserSelectable: true,
+			targetChatSessionType: 'agent-host-claude',
+			modelGroup: { id: 'anthropic' },
 			capabilities: { toolCalling: true, vision: false, agentMode: true },
 			isDefaultForLocation: {},
 		});
 
+		// The BYOK original, as the Copilot Chat extension registers it here.
+		service.addVendor({ vendor: 'openrouter', displayName: 'OpenRouter', managementCommand: undefined, when: undefined, configuration: undefined });
+		service.addModel('openrouter', 'openrouter/OpenRouter 2/aion-labs/aion-3.0', {
+			extension: new ExtensionIdentifier('github.copilot-chat'),
+			id: 'aion-labs/aion-3.0',
+			name: 'AionLabs: Aion-3.0',
+			family: 'aion-labs/aion-3.0',
+			version: '1.0',
+			vendor: 'openrouter',
+			maxInputTokens: 128000,
+			maxOutputTokens: 4096,
+			isUserSelectable: true,
+			capabilities: { toolCalling: true, vision: false, agentMode: true },
+			isDefaultForLocation: {},
+		}, 'OpenRouter 2');
+
 		// Agent-host BYOK copy — carries the original model identifier; filtered out.
-		service.addModel('agent-host-copilotcli', 'agent-host-copilotcli:openrouter/aion-labs/aion-3.0', {
+		service.addModel('agent-host-claude', 'agent-host-claude:openrouter/aion-labs/aion-3.0', {
 			extension: new ExtensionIdentifier('vscode.chat'),
 			id: 'openrouter/aion-labs/aion-3.0',
 			name: 'AionLabs: Aion-3.0',
 			family: 'openrouter/aion-labs/aion-3.0',
 			version: '1.0',
-			vendor: 'agent-host-copilotcli',
+			vendor: 'agent-host-claude',
 			maxInputTokens: 128000,
 			maxOutputTokens: 4096,
 			isUserSelectable: true,
-			targetChatSessionType: 'agent-host-copilotcli',
+			targetChatSessionType: 'agent-host-claude',
 			modelGroup: { id: 'openrouter' },
 			byokModelIdentifier: 'openrouter/OpenRouter 2/aion-labs/aion-3.0',
 			capabilities: { toolCalling: true, vision: false, agentMode: true },
@@ -1040,8 +1268,117 @@ suite('ChatModelsViewModel', () => {
 		const agentHostViewModel = store.add(new ChatModelsViewModel(service));
 		await agentHostViewModel.refresh();
 
-		const models = agentHostViewModel.filter('').filter(r => !isLanguageModelProviderEntry(r) && !isLanguageModelGroupEntry(r)) as ILanguageModelEntry[];
-		assert.deepStrictEqual(models.map(m => m.model.metadata.id), ['claude-haiku-4.5']);
+		// Provider groups start collapsed once there is more than one of them.
+		for (const id of agentHostViewModel.viewModelEntries.filter(isLanguageModelProviderEntry).map(entry => entry.id)) {
+			const entry = agentHostViewModel.viewModelEntries.find(candidate => candidate.id === id);
+			if (entry) {
+				agentHostViewModel.toggleCollapsed(entry);
+			}
+		}
+
+		const entries = agentHostViewModel.viewModelEntries;
+		const models = entries.filter(entry => !isLanguageModelProviderEntry(entry) && !isLanguageModelGroupEntry(entry)) as ILanguageModelEntry[];
+		assert.deepStrictEqual(models.map(model => ({
+			id: model.model.metadata.id,
+			provider: getManageModelsProviderLabel(model.model),
+		})), [
+			{ id: '@provider=anthropic:claude-haiku-4.5', provider: 'Claude' },
+			{ id: '@provider=copilot:claude-haiku-4.5', provider: 'Claude' },
+			// The copy of this one stayed out: its original is the row above.
+			{ id: 'aion-labs/aion-3.0', provider: 'OpenRouter 2' },
+		]);
+	});
+
+	test('lists an agent-host BYOK copy under its Provider when the original is not registered here', async () => {
+		// The Agents window in a browser: the BYOK providers live in the desktop
+		// renderer, so only the agent hosts' copies of their models arrive. With no
+		// original to defer to the copy is the only row there is, and the Provider
+		// it belongs to survives in the identifier it was copied from.
+		const service = new MockLanguageModelsService();
+		service.addVendor({ vendor: 'remote-mac-claude', displayName: 'Claude [This Mac]', managementCommand: undefined, when: undefined, configuration: undefined });
+		service.addVendor({ vendor: 'remote-mac-pi', displayName: 'Pi [This Mac]', managementCommand: undefined, when: undefined, configuration: undefined });
+
+		const copy = (vendor: string): ILanguageModelChatMetadata => ({
+			extension: new ExtensionIdentifier('vscode.chat'),
+			id: 'customendpoint/Example/claude-fable-5',
+			name: 'claude-fable-5',
+			family: 'customendpoint/Example/claude-fable-5',
+			version: '1.0',
+			vendor,
+			maxInputTokens: 1000000,
+			maxOutputTokens: 128000,
+			isUserSelectable: true,
+			targetChatSessionType: vendor,
+			modelGroup: { id: 'customendpoint' },
+			byokModelIdentifier: 'customendpoint/Example/claude-fable-5',
+			capabilities: { toolCalling: true, vision: true, agentMode: true },
+			isDefaultForLocation: {},
+		});
+		service.addModel('remote-mac-claude', 'remote-mac-claude:customendpoint/Example/claude-fable-5', copy('remote-mac-claude'));
+		service.addModel('remote-mac-pi', 'remote-mac-pi:customendpoint/Example/claude-fable-5', copy('remote-mac-pi'));
+
+		const remoteViewModel = store.add(new ChatModelsViewModel(service));
+		await remoteViewModel.refresh();
+
+		const entries = remoteViewModel.filter('');
+		const models = entries.filter(entry => !isLanguageModelProviderEntry(entry) && !isLanguageModelGroupEntry(entry)) as ILanguageModelEntry[];
+		// One row, not one per agent that offers it, keyed by the original identifier
+		// so a single visibility toggle covers every agent.
+		assert.deepStrictEqual(models.map(model => ({
+			identifier: model.model.identifier,
+			provider: getManageModelsProviderLabel(model.model),
+		})), [
+			{ identifier: 'customendpoint/Example/claude-fable-5', provider: 'Example' },
+		]);
+	});
+
+	test('an agent-host BYOK copy the host has hidden is listed hidden, and this window does not toggle it', async () => {
+		// The host's Manage Models state arrives on the copy. This window has no
+		// visibility state of its own for a Provider it cannot see, so it renders the
+		// host's answer rather than its own default of "visible" — the row is there,
+		// greyed, exactly as it is on the machine that owns the Provider. Toggling it
+		// stores nothing: a second set for the same model could only disagree.
+		const service = new MockLanguageModelsService();
+		service.addVendor({ vendor: 'remote-mac-claude', displayName: 'Claude [This Mac]', managementCommand: undefined, when: undefined, configuration: undefined });
+
+		const copy = (id: string, hiddenByHost: boolean): ILanguageModelChatMetadata => ({
+			extension: new ExtensionIdentifier('vscode.chat'),
+			id: `customendpoint/Example/${id}`,
+			name: id,
+			family: `customendpoint/Example/${id}`,
+			version: '1.0',
+			vendor: 'remote-mac-claude',
+			maxInputTokens: 1000000,
+			maxOutputTokens: 128000,
+			isUserSelectable: true,
+			targetChatSessionType: 'remote-mac-claude',
+			modelGroup: { id: 'customendpoint' },
+			byokModelIdentifier: `customendpoint/Example/${id}`,
+			...(hiddenByHost ? { byokModelHidden: true } : {}),
+			capabilities: { toolCalling: true, vision: true, agentMode: true },
+			isDefaultForLocation: {},
+		});
+		service.addModel('remote-mac-claude', 'remote-mac-claude:customendpoint/Example/claude-fable-5', copy('claude-fable-5', false));
+		service.addModel('remote-mac-claude', 'remote-mac-claude:customendpoint/Example/claude-opus-4-7', copy('claude-opus-4-7', true));
+
+		const remoteViewModel = store.add(new ChatModelsViewModel(service));
+		await remoteViewModel.refresh();
+
+		const entries = remoteViewModel.filter('');
+		const models = entries.filter(entry => !isLanguageModelProviderEntry(entry) && !isLanguageModelGroupEntry(entry)) as ILanguageModelEntry[];
+		const hiddenRow = models.find(model => model.model.identifier === 'customendpoint/Example/claude-opus-4-7')!;
+		remoteViewModel.toggleModelHidden(hiddenRow);
+
+		assert.deepStrictEqual({
+			rows: models.map(model => ({ identifier: model.model.identifier, hidden: model.model.hidden })),
+			writes: service.setModelsHiddenCalls,
+		}, {
+			rows: [
+				{ identifier: 'customendpoint/Example/claude-fable-5', hidden: false },
+				{ identifier: 'customendpoint/Example/claude-opus-4-7', hidden: true },
+			],
+			writes: [{ modelIdentifiers: [], hidden: false }],
+		});
 	});
 
 });

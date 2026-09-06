@@ -113,4 +113,77 @@ suite('MultiDiffEditorWidget', () => {
 			documentItem.dispose();
 		}
 	});
+
+	test('preserves pending view state while documents load incrementally', async () => {
+		const services = new ServiceCollection();
+		services.set(IAccessibilitySignalService, new class extends mock<IAccessibilitySignalService>() { }());
+		services.set(IActionViewItemService, new NullActionViewItemService());
+		services.set(IEditorProgressService, new class extends mock<IEditorProgressService>() { }());
+		services.set(IDiffProviderFactoryService, new TestDiffProviderFactoryService());
+		services.set(IStorageService, disposables.add(new InMemoryStorageService()));
+		services.set(IMenuService, new class extends mock<IMenuService>() {
+			override createMenu(): IMenu {
+				return new class extends mock<IMenu>() {
+					override readonly onDidChange = Event.None;
+					override getActions() { return []; }
+					override dispose(): void { }
+				}();
+			}
+		}());
+		const instantiationService = createCodeEditorServices(disposables, services);
+
+		const firstOriginalUri = URI.parse('inmemory://original/first.js');
+		const firstModifiedUri = URI.parse('inmemory://modified/first.js');
+		const secondOriginalUri = URI.parse('inmemory://original/second.js');
+		const secondModifiedUri = URI.parse('inmemory://modified/second.js');
+		const firstItem = RefCounted.createOfNonDisposable<IDocumentDiffItem>({
+			original: disposables.add(instantiateTextModel(instantiationService, 'first old', undefined, undefined, firstOriginalUri)),
+			modified: disposables.add(instantiateTextModel(instantiationService, 'first new', undefined, undefined, firstModifiedUri)),
+		}, { dispose() { } });
+		const secondItem = RefCounted.createOfNonDisposable<IDocumentDiffItem>({
+			original: disposables.add(instantiateTextModel(instantiationService, 'second old', undefined, undefined, secondOriginalUri)),
+			modified: disposables.add(instantiateTextModel(instantiationService, 'second new', undefined, undefined, secondModifiedUri)),
+		}, { dispose() { } });
+		const documents = new ValueWithChangeEvent<readonly RefCounted<IDocumentDiffItem>[] | 'loading'>('loading');
+		const isComplete = new ValueWithChangeEvent(false);
+		const secondKey = JSON.stringify([secondOriginalUri.toString(), secondModifiedUri.toString()]);
+		const model: IMultiDiffEditorModel = { documents, isComplete };
+		const container = document.createElement('div');
+		const widget = instantiationService.createInstance(
+			MultiDiffEditorWidget,
+			container,
+			{} satisfies IWorkbenchUIElementFactory,
+			undefined,
+		);
+		widget.layout(new Dimension(800, 600));
+		const viewModel = widget.createViewModel(model);
+		widget.setViewModel(viewModel, { preserveFocus: true });
+
+		try {
+			documents.value = [firstItem];
+			await waitForState(viewModel.items, items => items.length === 1);
+			widget.setViewState({
+				scrollState: { top: 400, left: 0 },
+				docStates: { [secondKey]: { collapsed: true } },
+				activeDiffItemKey: secondKey,
+			});
+			const partialState = widget.getViewState();
+			assert.strictEqual(partialState.activeDiffItemKey, secondKey);
+			assert.strictEqual(partialState.docStates?.[secondKey]?.collapsed, true);
+			assert.strictEqual(partialState.scrollState.top, 400);
+
+			documents.value = [firstItem, secondItem];
+			isComplete.value = true;
+			await waitForState(viewModel.isLoading, loading => !loading);
+
+			assert.strictEqual(viewModel.activeDiffItem.get()?.getKey(), secondKey);
+			assert.strictEqual(viewModel.items.get()[1].collapsed.get(), true);
+		} finally {
+			widget.setViewModel(undefined);
+			viewModel.dispose();
+			widget.dispose();
+			firstItem.dispose();
+			secondItem.dispose();
+		}
+	});
 });

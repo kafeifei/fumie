@@ -29,6 +29,7 @@ import { IChatSessionsService } from '../../../../../workbench/contrib/chat/comm
 import { IActiveSession } from '../../../../services/sessions/common/sessionsManagement.js';
 import { ISessionContext } from '../../../../services/sessions/browser/sessionContext.js';
 import { AgentHostInputCompletionHandler } from '../../browser/agentHostInputCompletions.js';
+import { collectComposerClipboardAttachments } from '../../browser/composerAttach.js';
 import { INewChatAttachments } from '../../browser/newChatContextAttachments.js';
 import { NewChatInputPasteTarget } from '../../browser/newChatInputPasteTarget.js';
 
@@ -71,6 +72,29 @@ class TestAttachments implements INewChatAttachments {
 		this._onDidChangeContext.dispose();
 	}
 }
+
+suite('collectComposerClipboardAttachments', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('does not create an attachment for an ordinary text paste', () => {
+		const clipboardData = new DataTransfer();
+		clipboardData.setData(Mimes.text, 'test prompt');
+		const event = new ClipboardEvent('paste', { clipboardData });
+
+		assert.strictEqual(collectComposerClipboardAttachments(event), undefined);
+	});
+
+	test('leaves raw image data to the shared paste pipeline', () => {
+		// Raw image data (e.g. a pasted screenshot) is attached by the pipeline's
+		// PasteImageProvider; collecting it here too attached the same image twice.
+		const clipboardData = new DataTransfer();
+		clipboardData.items.add(new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'screenshot.png', { type: 'image/png' }));
+		const event = new ClipboardEvent('paste', { clipboardData });
+
+		assert.strictEqual(collectComposerClipboardAttachments(event), undefined);
+	});
+});
 
 suite('NewChatInputPasteTarget', () => {
 

@@ -5,6 +5,7 @@
 
 import assert from 'assert';
 import { CancellationToken, CancellationTokenSource } from '../../../../../../../base/common/cancellation.js';
+import { CancellationError } from '../../../../../../../base/common/errors.js';
 import { match } from '../../../../../../../base/common/glob.js';
 import { Schemas } from '../../../../../../../base/common/network.js';
 import { basename, relativePath } from '../../../../../../../base/common/resources.js';
@@ -2929,6 +2930,33 @@ suite('PromptFilesLocator', () => {
 					'/Users/legomushroom/.copilot/hooks/my-hook.json',
 				],
 			);
+		});
+	});
+
+	suite('cancellation', () => {
+		testT('a cancelled scan is not reported as an error', async () => {
+			setLocations({ '/Users/legomushroom/repos/prompts/': true });
+			setWorkspaceFolders([]);
+			await mockFiles(fileService, []);
+
+			const errors: string[] = [];
+			instantiationService.stub(ILogService, new class extends NullLogService {
+				override error(message: string | Error): void {
+					errors.push(String(message));
+				}
+			}());
+			instantiationService.stub(IFileService, mockService<IFileService>({
+				resolve: (() => Promise.reject(new CancellationError())) as IFileService['resolve'],
+			}));
+
+			const locator = instantiationService.createInstance(PromptFilesLocator);
+
+			assertOutcome(
+				await locator.listFiles(PromptsType.prompt, PromptsStorage.local, CancellationToken.None),
+				[],
+				'A cancelled scan must find nothing.',
+			);
+			assert.deepStrictEqual(errors, [], 'Cancellation must not be logged as an error.');
 		});
 	});
 

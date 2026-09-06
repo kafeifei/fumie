@@ -11,6 +11,7 @@ import { IAction } from '../../../../../base/common/actions.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { KeyCode } from '../../../../../base/common/keyCodes.js';
 import { DisposableStore, MutableDisposable } from '../../../../../base/common/lifecycle.js';
+import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { localize } from '../../../../../nls.js';
 import { IContextMenuService } from '../../../../../platform/contextview/browser/contextView.js';
 import { IHoverService } from '../../../../../platform/hover/browser/hover.js';
@@ -40,16 +41,6 @@ export class MobileHostFilterActionViewItem extends HostFilterActionViewItem {
 		@IHoverService hoverService: IHoverService,
 	) {
 		super(action, 'titlebar', filterService, contextMenuService, hoverService);
-	}
-
-	/**
-	 * Always interactive on mobile — even with zero hosts the sheet
-	 * shows an empty state and the always-visible "Re-discover hosts"
-	 * action. This is the primary entry point for retrying discovery
-	 * when no hosts have been found yet.
-	 */
-	protected override _isInteractive(): boolean {
-		return true;
 	}
 
 	protected override _showMenu(_e: Event): void {
@@ -121,7 +112,7 @@ export class MobileHostFilterActionViewItem extends HostFilterActionViewItem {
 		// --- Subtitle --------------------------------------------------------
 		dom.append(sheet, $('div.host-picker-sheet-subtitle')).textContent =
 			localize('agentHostFilter.sheet.subtitle',
-				"Sessions are scoped to a host. Switching hosts shows that machine's sessions and runs new sessions there.");
+				"Choose which machine's sessions to show. Picking a host also runs new sessions there.");
 
 		// --- Body (host list or empty state) --------------------------------
 		const body = dom.append(sheet, $('div.host-picker-sheet-body'));
@@ -177,7 +168,7 @@ export class MobileHostFilterActionViewItem extends HostFilterActionViewItem {
 
 	private _renderHostList(disposables: DisposableStore, body: HTMLElement, finish: () => void, focusRefs: { firstHost?: HTMLButtonElement; firstCheckedHost?: HTMLButtonElement }): void {
 		const hosts = this._filterService.hosts;
-		const selectedId = this._filterService.selectedProviderId;
+		const scope = this._filterService.scope;
 
 		if (hosts.length === 0) {
 			const empty = dom.append(body, $('div.host-picker-sheet-empty'));
@@ -187,45 +178,82 @@ export class MobileHostFilterActionViewItem extends HostFilterActionViewItem {
 			return;
 		}
 
+		const track = (row: HTMLButtonElement, checked: boolean) => {
+			focusRefs.firstHost ??= row;
+			if (checked) {
+				focusRefs.firstCheckedHost ??= row;
+			}
+		};
+
+		// "All Machines" first: the union of every host, and the one entry
+		// that stays meaningful when a host goes away.
+		const allChecked = scope.kind === 'all';
+		track(this._renderItem(disposables, body, {
+			icon: Codicon.layers,
+			name: localize('agentHostFilter.sheet.allMachines', "All Machines"),
+			detail: localize('agentHostFilter.sheet.allMachines.detail', "Sessions from every machine"),
+			checked: allChecked,
+			run: () => this._filterService.setScope({ kind: 'all' }),
+		}, finish), allChecked);
+
 		dom.append(body, $('div.host-picker-sheet-section-title')).textContent =
 			localize('agentHostFilter.sheet.available', "Available");
 
 		for (const host of hosts) {
-			const row = this._renderHostItem(disposables, body, host, selectedId === host.providerId, finish);
-			focusRefs.firstHost ??= row;
-			if (selectedId === host.providerId) {
-				focusRefs.firstCheckedHost ??= row;
-			}
+			const checked = scope.kind === 'host' && scope.providerId === host.providerId;
+			track(this._renderHostItem(disposables, body, host, checked, finish), checked);
 		}
 	}
 
 	private _renderHostItem(disposables: DisposableStore, body: HTMLElement, host: IAgentHostFilterEntry, checked: boolean, finish: () => void): HTMLButtonElement {
+		return this._renderItem(disposables, body, {
+			icon: Codicon.remote,
+			status: host.status,
+			name: host.label,
+			detail: this._statusLabel(host.status),
+			checked,
+			run: () => this._filterService.setScope({ kind: 'host', providerId: host.providerId }),
+		}, finish);
+	}
+
+	private _renderItem(disposables: DisposableStore, body: HTMLElement, item: {
+		readonly icon: ThemeIcon;
+		readonly status?: AgentHostFilterConnectionStatus;
+		readonly name: string;
+		readonly detail: string;
+		readonly checked: boolean;
+		readonly run: () => void;
+	}, finish: () => void): HTMLButtonElement {
 		const row = dom.append(body, $('button.host-picker-sheet-item', { type: 'button' })) as HTMLButtonElement;
 		row.setAttribute('role', 'menuitemradio');
-		row.setAttribute('aria-checked', String(checked));
-		if (checked) {
+		row.setAttribute('aria-checked', String(item.checked));
+		if (item.checked) {
 			row.classList.add('checked');
 		}
 
-		// Icon + small status dot in the bottom-right.
+		// Icon + small status dot in the bottom-right. Entries that aren't a
+		// single host (e.g. "All Machines") have no connection of their own,
+		// so they get no dot rather than a gray "disconnected" one.
 		const iconWrap = dom.append(row, $('span.host-picker-sheet-item-icon'));
-		iconWrap.append(...renderLabelWithIcons(`$(${Codicon.remote.id})`));
-		const status = dom.append(iconWrap, $('span.host-picker-sheet-item-status'));
-		switch (host.status) {
-			case AgentHostFilterConnectionStatus.Connected:
-				status.classList.add('connected');
-				break;
-			case AgentHostFilterConnectionStatus.Connecting:
-				status.classList.add('connecting');
-				break;
+		iconWrap.append(...renderLabelWithIcons(`$(${item.icon.id})`));
+		if (item.status !== undefined) {
+			const status = dom.append(iconWrap, $('span.host-picker-sheet-item-status'));
+			switch (item.status) {
+				case AgentHostFilterConnectionStatus.Connected:
+					status.classList.add('connected');
+					break;
+				case AgentHostFilterConnectionStatus.Connecting:
+					status.classList.add('connecting');
+					break;
+			}
 		}
 
 		// Name + status sub-line.
 		const text = dom.append(row, $('span.host-picker-sheet-item-text'));
-		dom.append(text, $('span.host-picker-sheet-item-name')).textContent = host.label;
-		dom.append(text, $('span.host-picker-sheet-item-sub')).textContent = this._statusLabel(host.status);
+		dom.append(text, $('span.host-picker-sheet-item-name')).textContent = item.name;
+		dom.append(text, $('span.host-picker-sheet-item-sub')).textContent = item.detail;
 
-		if (checked) {
+		if (item.checked) {
 			const check = dom.append(row, $('span.host-picker-sheet-item-check'));
 			check.append(...renderLabelWithIcons(`$(${Codicon.check.id})`));
 		}
@@ -234,7 +262,7 @@ export class MobileHostFilterActionViewItem extends HostFilterActionViewItem {
 			if (e) {
 				dom.EventHelper.stop(e, true);
 			}
-			this._filterService.setSelectedProviderId(host.providerId);
+			item.run();
 			finish();
 		};
 

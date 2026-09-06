@@ -9,6 +9,7 @@ import { ClaudePermissionMode, narrowClaudePermissionMode } from '../../common/c
 import { IAgentChatMetadata } from '../../common/agent.js';
 import { ISessionDataService } from '../../common/sessionDataService.js';
 import type { AgentSelection, ModelSelection } from '../../common/state/protocol/state.js';
+import type { ClaudeTransport } from './claudeProxyService.js';
 import { AH_META_WORKSPACELESS_DB_KEY } from '../../common/state/sessionState.js';
 
 /**
@@ -36,7 +37,7 @@ export interface IClaudeSessionOverlay {
 	 * transport resolution in v1 (transport is resolved host-level). Lets a
 	 * future per-session-transport feature land without a data migration.
 	 */
-	readonly transport?: 'proxy' | 'native';
+	readonly transport?: ClaudeTransport['kind'];
 }
 
 /**
@@ -50,7 +51,7 @@ export interface IClaudeSessionOverlayUpdate {
 	readonly permissionMode?: ClaudePermissionMode;
 	readonly agent?: AgentSelection | null;
 	readonly workingDirectories?: readonly URI[];
-	readonly transport?: 'proxy' | 'native';
+	readonly transport?: ClaudeTransport['kind'];
 }
 
 /**
@@ -171,7 +172,7 @@ export class ClaudeSessionMetadataStore {
 				model: parseModelSelection(modelRaw),
 				permissionMode: narrowClaudePermissionMode(permissionModeRaw),
 				agent: parseAgentSelection(agentRaw),
-				transport: transportRaw === 'proxy' || transportRaw === 'native' ? transportRaw : undefined,
+				transport: transportRaw === 'proxy' || transportRaw === 'native' || transportRaw === 'byok' ? transportRaw : undefined,
 				workingDirectories: parseWorkingDirectories(workingDirectoriesRaw),
 			};
 		} finally {

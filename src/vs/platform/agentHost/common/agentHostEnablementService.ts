@@ -41,6 +41,13 @@ configurationRegistry.registerConfiguration({
 	title: nls.localize('chatAgentHostConfigurationTitle', "Chat Agent Host"),
 	type: 'object',
 	properties: {
+		'chat.agents.copilotCli.hideExtensionHost': {
+			type: 'boolean',
+			markdownDescription: nls.localize('chat.agents.copilotCli.hideExtensionHost', "When enabled, hides the Extension Host Copilot CLI entry from the Agents window picker."),
+			default: true,
+			tags: ['experimental'],
+			experiment: { mode: 'startup' },
+		},
 		'chat.editor.preferCopilotHarness': {
 			type: 'boolean',
 			description: nls.localize('chat.editor.preferCopilotHarness', "When enabled, uses the Agent Host Copilot SDK whenever the local harness would otherwise be selected for a new editor chat session. Claude and Codex selections are unaffected."),

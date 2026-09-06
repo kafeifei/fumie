@@ -240,13 +240,18 @@ const configuration: IConfigurationNode = {
 			description: localize('verbosity.chatPetAchievements', 'Provide information about how to access chat pet achievements accessibility help when the Achievements modal is focused.'),
 			...baseVerbosityProperty
 		},
+		// Signal sounds ship muted: every sound played by `AccessibilitySignalService`
+		// is scaled by this volume, so a default of `0` silences all of them while
+		// leaving announcements and the individual signal settings untouched. The
+		// Agents window additionally pins the value so it cannot be raised.
 		'accessibility.signalOptions.volume': {
 			'description': localize('accessibility.signalOptions.volume', "The volume of the sounds in percent (0-100)."),
 			'type': 'number',
 			'minimum': 0,
 			'maximum': 100,
-			'default': 70,
-			'tags': ['accessibility']
+			'default': 0,
+			'tags': ['accessibility'],
+			agentsWindow: { default: 0, readOnly: true }
 		},
 		'accessibility.signalOptions.debouncePositionChanges': {
 			'description': localize('accessibility.signalOptions.debouncePositionChanges', "Whether or not position changes should be debounced"),

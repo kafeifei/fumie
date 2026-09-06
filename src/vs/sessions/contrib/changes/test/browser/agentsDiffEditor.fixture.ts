@@ -39,6 +39,7 @@ import { AgentFeedbackEditorInputContribution } from '../../../agentFeedback/bro
 import { AgentFeedbackOverlayController, IAgentFeedbackOverlayEditorGroup } from '../../../agentFeedback/browser/agentFeedbackEditorOverlay.js';
 import { clearAllFeedbackActionId, navigateNextFeedbackActionId, navigatePreviousFeedbackActionId, navigationBearingFakeActionId, submitFeedbackActionId } from '../../../agentFeedback/browser/agentFeedbackEditorActions.js';
 import { AgentFeedbackKind, AgentFeedbackState, IAgentFeedback, IAgentFeedbackService } from '../../../agentFeedback/browser/agentFeedbackService.js';
+import { ISessionChangesService } from '../../browser/sessionChangesService.js';
 import { Menus } from '../../../../browser/menus.js';
 import { ISession } from '../../../../services/sessions/common/session.js';
 
@@ -236,6 +237,9 @@ async function renderAgentsDiffEditor({ container, disposableStore, disposableSt
 		additionalServices: reg => {
 			registerWorkbenchServices(reg);
 			reg.defineInstance(IAgentFeedbackService, agentFeedbackService);
+			reg.defineInstance(ISessionChangesService, new class extends mock<ISessionChangesService>() {
+				override getSessionResource(): undefined { return undefined; }
+			}());
 			reg.defineInstance(IContextKeyService, createContextKeyService());
 			reg.define(IMenuService, FixtureAgentFeedbackMenuService);
 			reg.defineInstance(IDecorationsService, new class extends mock<IDecorationsService>() { override onDidChangeDecorations = Event.None; }());

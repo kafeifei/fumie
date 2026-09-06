@@ -104,6 +104,25 @@ function emptyHarness(): ICodexConversationResolverHarness {
 	return { id: CODEX_AGENT_PROVIDER_ID, _sessionIdByChatUri: new Map() };
 }
 
+/** The `ChatToolCallReady` fields an approval request fills in. */
+interface ICodexApprovalCard {
+	readonly invocationMessage: string;
+	readonly toolInput?: string;
+	readonly confirmationTitle?: string;
+}
+
+/** Exactly the state `respondToPermissionRequest` reaches for. */
+interface ICodexRespondSession {
+	readonly pendingCommandApprovals: { respond(requestId: string, decision: string): boolean };
+	readonly mapState: { readonly declinedToolCalls: Set<string> };
+}
+
+interface ICodexRespondHarness {
+	readonly _sessions: Map<string, ICodexRespondSession>;
+	readonly _subagentsByThreadId: Map<string, { readonly session: ICodexRespondSession }>;
+	readonly _logService: { info(message: string): void };
+}
+
 suite('CodexAgent', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -166,6 +185,7 @@ suite('CodexAgent', () => {
 			_githubToken: 'token',
 			_gitHubMcpServerConfiguration: createGitHubMcpServerConfiguration('https://api.enterprise.githubcopilot.com'),
 			_connection: { kind: 'ready', proxyHandle: { setToken: (token: string) => proxyTokens.push(token) } },
+			_nativeConnection: { kind: 'idle' },
 			_queueModelRefresh: () => { modelRefreshes++; },
 			_sessions: new Map([['session', {}]]),
 			_reconcileMaterializedCustomizations: async () => { reconciliations++; },
@@ -200,6 +220,7 @@ suite('CodexAgent', () => {
 			_gitHubMcpServerConfiguration: undefined,
 			_resolveGitHubMcpServerConfiguration: async () => resolution.p,
 			_connection: { kind: 'ready', proxyHandle: { setToken: (token: string) => proxyTokens.push(token) } },
+			_nativeConnection: { kind: 'idle' },
 			_queueModelRefresh: () => { },
 			_sessions: new Map([['session', {}]]),
 			_reconcileMaterializedCustomizations: async () => { reconciliations++; },
@@ -492,5 +513,74 @@ suite('CodexAgent', () => {
 		});
 
 		assert.deepStrictEqual(emitted, [{ ...chats[2], external: true }]);
+	});
+
+	test('item approval keeps the item message under the confirmation title', async () => {
+		const requestItemApproval = (CodexAgent.prototype as unknown as {
+			_requestItemApproval(this: {
+				_logService: { warn(message: string): void };
+				_resolveApprovalTarget(threadId: string): { readonly session: unknown } | undefined;
+				_fireApproval(target: unknown, action: ICodexApprovalCard): void;
+			}, threadId: string, itemId: string, confirmationTitle: string): Promise<string>;
+		})._requestItemApproval;
+		const fired: ICodexApprovalCard[] = [];
+		const session = {
+			sessionId: 'session-1',
+			mapState: {
+				itemToToolCall: new Map([
+					['patch_1', { toolCallId: 'call-1', turnId: 'turn-1', toolName: 'file_edit', output: '', invocationMessage: 'update: src/a.ts' }],
+					['shell_1', { toolCallId: 'call-2', turnId: 'turn-1', toolName: 'shell', output: '' }],
+				]),
+			},
+			pendingCommandApprovals: {
+				registerAndFire: async (_toolCallId: string, fire: () => void) => { fire(); return 'decline'; },
+			},
+		};
+		const harness = {
+			_logService: { warn: () => { } },
+			_resolveApprovalTarget: () => ({ session }),
+			_fireApproval: (_target: unknown, action: ICodexApprovalCard) => { fired.push(action); },
+		};
+
+		await requestItemApproval.call(harness, 'thr_1', 'patch_1', 'Apply file changes');
+		await requestItemApproval.call(harness, 'thr_1', 'shell_1', 'Grant elevated permissions');
+
+		assert.deepStrictEqual(fired.map(action => ({ title: action.confirmationTitle, message: action.invocationMessage, input: action.toolInput })), [
+			// The card's title says what is being approved; its body must keep
+			// the files the patch touches, not repeat the title.
+			{ title: 'Apply file changes', message: 'update: src/a.ts', input: 'update: src/a.ts' },
+			// No recorded message for this item: the title still stands in.
+			{ title: 'Grant elevated permissions', message: 'Grant elevated permissions', input: 'Grant elevated permissions' },
+		]);
+	});
+
+	test('an approval carries the picked option through to codex', () => {
+		const respond = (CodexAgent.prototype as unknown as {
+			respondToPermissionRequest(this: ICodexRespondHarness, requestId: string, approved: boolean, selectedOptionId?: string): void;
+		}).respondToPermissionRequest;
+		const decisions: string[] = [];
+		const declined = new Set<string>();
+		const session = {
+			pendingCommandApprovals: {
+				respond: (_requestId: string, decision: string) => { decisions.push(decision); return true; },
+			},
+			mapState: { declinedToolCalls: declined },
+		};
+		const harness: ICodexRespondHarness = {
+			_sessions: new Map([['session-1', session]]),
+			_subagentsByThreadId: new Map(),
+			_logService: { info: () => { } },
+		};
+
+		// Only the explicit session grant becomes `acceptForSession`; an accept
+		// with no option (all a client offering no options can say) stays a
+		// one-shot accept, so nothing is approved beyond what the user picked.
+		respond.call(harness, 'call-1', true, 'allow-session');
+		respond.call(harness, 'call-2', true, 'allow-once');
+		respond.call(harness, 'call-3', true, undefined);
+		respond.call(harness, 'call-4', false, 'allow-session');
+
+		assert.deepStrictEqual(decisions, ['acceptForSession', 'accept', 'accept', 'decline']);
+		assert.deepStrictEqual([...declined], ['call-4']);
 	});
 });

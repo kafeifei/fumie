@@ -31,10 +31,12 @@ import {
 	type ICachedTunnel,
 	type ITunnelAgentHostMainService,
 	type ITunnelConnectResult,
+	type ITunnelDiscoveryOptions,
 	type ITunnelGatewayInventory,
 	type ITunnelGatewaySelection,
 	type ITunnelGatewaySelectionSession,
 	type ITunnelInfo,
+	type ITunnelUserLimit,
 	type TunnelAutoConnectMode,
 } from '../../../../../platform/agentHost/common/tunnelAgentHost.js';
 import { AhpJsonlLogger } from '../../../../../platform/agentHost/common/ahpJsonlLogger.js';
@@ -128,7 +130,7 @@ export class TunnelAgentHostService extends Disposable implements ITunnelAgentHo
 		);
 	}
 
-	async listTunnels(options?: { silent?: boolean }): Promise<ITunnelInfo[]> {
+	async listTunnels(options?: ITunnelDiscoveryOptions): Promise<ITunnelInfo[]> {
 		if (!this._configurationService.getValue<boolean>(RemoteAgentHostsEnabledSettingId)) {
 			return [];
 		}
@@ -144,8 +146,22 @@ export class TunnelAgentHostService extends Disposable implements ITunnelAgentHo
 			return [];
 		}
 
-		const additionalNames = this._configurationService.getValue<string[]>(TunnelAgentHostsSettingId) ?? [];
-		return this._mainService.listTunnels(auth.token, auth.provider, additionalNames.length > 0 ? additionalNames : undefined);
+		const additionalTunnelNames = this._configurationService.getValue<string[]>(TunnelAgentHostsSettingId) ?? [];
+		return this._mainService.listTunnels(auth.token, auth.provider, {
+			additionalTunnelNames,
+			includeAllTunnels: options?.includeAllTunnels,
+		});
+	}
+
+	async listUserLimits(options?: { silent?: boolean }): Promise<readonly ITunnelUserLimit[] | undefined> {
+		if (!this._configurationService.getValue<boolean>(RemoteAgentHostsEnabledSettingId)) {
+			return undefined;
+		}
+		const auth = await this._getToken(options?.silent ?? false);
+		if (!auth) {
+			return undefined;
+		}
+		return this._mainService.listUserLimits(auth.token, auth.provider);
 	}
 
 	getAutoConnectMode(tunnel: ITunnelInfo): TunnelAutoConnectMode {

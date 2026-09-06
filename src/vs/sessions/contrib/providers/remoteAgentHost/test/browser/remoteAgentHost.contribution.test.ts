@@ -14,8 +14,10 @@ import { ICommandService } from '../../../../../../platform/commands/common/comm
 import { IRemoteAgentHostSSHConnection, RemoteAgentHostEntryType } from '../../../../../../platform/agentHost/common/remoteAgentHostService.js';
 import { SSHHostKeyDeniedError } from '../../../../../../platform/agentHost/common/sshRemoteAgentHost.js';
 import { AuthRequiredReason, NotificationType, type INotification } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
+import { type AgentInfo } from '../../../../../../platform/agentHost/common/state/sessionState.js';
 import { type ProtectedResourceMetadata } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { TestInstantiationService } from '../../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
+import { type IProductService } from '../../../../../../platform/product/common/productService.js';
 import { ILogService, NullLogService } from '../../../../../../platform/log/common/log.js';
 import { IAuthenticationService } from '../../../../../../workbench/services/authentication/common/authentication.js';
 import { categorizeSSHConnectError } from '../../../../../common/sessionsTelemetry.js';
@@ -23,11 +25,13 @@ import { disconnectSSHEntry, RemoteAgentHostContribution, shouldPauseSSHReconnec
 
 interface IRemoteAuthNotificationHarness {
 	_connections: Map<string, { readonly authTokenCache: AgentHostAuthTokenCache; readonly authRecovery: AgentHostAuthenticationRecovery }>;
-	_sessionsProvidersService: { getProvider(): undefined };
+	_sessionsProvidersService: { getProvider(): { setAuthenticationPending(pending: boolean): void } | undefined };
 	_instantiationService: TestInstantiationService;
 	_connectionCustomizations: { get(address: string): { readonly authenticate?: (request: { readonly resource: string; readonly scopes?: readonly string[]; readonly token: string }) => Promise<{ readonly resource: string; readonly scopes?: readonly string[]; readonly token: string }> } | undefined };
 	_logService: NullLogService;
+	_productService: Pick<IProductService, 'sessionsMinimalShell' | 'sessionsRequireDefaultAccount'>;
 	_handleAuthenticationRequiredNotification(address: string, connection: Pick<IAgentConnection, 'authenticate'>, notification: INotification): void;
+	_authenticateWithConnection(address: string, connection: Pick<IAgentConnection, 'authenticate'>, agents: readonly AgentInfo[]): Promise<void>;
 }
 
 suite('RemoteAgentHost auth notifications', () => {
@@ -156,6 +160,57 @@ suite('RemoteAgentHost auth notifications', () => {
 		assert.deepStrictEqual({ envelopes, promptCount }, {
 			envelopes: ['session-token:sealed-1', 'session-token:sealed-2'],
 			promptCount: 1,
+		});
+	});
+
+	test('never pushes a workbench credential to a host whose harnesses own their own', async () => {
+		// The browser driving this machine reaches the desktop's own agent host,
+		// which is already running on the harnesses' credentials. A pass here
+		// resolves nothing (the web client has no authentication provider) and
+		// would still forward the empty token that revokes what the host holds —
+		// once per root-state change, so several times per session open.
+		const address = 'test-host';
+		const run = async (productService: Pick<IProductService, 'sessionsMinimalShell' | 'sessionsRequireDefaultAccount'>) => {
+			const instantiationService = store.add(new TestInstantiationService());
+			instantiationService.stub(IAuthenticationService, {
+				getOrActivateProviderIdForServer: async () => undefined,
+				getSessions: async () => [],
+			});
+			instantiationService.stub(ILogService, new NullLogService());
+			const authenticateCalls: string[] = [];
+			const pending: boolean[] = [];
+			const contribution = Object.create(RemoteAgentHostContribution.prototype) as IRemoteAuthNotificationHarness;
+			contribution._connections = new Map([[address, { authTokenCache: new AgentHostAuthTokenCache(), authRecovery: new AgentHostAuthenticationRecovery() }]]);
+			contribution._sessionsProvidersService = { getProvider: () => ({ setAuthenticationPending: value => pending.push(value) }) };
+			contribution._instantiationService = instantiationService;
+			contribution._connectionCustomizations = { get: () => undefined };
+			contribution._logService = new NullLogService();
+			contribution._productService = productService;
+			const agents = [{
+				provider: 'claude',
+				protectedResources: [
+					{ resource: 'https://api.github.com', authorization_servers: ['https://github.com/login/oauth'], scopes_supported: ['read:user'], required: false },
+					{ resource: 'https://api.github.com/repos', authorization_servers: ['https://github.com/login/oauth'], scopes_supported: ['repo'], required: false },
+				],
+			}] as unknown as readonly AgentInfo[];
+
+			await contribution._authenticateWithConnection(address, {
+				authenticate: async request => { authenticateCalls.push(`${request.resource}=${request.token}`); return { authenticated: true }; },
+			}, agents);
+			return { authenticateCalls, pending };
+		};
+
+		assert.deepStrictEqual({
+			// Fumie's shape. `pending: [false]` and nothing else — the provider
+			// starts pending, so it still has to settle or the host's sessions
+			// stay loading forever.
+			minimalShell: await run({ sessionsMinimalShell: true, sessionsRequireDefaultAccount: false }),
+			// A product that does own the credential still forwards, including
+			// the empty token that says it has none.
+			fullShell: await run({ sessionsMinimalShell: false, sessionsRequireDefaultAccount: true }),
+		}, {
+			minimalShell: { authenticateCalls: [], pending: [false] },
+			fullShell: { authenticateCalls: ['https://api.github.com=', 'https://api.github.com/repos='], pending: [true, false] },
 		});
 	});
 });

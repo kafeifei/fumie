@@ -270,6 +270,37 @@ export interface IProductConfiguration {
 	readonly aiGeneratedWorkspaceTrust?: IAiGeneratedWorkspaceTrust;
 
 	readonly defaultChatAgent: IDefaultChatAgent;
+	/** Whether the Sessions window should require the default (Copilot) account setup flow. */
+	readonly sessionsRequireDefaultAccount?: boolean;
+	/** Whether the Sessions title bar should expose the default account widget. */
+	readonly sessionsAccountUI?: boolean;
+	/** Whether the Sessions window should hide editor/task/terminal shell affordances. */
+	readonly sessionsMinimalShell?: boolean;
+	/** Whether the Sessions title bar should expose the built-in Dev Tunnels host control. */
+	readonly sessionsRemoteConnectionsUI?: boolean;
+	/** Monotonic build number stamped only into packaged Fumie Debug apps. */
+	readonly fumieDebugBuildNumber?: string;
+	/** Agent-host providers exposed by the Sessions shell, in preferred order. */
+	readonly sessionsAllowedAgentHostProviders?: readonly string[];
+	/** Product-owned runtime context that tells provider agents how to interpret the hosting application and its user-facing controls. */
+	readonly agentHostInstructions?: readonly string[];
+	/** Product-level root for Fumie-owned agent data such as sessions, plugins, and worktrees. */
+	readonly agentHostDefaultFumieHome?: string;
+	/** Product-level fallback for the Codex home used by the local agent host. */
+	readonly agentHostDefaultCodexHome?: string;
+	/** Product-level fallback for Codex's shared SQLite state, independent of its config home. */
+	readonly agentHostDefaultCodexSqliteHome?: string;
+	/** Product-level fallback for a Codex executable compatible with that home. */
+	readonly agentHostDefaultCodexBinaryPath?: string;
+	/** Product-level default for direct Codex versus Copilot-routed usage. */
+	readonly agentHostDefaultCodexUsageSource?: 'openai' | 'copilot';
+	/** Product-level fallback for the Copilot CLI home used by the local agent host. */
+	readonly agentHostDefaultCopilotHome?: string;
+	/** Product-level default for routing Claude Agent SDK traffic through Copilot. */
+	readonly agentHostDefaultClaudeUseCopilotProxy?: boolean;
+	readonly agentHostByokModelsEnabledByDefault?: boolean;
+	readonly extensionActivationEnvironmentRequirements?: { readonly [extensionId: string]: { readonly [name: string]: string } };
+	readonly extensionGlobalStateDefaults?: { readonly [extensionId: string]: { readonly [key: string]: unknown } };
 	readonly chatParticipantRegistry?: string;
 	readonly chatSessionRecommendations?: IChatSessionRecommendation[];
 	readonly emergencyAlertUrl?: string;

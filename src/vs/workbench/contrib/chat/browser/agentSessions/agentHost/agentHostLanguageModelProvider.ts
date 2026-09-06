@@ -6,13 +6,15 @@
 import { CancellationToken } from '../../../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../../../base/common/event.js';
 import { Disposable } from '../../../../../../base/common/lifecycle.js';
+import Severity from '../../../../../../base/common/severity.js';
 import { localize } from '../../../../../../nls.js';
-import { ConfigSchema, SessionModelInfo } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+import { ConfigSchema, type AgentCapabilities, type AgentInfo, SessionModelInfo } from '../../../../../../platform/agentHost/common/state/sessionState.js';
 import { readAgentModelPricingMeta } from '../../../../../../platform/agentHost/common/agentModelPricing.js';
-import { readAgentModelByokIdentifier } from '../../../../../../platform/agentHost/common/agentModelByokMeta.js';
-import { readAgentModelGroupId, readAgentModelSourceId } from '../../../../../../platform/agentHost/common/agentModelSource.js';
+import { readAgentModelByokHidden, readAgentModelByokIdentifier } from '../../../../../../platform/agentHost/common/agentModelByokMeta.js';
+import { isSubscriptionCatalogModel, readAgentModelGroupId, readAgentModelSourceId } from '../../../../../../platform/agentHost/common/agentModelSource.js';
 import { nullExtensionDescription } from '../../../../../services/extensions/common/extensions.js';
-import { ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelConfigurationSchema } from '../../../common/languageModels.js';
+import { IAgentHostModelProviderPresentation } from '../../../../../services/agentHost/browser/agentHostModelProviderPresentation.js';
+import { ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelConfigurationSchema, ILanguageModelProviderStatus } from '../../../common/languageModels.js';
 
 /**
  * Returns whether an agent host provider exposes a synthetic "Auto" model to
@@ -35,6 +37,43 @@ export function agentHostProviderSupportsAutoModel(provider: string): boolean {
 }
 
 /**
+ * A model as this vendor publishes it: what the agent advertised, plus the
+ * renderer's decision on whether the picker may offer it as a row.
+ *
+ * The flag is optional and absent means selectable, so a plain
+ * {@link SessionModelInfo} list — what every other caller of
+ * {@link AgentHostLanguageModelProvider.updateModels} has — is already one of
+ * these.
+ */
+export interface IAgentVendorModel extends SessionModelInfo {
+	readonly isUserSelectable?: boolean;
+}
+
+/**
+ * The models an agent's own vendor publishes: everything it advertises, with
+ * the rows that belong to a first-party subscription marked unselectable.
+ *
+ * A subscription's models reach the picker through the provider the user added
+ * for that subscription, which stamps them with this same session type and so
+ * routes them identically. Offering them here as well would list every one of
+ * them twice, under two names, with no way to tell which row does what — and
+ * would keep offering them to a user who has not added the subscription at all.
+ * Dropping them outright is not the answer either: what model a session runs and
+ * how wide its context window is are facts about the agent, not about what the
+ * user has configured, and every consumer that resolves a running model through
+ * the catalog goes blind the moment the row is missing. So the catalog registers
+ * them and the picker does not list them. The host keeps publishing the whole
+ * catalog; which half each vendor *offers* is decided here, in the renderer.
+ *
+ * Exported for unit testing.
+ */
+export function agentVendorModels(agent: AgentInfo): readonly IAgentVendorModel[] {
+	return agent.models.map(model => isSubscriptionCatalogModel(agent.provider, model)
+		? { ...model, isUserSelectable: false }
+		: model);
+}
+
+/**
  * Exposes models available from the agent host process as selectable
  * language models in the chat model picker. Models are provided from
  * root state (via {@link AgentInfo.models}) rather than via RPC.
@@ -43,21 +82,51 @@ export class AgentHostLanguageModelProvider extends Disposable implements ILangu
 	private readonly _onDidChange = this._register(new Emitter<void>());
 	readonly onDidChange = this._onDidChange.event;
 
-	private _models: readonly SessionModelInfo[] = [];
+	private _models: readonly IAgentVendorModel[] = [];
+	private _hasModelSnapshot = false;
 
 	constructor(
 		private readonly _sessionType: string,
 		private readonly _vendor: string,
+		private readonly _modelCatalog: NonNullable<AgentCapabilities['modelCatalog']> = 'owned',
+		private readonly _presentation?: IAgentHostModelProviderPresentation,
 	) {
 		super();
+		if (this._presentation) {
+			this._register(this._presentation.onDidChange(() => this._onDidChange.fire()));
+		}
 	}
 
 	/**
 	 * Called by {@link AgentHostContribution} when models change in root state.
 	 */
-	updateModels(models: readonly SessionModelInfo[]): void {
+	updateModels(models: readonly IAgentVendorModel[]): void {
 		this._models = models;
+		this._hasModelSnapshot = true;
 		this._onDidChange.fire();
+	}
+
+	async provideLanguageModelChatStatus(_options: unknown, _token: CancellationToken): Promise<ILanguageModelProviderStatus | undefined> {
+		if (this._modelCatalog === 'projected') {
+			return undefined;
+		}
+		// Only the rows this vendor actually offers count: a catalog made up
+		// entirely of models another vendor lists still leaves this one with
+		// nothing to pick, which is what the status speaks to.
+		const hasNativeModels = this._models.some(model => model.policyState !== 'disabled' && model.isUserSelectable !== false && readAgentModelByokIdentifier(model) === undefined);
+		const presentationStatus = this._presentation?.provideStatus({
+			hasModelSnapshot: this._hasModelSnapshot,
+			hasNativeModels,
+		});
+		if (presentationStatus) {
+			return presentationStatus;
+		}
+		if (hasNativeModels) {
+			return undefined;
+		}
+		return this._hasModelSnapshot
+			? { message: localize('agentHost.models.empty', "No models available"), severity: Severity.Warning }
+			: { message: localize('agentHost.models.loading', "Loading models…"), severity: Severity.Info };
 	}
 
 	async provideLanguageModelChatInfo(_options: unknown, _token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]> {
@@ -80,21 +149,35 @@ export class AgentHostLanguageModelProvider extends Disposable implements ILangu
 					: undefined;
 				const modelGroup = this._modelGroupFor(m);
 				const byokModelIdentifier = readAgentModelByokIdentifier(m);
+				// The host's own Manage Models visibility, carried so a client that has no
+				// copy of that state can grey the row instead of dropping it.
+				const byokModelHidden = readAgentModelByokHidden(m);
 				return {
 					identifier: `${this._vendor}:${m.id}`,
 					metadata: {
 						extension: nullExtensionDescription.identifier,
 						name: m.name,
 						id: m.id,
+						// The agent's own name for this model, when it publishes the row
+						// under a decorated id; the only handle a turn replayed from a
+						// transcript has to find this row by.
+						...(m.underlyingModelId !== undefined && { underlyingModelId: m.underlyingModelId }),
 						vendor: this._vendor,
 						version: '1.0',
 						family: m.id,
 						...(tooltip !== undefined && { tooltip }),
 						...(detail !== undefined && { detail }),
-						maxInputTokens: m.maxPromptTokens ?? 0,
+						// BYOK-bridge models carry only `maxContextWindow` (prompt +
+						// output, from the renderer catalog); derive the input side
+						// from it so the context-usage gauge has a denominator.
+						maxInputTokens: m.maxPromptTokens ?? (m.maxContextWindow !== undefined ? Math.max(0, m.maxContextWindow - (m.maxOutputTokens ?? 0)) : 0),
 						maxOutputTokens: m.maxOutputTokens ?? 0,
 						isDefaultForLocation: {},
-						isUserSelectable: true,
+						// A row this vendor registers but does not offer (a subscription's
+						// models, which its own provider offers instead) is still resolvable
+						// by identifier — the catalog states what the agent can run, the flag
+						// states what the user may pick.
+						isUserSelectable: m.isUserSelectable ?? true,
 						pricing: multiplierNumeric !== undefined ? `${multiplierNumeric}x` : undefined,
 						multiplierNumeric,
 						inputCost: pricing.inputCost,
@@ -115,6 +198,7 @@ export class AgentHostLanguageModelProvider extends Disposable implements ILangu
 						// undifferentiated bucket. Presentation-only; routing stays by vendor.
 						...(modelGroup ? { modelGroup } : {}),
 						...(byokModelIdentifier !== undefined && { byokModelIdentifier }),
+						...(byokModelHidden && { byokModelHidden }),
 						capabilities: {
 							vision: m.supportsVision ?? false,
 							toolCalling: true,
@@ -151,6 +235,7 @@ export class AgentHostLanguageModelProvider extends Disposable implements ILangu
 	private static _groupForConfigKey(key: string): string | undefined {
 		switch (key) {
 			case 'thinkingLevel': return 'navigation';
+			case 'serviceTier': return 'performance';
 			case 'contextSize': return 'tokens';
 			default: return undefined;
 		}

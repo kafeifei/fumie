@@ -537,9 +537,14 @@ export class CodeApplication extends Disposable {
 		app.on('activate', async (event, hasVisibleWindows) => {
 			this.logService.trace('app#activate');
 
-			// Mac only event: open new window when we get activated
+			// Mac only event: reopen the last Agents window instead of an
+			// empty editor when that was the surface the user just closed.
 			if (!hasVisibleWindows) {
-				await this.windowsMainService?.openEmptyWindow({ context: OpenContext.DOCK });
+				try {
+					await this.windowsMainService?.openWindowOnActivate({ context: OpenContext.DOCK });
+				} catch (error) {
+					this.logService.error('app#activate failed to restore window', error);
+				}
 			}
 		});
 

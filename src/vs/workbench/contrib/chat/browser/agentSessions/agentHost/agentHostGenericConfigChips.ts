@@ -11,6 +11,7 @@ import { IInstantiationService } from '../../../../../../platform/instantiation/
 import { IAgentHostService } from '../../../../../../platform/agentHost/common/agentService.js';
 import type { ResolveSessionConfigResult, SessionConfigPropertySchema } from '../../../../../../platform/agentHost/common/state/protocol/commands.js';
 import type { SessionState } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
+import { NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
 import { StateComponents } from '../../../../../../platform/agentHost/common/state/sessionState.js';
 import { type IAgentSubscription } from '../../../../../../platform/agentHost/common/state/agentSubscription.js';
 import { isUntitledChatSession } from '../../../common/model/chatUri.js';
@@ -51,6 +52,13 @@ export class AgentHostGenericConfigChips extends Disposable {
 	private _initialResolved: { readonly sessionResource: URI; readonly result: ResolveSessionConfigResult } | undefined;
 	private readonly _initialResolveCts = this._register(new MutableDisposable<CancellationTokenSource>());
 
+	/**
+	 * While the active resource has no backend session yet, listens for the
+	 * host announcing it so the chips can subscribe the moment it exists.
+	 * Replaced on every {@link _reattach} and dropped once attached.
+	 */
+	private readonly _pendingSessionAdded = this._register(new MutableDisposable<IDisposable>());
+
 	constructor(
 		private readonly _widget: IChatWidget,
 		@IInstantiationService private readonly _instantiationService: IInstantiationService,
@@ -77,6 +85,7 @@ export class AgentHostGenericConfigChips extends Disposable {
 	}
 
 	private _reattach(): void {
+		this._pendingSessionAdded.clear();
 		const sessionResource = this._widget.viewModel?.sessionResource;
 		const provisionalBackend = sessionResource ? this._provisional.get(sessionResource) : undefined;
 		const backendSession = provisionalBackend
@@ -90,16 +99,37 @@ export class AgentHostGenericConfigChips extends Disposable {
 			return;
 		}
 
-		if (isUntitledChatSession(sessionResource) && !provisionalBackend) {
+		// Pre-session resources have no backend session to subscribe to: an
+		// untitled chat without a provisional, and a composer draft in the
+		// Agents window (client-local until its first message is sent).
+		// Subscribing would open a channel for a session the host has never
+		// heard of, so resolve the schema from the provider defaults instead
+		// and wait for the host to announce the session.
+		if (!provisionalBackend && (isUntitledChatSession(sessionResource) || this._workingDirectoryResolver.isNewSession(sessionResource))) {
 			this._subRef.clear();
 			if (!this._initialResolved || this._initialResolved.sessionResource.toString() !== sessionResource.toString()) {
 				this._initialResolved = undefined;
 				void this._refreshInitialResolved(sessionResource, backendSession);
 			}
+			// The composer keeps the same resource across the send that commits
+			// the draft, so nothing re-runs `_reattach` on its own. Attach
+			// directly from the announcement rather than re-testing the
+			// pre-session predicate — listener ordering is not guaranteed.
+			this._pendingSessionAdded.value = this._agentHostService.onDidNotification(n => {
+				if (n.type === NotificationType.SessionAdded && String(n.summary.resource) === backendSession.toString()) {
+					this._attachSubscription(backendSession);
+				}
+			});
 			this._sync();
 			return;
 		}
 
+		this._attachSubscription(backendSession);
+	}
+
+	/** Subscribe to `backendSession`'s state and render from it. */
+	private _attachSubscription(backendSession: URI): void {
+		this._pendingSessionAdded.clear();
 		this._initialResolved = undefined;
 		this._cancelInitialResolve();
 		const ref = this._agentHostService.getSubscription(StateComponents.Session, backendSession, 'AgentHostGenericConfigChips');

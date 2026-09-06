@@ -17,8 +17,6 @@ import { IUriIdentityService } from '../../../../../platform/uriIdentity/common/
 // eslint-disable-next-line local/code-import-patterns
 import { IAgentHostFilterService } from '../../../../../sessions/services/agentHostFilter/common/agentHostFilter.js';
 // eslint-disable-next-line local/code-import-patterns
-import { ISessionGroup, ISessionGroupsService } from '../../../../../sessions/services/sessions/browser/sessionGroupsService.js';
-// eslint-disable-next-line local/code-import-patterns
 import { ISessionSectionOrderService } from '../../../../../sessions/services/sessions/browser/sessionSectionOrderService.js';
 // eslint-disable-next-line local/code-import-patterns
 import { ISessionsListModelService } from '../../../../../sessions/services/sessions/browser/sessionsListModelService.js';
@@ -54,7 +52,6 @@ interface ISessionSpec {
 	readonly description?: string;
 	readonly minutesAgo: number;
 	readonly changesSummary?: ISessionChangesSummary;
-	readonly group?: string;
 }
 
 function createWorkspace(label: string): ISessionWorkspace {
@@ -97,7 +94,6 @@ function createSession(spec: ISessionSpec): ISession {
 
 interface IRenderOptions {
 	readonly sessions: readonly ISessionSpec[];
-	readonly groups?: readonly ISessionGroup[];
 	readonly grouping?: SessionsGrouping;
 	readonly width?: number;
 	readonly phone?: boolean;
@@ -106,13 +102,6 @@ interface IRenderOptions {
 function renderSessionsList(ctx: ComponentFixtureContext, options: IRenderOptions): void {
 	const { container, disposableStore } = ctx;
 	const sessions = options.sessions.map(createSession);
-	const groups = options.groups ?? [];
-	const membership = new Map<string, string>();
-	for (const spec of options.sessions) {
-		if (spec.group) {
-			membership.set(spec.id, spec.group);
-		}
-	}
 
 	const instantiationService = createEditorServices(disposableStore, {
 		colorTheme: ctx.theme,
@@ -153,15 +142,6 @@ function renderSessionsList(ctx: ComponentFixtureContext, options: IRenderOption
 						default:
 							return { ...Codicon.circleSmallFilled, color: themeColorFromId('agentSessionReadIndicator.foreground') };
 					}
-				}
-			}());
-			reg.defineInstance(ISessionGroupsService, new class extends mock<ISessionGroupsService>() {
-				override readonly onDidChange = Event.None;
-				override getGroups(): ISessionGroup[] { return [...groups]; }
-				override getGroup(groupId: string): ISessionGroup | undefined { return groups.find(group => group.id === groupId); }
-				override getGroupOfSession(sessionId: string): string | undefined { return membership.get(sessionId); }
-				override getSessionIdsInGroup(groupId: string): string[] {
-					return [...membership].filter(([, id]) => id === groupId).map(([sessionId]) => sessionId);
 				}
 			}());
 			reg.defineInstance(ISessionSectionOrderService, new class extends mock<ISessionSectionOrderService>() {
@@ -215,34 +195,31 @@ function renderSessionsList(ctx: ComponentFixtureContext, options: IRenderOption
 	list.layout(options.phone ? 260 : 220, width);
 }
 
-const GROUP: ISessionGroup = { id: 'group-1', name: 'Release work', createdAt: Date.now() };
-const GROUPED_SESSIONS: readonly ISessionSpec[] = [
-	{ id: 'a', title: 'Fix authentication redirect loop', workspace: 'vscode', minutesAgo: 12, group: GROUP.id, changesSummary: { files: 4, additions: 132, deletions: 18 } },
-	{ id: 'b', title: 'Add reconnect backoff', workspace: 'agent-host-protocol', minutesAgo: 64, group: GROUP.id },
+const WORKSPACE_SESSIONS: readonly ISessionSpec[] = [
+	{ id: 'a', title: 'Fix authentication redirect loop', workspace: 'vscode', minutesAgo: 12, changesSummary: { files: 4, additions: 132, deletions: 18 } },
+	{ id: 'b', title: 'Add reconnect backoff', workspace: 'agent-host-protocol', minutesAgo: 64 },
 	{ id: 'c', title: 'Update onboarding copy', workspace: 'vscode-docs', minutesAgo: 180 },
 ];
 
 export default defineThemedFixtureGroup({ path: 'sessions/' }, {
-	SessionsList_CustomGroup: defineComponentFixture({
-		render: ctx => renderSessionsList(ctx, { sessions: GROUPED_SESSIONS, groups: [GROUP] }),
+	SessionsList_WorkspaceSections: defineComponentFixture({
+		render: ctx => renderSessionsList(ctx, { sessions: WORKSPACE_SESSIONS }),
 	}),
-	SessionsList_CustomGroup_LongWorkspaceNarrow: defineComponentFixture({
+	SessionsList_LongWorkspaceNarrow: defineComponentFixture({
 		render: ctx => renderSessionsList(ctx, {
 			sessions: [
-				{ id: 'a', title: 'Fix authentication redirect loop', workspace: 'an-extremely-long-workspace-name-that-must-truncate', minutesAgo: 12, group: GROUP.id, changesSummary: { files: 4, additions: 132, deletions: 18 } },
-				...GROUPED_SESSIONS.slice(1),
+				{ id: 'a', title: 'Fix authentication redirect loop', workspace: 'an-extremely-long-workspace-name-that-must-truncate', minutesAgo: 12, changesSummary: { files: 4, additions: 132, deletions: 18 } },
+				...WORKSPACE_SESSIONS.slice(1),
 			],
-			groups: [GROUP],
 			width: 260,
 		}),
 	}),
-	SessionsList_CustomGroup_InProgress: defineComponentFixture({
+	SessionsList_InProgress: defineComponentFixture({
 		render: ctx => renderSessionsList(ctx, {
 			sessions: [
-				{ id: 'a', title: 'Fix authentication redirect loop', workspace: 'agent-host-protocol', minutesAgo: 1, group: GROUP.id, status: SessionStatus.InProgress, description: 'Running the integration suite' },
-				...GROUPED_SESSIONS.slice(1),
+				{ id: 'a', title: 'Fix authentication redirect loop', workspace: 'agent-host-protocol', minutesAgo: 1, status: SessionStatus.InProgress, description: 'Running the integration suite' },
+				...WORKSPACE_SESSIONS.slice(1),
 			],
-			groups: [GROUP],
 			width: 260,
 		}),
 	}),
@@ -251,7 +228,7 @@ export default defineThemedFixtureGroup({ path: 'sessions/' }, {
 			sessions: [{ id: 'c', title: 'Update onboarding copy', workspace: 'vscode-docs', minutesAgo: 180 }],
 		}),
 	}),
-	SessionsList_CustomGroup_Phone: defineComponentFixture({
-		render: ctx => renderSessionsList(ctx, { sessions: GROUPED_SESSIONS, groups: [GROUP], phone: true, width: 340 }),
+	SessionsList_Phone: defineComponentFixture({
+		render: ctx => renderSessionsList(ctx, { sessions: WORKSPACE_SESSIONS, phone: true, width: 340 }),
 	}),
 });

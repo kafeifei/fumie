@@ -633,6 +633,7 @@ suite('AgentHostProtocolClient', () => {
 			channel: session.toString(),
 			_meta: { multiRoot: { workspaceFile: 'file:///demo.code-workspace' } },
 			provider: 'copilot',
+			model: undefined,
 			workingDirectories: undefined,
 			config: undefined,
 			activeClient: undefined,

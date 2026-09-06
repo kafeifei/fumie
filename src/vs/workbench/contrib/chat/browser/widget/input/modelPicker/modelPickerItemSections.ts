@@ -159,10 +159,50 @@ interface IGroupedContext {
 	markPlaced(identifierOrId: string): void;
 }
 
+/**
+ * The identity two picker rows must share to be the same offer: the model, plus
+ * the provider the row is served by.
+ *
+ * Two *different* vendors can register one and the same row. A subscription's
+ * models are registered both by the agent host's own (hidden) harness vendor and
+ * by the visible subscription vendor the user added, so the rows differ in
+ * `identifier` while sharing `metadata.id`. Placing one of them and leaving the
+ * sibling unplaced lists the model twice — once in the promoted block, which
+ * resolves control-manifest entries by bare `metadata.id` and so reaches an
+ * arbitrary one of the pair, and once again under the other vendor's group.
+ *
+ * The bare id alone is too coarse a key: a BYOK copy of the same model id added
+ * under another provider (`customendpoint`) is a genuinely different offer —
+ * different credential, different routing — and must keep its own row. What
+ * separates the two cases is the source group, which is exactly what
+ * {@link getProviderGroupForModel} reads to bucket a row: `byokModelIdentifier`
+ * when the row projects another provider's model, else `modelGroup.id`, else the
+ * vendor. The harness and subscription copies of a subscription model share one
+ * (Claude's transport group, `anthropic`); a BYOK copy does not. So the rule is
+ * one visible row per (bare id, source group).
+ */
+function modelOfferKey(model: ILanguageModelChatMetadataAndIdentifier): string {
+	const { metadata } = model;
+	const source = metadata.byokModelIdentifier ?? metadata.modelGroup?.id ?? metadata.vendor;
+	// Same separator as `getProviderGroupKey`, for the same reason: neither half
+	// can contain it, so the halves cannot run together into a colliding key.
+	return `${metadata.id}\u0000${source}`;
+}
+
 function createGroupedContext(options: IBuildModelPickerItemsOptions): IGroupedContext {
 	const modelToGroup = buildModelToProviderGroupMap(options.languageModelsService);
 	const allModels = new Map(options.models.map(model => [model.identifier, model]));
 	const modelsByMetadataId = new Map(options.models.map(model => [model.metadata.id, model]));
+	const siblingsByOfferKey = new Map<string, ILanguageModelChatMetadataAndIdentifier[]>();
+	for (const model of options.models) {
+		const key = modelOfferKey(model);
+		const siblings = siblingsByOfferKey.get(key);
+		if (siblings) {
+			siblings.push(model);
+		} else {
+			siblingsByOfferKey.set(key, [model]);
+		}
+	}
 	const placed = new Set<string>();
 	return {
 		options,
@@ -177,7 +217,17 @@ function createGroupedContext(options: IBuildModelPickerItemsOptions): IGroupedC
 		makePinAction: model => options.actions.onTogglePin
 			? createPinAction(model.identifier, options.pinnedModelIds.includes(model.identifier), options.actions.onTogglePin)
 			: undefined,
-		markPlaced: identifierOrId => placed.add(identifierOrId),
+		// Placing a row places every row that offers the same thing, so a sibling
+		// registered by a second vendor cannot resurface in a later section. Called
+		// with a control-manifest id for an entry no model backs, which matches
+		// nothing here and just marks the id.
+		markPlaced: identifierOrId => {
+			placed.add(identifierOrId);
+			const model = allModels.get(identifierOrId) ?? modelsByMetadataId.get(identifierOrId);
+			for (const sibling of model ? siblingsByOfferKey.get(modelOfferKey(model)) ?? [] : []) {
+				placed.add(sibling.identifier);
+			}
+		},
 	};
 }
 

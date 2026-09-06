@@ -7,10 +7,10 @@ import assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { readAgentMessageDelegationMeta } from '../../../common/meta/agentMessageDelegationMeta.js';
-import { createCodexSessionMapState, extractUserInputText, finalizeCodexTurnMapState, mapAgentMessageDelta, mapCommandExecutionOutputDelta, mapFileChangePatchUpdated, mapItemCompleted, mapItemStarted, mapMcpToolCallProgress, mapReasoningSummaryPartAdded, mapReasoningSummaryTextDelta, mapReasoningTextDelta, mapTokenUsageModelCallCompleted, mapTokenUsageUpdated, mapTurnCompleted, mapTurnStarted, resetCodexTurnMapState, turnStateFromStatus } from '../../../node/codex/codexMapAppServerEvents.js';
+import { codexUsageBreakdown, createCodexSessionMapState, extractUserInputText, finalizeCodexTurnMapState, mapAgentMessageDelta, mapCodexPlanTodos, mapCommandExecutionOutputDelta, mapFileChangePatchUpdated, mapItemCompleted, mapItemStarted, mapMcpToolCallProgress, mapReasoningSummaryPartAdded, mapReasoningSummaryTextDelta, mapReasoningTextDelta, mapTokenUsageModelCallCompleted, mapTokenUsageUpdated, mapTurnCompleted, mapTurnPlanUpdated, mapTurnStarted, resetCodexTurnMapState, turnStateFromStatus } from '../../../node/codex/codexMapAppServerEvents.js';
 import { ActionType, type ChatAction, type SessionAction } from '../../../common/state/sessionActions.js';
 import { chatReducer } from '../../../common/state/protocol/reducers.js';
-import { ChatOriginKind, MessageKind, ResponsePartKind, SessionStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolResultContentType, TurnState, type ChatState } from '../../../common/state/sessionState.js';
+import { ChatOriginKind, MessageKind, ResponsePartKind, SessionStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, TurnState, type ChatState } from '../../../common/state/sessionState.js';
 import { ActiveClientToolSet } from '../../../node/activeClientState.js';
 
 /** Extracts the content of a Markdown response part emitted by a mapper action. */
@@ -131,7 +131,7 @@ suite('codexMapAppServerEvents', () => {
 	test('item/started for agentMessage seeds a markdown part', () => {
 		const state = createCodexSessionMapState();
 		const actions = mapItemStarted(state, {
-			item: { type: 'agentMessage', id: 'item_x', text: '', phase: null, memoryCitation: null },
+			item: { type: 'agentMessage', id: 'item_x', text: '', phase: null, memoryCitation: null, delivery: null, questions: null },
 			threadId: 'thr_1',
 			turnId: 'turn_a',
 			startedAtMs: 0,
@@ -161,7 +161,7 @@ suite('codexMapAppServerEvents', () => {
 	test('item/agentMessage/delta emits ChatDelta for known itemId', () => {
 		const state = createCodexSessionMapState();
 		mapItemStarted(state, {
-			item: { type: 'agentMessage', id: 'item_x', text: '', phase: null, memoryCitation: null },
+			item: { type: 'agentMessage', id: 'item_x', text: '', phase: null, memoryCitation: null, delivery: null, questions: null },
 			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
 		});
 		const partId = state.itemToPartId.get('item_x')!;
@@ -234,17 +234,160 @@ suite('codexMapAppServerEvents', () => {
 				modelContextWindow: 200000,
 			},
 		}, 'codex-model:openai:gpt-5.6-sol');
+		// Codex's `inputTokens` is taken as inclusive of `cachedInputTokens`
+		// (unverified — see `codexUsageBreakdown`), so the mapper splits rather
+		// than transcribes. What is pinned here is the invariant that survives
+		// either reading: the client's occupancy sum reproduces the 10 this
+		// mapper reported before the fold moved off it.
 		assert.deepStrictEqual(actions, [{
 			type: ActionType.ChatUsage,
 			turnId: 'turn_a',
 			usage: {
-				inputTokens: 10,
+				inputTokens: 6,
 				outputTokens: 6,
 				model: 'codex-model:openai:gpt-5.6-sol',
 				cacheReadTokens: 4,
 				_meta: { reasoningOutputTokens: 2, modelContextWindow: 200000 },
 			},
 		}]);
+	});
+
+	test('codexUsageBreakdown keeps the reported prompt total and never goes negative', () => {
+		assert.deepStrictEqual(
+			codexUsageBreakdown({ inputTokens: 12_000, cachedInputTokens: 11_500, cacheWriteInputTokens: 400, outputTokens: 90, reasoningOutputTokens: 40, totalTokens: 12_090 }),
+			{ inputTokens: 500, cacheReadTokens: 11_500 },
+		);
+		// A cached count above the reported input would otherwise drive the
+		// fresh share negative and shrink the gauge below the truth.
+		assert.deepStrictEqual(
+			codexUsageBreakdown({ inputTokens: 100, cachedInputTokens: 250, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0, totalTokens: 255 }),
+			{ inputTokens: 0, cacheReadTokens: 250 },
+		);
+	});
+
+	test('turn/plan/updated starts one item, updates the stable id, and completes it with the turn', () => {
+		const state = createCodexSessionMapState();
+		const started = mapTurnPlanUpdated(state, {
+			threadId: 'thr_1',
+			turnId: 'turn_a',
+			explanation: null,
+			plan: [
+				{ step: 'Read the terminal docs', status: 'completed' },
+				{ step: 'Patch the mapper', status: 'inProgress' },
+				{ step: 'Add tests', status: 'pending' },
+			],
+		});
+		const toolCallId = (started[0] as { toolCallId: string }).toolCallId;
+		const startedToolInput = JSON.stringify({
+			explanation: null, plan: [
+				{ step: 'Read the terminal docs', status: 'completed' },
+				{ step: 'Patch the mapper', status: 'inProgress' },
+				{ step: 'Add tests', status: 'pending' },
+			]
+		});
+		assert.deepStrictEqual(started, [
+			{ type: ActionType.ChatToolCallStart, turnId: 'turn_a', toolCallId, toolName: 'update_plan', displayName: 'Update todo list' },
+			{ type: ActionType.ChatToolCallReady, turnId: 'turn_a', toolCallId, invocationMessage: 'Updating todo list: Patch the mapper (2/3)', toolInput: startedToolInput, confirmed: ToolCallConfirmationReason.NotNeeded },
+			{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [{ type: ToolResultContentType.Text, text: '[x] Read the terminal docs\n[>] Patch the mapper\n[ ] Add tests' }] },
+		]);
+
+		const updated = mapTurnPlanUpdated(state, {
+			threadId: 'thr_1',
+			turnId: 'turn_a',
+			explanation: 'Everything is done.',
+			plan: [
+				{ step: 'Read the terminal docs', status: 'completed' },
+				{ step: 'Patch the mapper', status: 'completed' },
+				{ step: 'Add tests', status: 'completed' },
+			],
+		});
+		const updatedToolInput = JSON.stringify({
+			explanation: 'Everything is done.', plan: [
+				{ step: 'Read the terminal docs', status: 'completed' },
+				{ step: 'Patch the mapper', status: 'completed' },
+				{ step: 'Add tests', status: 'completed' },
+			]
+		});
+		assert.deepStrictEqual(updated, [
+			{ type: ActionType.ChatToolCallReady, turnId: 'turn_a', toolCallId, invocationMessage: 'Updating todo list (3/3)', toolInput: updatedToolInput, confirmed: ToolCallConfirmationReason.NotNeeded },
+			{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [{ type: ToolResultContentType.Text, text: 'Everything is done.\n\n[x] Read the terminal docs\n[x] Patch the mapper\n[x] Add tests' }] },
+		]);
+
+		let chat: ChatState = {
+			resource: 'ahp-chat://plan-test',
+			title: 'Plan test',
+			status: SessionStatus.InProgress,
+			modifiedAt: new Date(0).toISOString(),
+			origin: { kind: ChatOriginKind.User },
+			turns: [],
+			activeTurn: {
+				id: 'turn_a',
+				startedAt: new Date(0).toISOString(),
+				message: { text: 'work', origin: { kind: MessageKind.User } },
+				responseParts: [],
+				usage: undefined,
+			},
+		};
+		for (const action of [...started, ...updated]) {
+			chat = chatReducer(chat, action as ChatAction);
+		}
+		const runningPlanParts = chat.activeTurn?.responseParts.filter(part => part.kind === ResponsePartKind.ToolCall) ?? [];
+		assert.strictEqual(runningPlanParts.length, 1);
+		assert.strictEqual(runningPlanParts[0].kind === ResponsePartKind.ToolCall ? runningPlanParts[0].toolCall.status : undefined, ToolCallStatus.Running);
+
+		const completed = mapTurnCompleted(state, {
+			threadId: 'thr_1',
+			turn: {
+				id: 'turn_a', items: [], itemsView: { type: 'full' } as never,
+				status: 'completed' as never,
+				error: null, startedAt: null, completedAt: null, durationMs: null,
+			},
+		});
+		assert.deepStrictEqual(completed, [
+			{
+				type: ActionType.ChatToolCallComplete,
+				turnId: 'turn_a',
+				toolCallId,
+				result: {
+					success: true,
+					pastTenseMessage: 'Updated todo list',
+					content: [{ type: ToolResultContentType.Text, text: 'Everything is done.\n\n[x] Read the terminal docs\n[x] Patch the mapper\n[x] Add tests' }],
+				},
+			},
+			{ type: ActionType.ChatTurnComplete, turnId: 'turn_a', duration: 0 },
+		]);
+		for (const action of completed) {
+			chat = chatReducer(chat, action as ChatAction);
+		}
+		const completedPlanParts = chat.turns[0].responseParts.filter(part => part.kind === ResponsePartKind.ToolCall);
+		assert.strictEqual(completedPlanParts.length, 1);
+		assert.strictEqual(completedPlanParts[0].kind === ResponsePartKind.ToolCall ? completedPlanParts[0].toolCall.status : undefined, ToolCallStatus.Completed);
+
+		const nextTurn = mapTurnPlanUpdated(state, {
+			threadId: 'thr_1', turnId: 'turn_b', explanation: null,
+			plan: [{ step: 'New turn', status: 'inProgress' }],
+		});
+		assert.notStrictEqual((nextTurn[0] as { toolCallId: string }).toolCallId, toolCallId);
+	});
+
+	test('turn/plan/updated preserves an empty snapshot without emitting persistent TodoList content', () => {
+		const state = createCodexSessionMapState();
+		const actions = mapTurnPlanUpdated(state, { threadId: 'thr_1', turnId: 'turn_a', explanation: null, plan: [] });
+		const toolCallId = (actions[0] as { toolCallId: string }).toolCallId;
+		assert.deepStrictEqual(actions, [
+			{ type: ActionType.ChatToolCallStart, turnId: 'turn_a', toolCallId, toolName: 'update_plan', displayName: 'Update todo list' },
+			{ type: ActionType.ChatToolCallReady, turnId: 'turn_a', toolCallId, invocationMessage: 'Updating todo list', toolInput: JSON.stringify({ explanation: null, plan: [] }), confirmed: ToolCallConfirmationReason.NotNeeded },
+			{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [{ type: ToolResultContentType.Text, text: '(no steps provided)' }] },
+		]);
+	});
+
+	test('mapCodexPlanTodos skips steps with empty titles', () => {
+		assert.deepStrictEqual(mapCodexPlanTodos([
+			{ step: '', status: 'pending' },
+			{ step: 'Do work', status: 'completed' },
+		]), [
+			{ id: 'plan-1', title: 'Do work', status: 'completed' },
+		]);
 	});
 
 	test('thread/tokenUsage/updated identifies one completed model call from cumulative usage', () => {
@@ -295,12 +438,12 @@ suite('codexMapAppServerEvents', () => {
 	test('item/completed for agentMessage clears the mapping', () => {
 		const state = createCodexSessionMapState();
 		mapItemStarted(state, {
-			item: { type: 'agentMessage', id: 'item_x', text: '', phase: null, memoryCitation: null },
+			item: { type: 'agentMessage', id: 'item_x', text: '', phase: null, memoryCitation: null, delivery: null, questions: null },
 			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
 		});
 		assert.strictEqual(state.itemToPartId.size, 1);
 		mapItemCompleted(state, {
-			item: { type: 'agentMessage', id: 'item_x', text: 'final', phase: null, memoryCitation: null },
+			item: { type: 'agentMessage', id: 'item_x', text: 'final', phase: null, memoryCitation: null, delivery: null, questions: null },
 			threadId: 'thr_1', turnId: 'turn_a', completedAtMs: 0,
 		});
 		assert.strictEqual(state.itemToPartId.size, 0);
@@ -309,11 +452,11 @@ suite('codexMapAppServerEvents', () => {
 	test('second agentMessage in a turn is seeded with a leading block separator', () => {
 		const state = createCodexSessionMapState();
 		const first = mapItemStarted(state, {
-			item: { type: 'agentMessage', id: 'm1', text: 'Consolidating the recommendation and tradeoffs.', phase: null, memoryCitation: null },
+			item: { type: 'agentMessage', id: 'm1', text: 'Consolidating the recommendation and tradeoffs.', phase: null, memoryCitation: null, delivery: null, questions: null },
 			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
 		});
 		const second = mapItemStarted(state, {
-			item: { type: 'agentMessage', id: 'm2', text: '## Conclusion', phase: null, memoryCitation: null },
+			item: { type: 'agentMessage', id: 'm2', text: '## Conclusion', phase: null, memoryCitation: null, delivery: null, questions: null },
 			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
 		});
 		assert.deepStrictEqual({
@@ -327,11 +470,11 @@ suite('codexMapAppServerEvents', () => {
 
 	test('agentMessage block separator counter resets per turn', () => {
 		const state = createCodexSessionMapState();
-		mapItemStarted(state, { item: { type: 'agentMessage', id: 'm1', text: 'a', phase: null, memoryCitation: null }, threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0 });
-		mapItemStarted(state, { item: { type: 'agentMessage', id: 'm2', text: 'b', phase: null, memoryCitation: null }, threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0 });
+		mapItemStarted(state, { item: { type: 'agentMessage', id: 'm1', text: 'a', phase: null, memoryCitation: null, delivery: null, questions: null }, threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0 });
+		mapItemStarted(state, { item: { type: 'agentMessage', id: 'm2', text: 'b', phase: null, memoryCitation: null, delivery: null, questions: null }, threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0 });
 		// A new turn resets the counter, so its first agentMessage is unseeded.
 		resetCodexTurnMapState(state);
-		const firstOfNextTurn = mapItemStarted(state, { item: { type: 'agentMessage', id: 'm3', text: 'c', phase: null, memoryCitation: null }, threadId: 'thr_1', turnId: 'turn_b', startedAtMs: 0 });
+		const firstOfNextTurn = mapItemStarted(state, { item: { type: 'agentMessage', id: 'm3', text: 'c', phase: null, memoryCitation: null, delivery: null, questions: null }, threadId: 'thr_1', turnId: 'turn_b', startedAtMs: 0 });
 		assert.strictEqual(markdownPartContent(firstOfNextTurn[0]), 'c');
 	});
 
@@ -356,9 +499,9 @@ suite('codexMapAppServerEvents', () => {
 			turn: { id: 'turn_a', items: [], itemsView: { type: 'full' } as never, status: 'inProgress' as never, error: null, startedAt: null, completedAt: null, durationMs: null },
 		}, 'prompt'));
 		// Preamble message, then the final-answer message; two distinct items.
-		apply(mapItemStarted(state, { item: { type: 'agentMessage', id: 'm1', text: '', phase: null, memoryCitation: null }, threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0 }));
+		apply(mapItemStarted(state, { item: { type: 'agentMessage', id: 'm1', text: '', phase: null, memoryCitation: null, delivery: null, questions: null }, threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0 }));
 		apply(mapAgentMessageDelta(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'm1', delta: 'Consolidating the recommendation and tradeoffs.' }));
-		apply(mapItemStarted(state, { item: { type: 'agentMessage', id: 'm2', text: '', phase: null, memoryCitation: null }, threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0 }));
+		apply(mapItemStarted(state, { item: { type: 'agentMessage', id: 'm2', text: '', phase: null, memoryCitation: null, delivery: null, questions: null }, threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0 }));
 		apply(mapAgentMessageDelta(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'm2', delta: '## Conclusion\n\nDone.' }));
 
 		// Adjacent markdown parts are coalesced by plain concatenation, so the
@@ -538,6 +681,41 @@ suite('codexMapAppServerEvents', () => {
 		});
 	});
 
+	test('item/commandExecution/outputDelta keeps a long stream linear instead of re-sending everything', () => {
+		// `chat/toolCallContentChanged` replaces `content`, so re-sending the
+		// whole accumulated output per delta costs O(N²) on the wire. A single
+		// `grep` did exactly that for 78 MB of updates and exhausted the agent
+		// host's heap; the preview cap keeps the cost proportional to the output.
+		const state = createCodexSessionMapState();
+		mapItemStarted(state, {
+			item: {
+				type: 'commandExecution', id: 'cmd_big',
+				command: 'grep -r x .', cwd: '/tmp', processId: null,
+				source: 'agent' as never, status: 'inProgress' as never,
+				commandActions: [], aggregatedOutput: null,
+				exitCode: null, durationMs: null,
+			} as never,
+			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
+		});
+		const deltaCount = 400;
+		const delta = 'x'.repeat(1024);
+		let shipped = 0;
+		let lastText = '';
+		for (let i = 0; i < deltaCount; i++) {
+			const actions = mapCommandExecutionOutputDelta(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'cmd_big', delta });
+			lastText = (actions[0] as { content: { text: string }[] }).content[0].text;
+			shipped += lastText.length;
+		}
+		const produced = deltaCount * delta.length;
+		// Re-sending everything would ship ~200x the produced output (~82 MB
+		// here); a capped preview stays a small multiple of it.
+		assert.ok(shipped < produced * 20, `expected linear wire cost, shipped ${shipped} chars for ${produced} produced`);
+		assert.ok(lastText.includes('earlier chars elided'), 'a truncated preview must say that it is truncated');
+		// Nothing is lost: the accumulated output stays intact for the
+		// `ChatToolCallComplete` that ends the tool call.
+		assert.strictEqual(state.itemToToolCall.get('cmd_big')!.output.length, produced);
+	});
+
 	test('item/completed for commandExecution emits ChatToolCallComplete with aggregated output', () => {
 		const state = createCodexSessionMapState();
 		mapItemStarted(state, {
@@ -634,12 +812,12 @@ suite('codexMapAppServerEvents', () => {
 	test('imageGeneration item maps to an image tool call lifecycle', () => {
 		const state = createCodexSessionMapState();
 		const startActions = mapItemStarted(state, {
-			item: { type: 'imageGeneration', id: 'image_1', status: 'in_progress', revisedPrompt: null, result: '' },
+			item: { type: 'imageGeneration', id: 'image_1', status: 'in_progress', revisedPrompt: null, result: '', failure: null },
 			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
 		});
 		const toolCallId = state.itemToToolCall.get('image_1')!.toolCallId;
 		const completeActions = mapItemCompleted(state, {
-			item: { type: 'imageGeneration', id: 'image_1', status: 'completed', revisedPrompt: 'A watercolor fox', result: 'aW1hZ2U=' },
+			item: { type: 'imageGeneration', id: 'image_1', status: 'completed', revisedPrompt: 'A watercolor fox', result: 'aW1hZ2U=', failure: null },
 			threadId: 'thr_1', turnId: 'turn_a', completedAtMs: 0,
 		});
 		assert.deepStrictEqual({
@@ -683,6 +861,9 @@ suite('codexMapAppServerEvents', () => {
 			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
 		});
 		const toolCallId = state.itemToToolCall.get('file_1')!.toolCallId;
+		// A later approval request re-sends `invocationMessage`, so the entry
+		// records it rather than making the approval echo its own title.
+		const recordedInvocationMessage = state.itemToToolCall.get('file_1')!.invocationMessage;
 		const patchActions = mapFileChangePatchUpdated(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'file_1', changes: [{ path: 'src/b.ts', kind: { type: 'add' }, diff: '+hello' }] });
 		const completeActions = mapItemCompleted(state, {
 			item: { type: 'fileChange', id: 'file_1', changes, status: 'completed' } as never,
@@ -695,6 +876,7 @@ suite('codexMapAppServerEvents', () => {
 			initialContent: startActions[3],
 			patchActions,
 			completeActions,
+			recordedInvocationMessage,
 			remainingToolCalls: state.itemToToolCall.size,
 		}, {
 			startTypes: [ActionType.ChatToolCallStart, ActionType.ChatToolCallDelta, ActionType.ChatToolCallReady, ActionType.ChatToolCallContentChanged],
@@ -703,6 +885,7 @@ suite('codexMapAppServerEvents', () => {
 			initialContent: { type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [{ type: ToolResultContentType.Text, text: 'update: src/a.ts\n@@ -1 +1 @@\n-old\n+new' }] },
 			patchActions: [{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [{ type: ToolResultContentType.Text, text: 'add: src/b.ts\n+hello' }] }],
 			completeActions: [{ type: ActionType.ChatToolCallComplete, turnId: 'turn_a', toolCallId, result: { success: true, pastTenseMessage: 'update: src/a.ts', content: [{ type: ToolResultContentType.Text, text: 'update: src/a.ts\n@@ -1 +1 @@\n-old\n+new' }] } }],
+			recordedInvocationMessage: 'update: src/a.ts',
 			remainingToolCalls: 0,
 		});
 	});

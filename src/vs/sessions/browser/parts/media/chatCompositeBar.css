@@ -33,7 +33,7 @@
 .chat-composite-bar-header {
 	display: flex;
 	flex-direction: row;
-	align-items: flex-start;
+	align-items: center;
 	gap: 6px;
 	border-bottom: var(--vscode-strokeThickness) solid color-mix(in srgb, var(--session-view-foreground, var(--chat-tab-active-foreground)) 12%, transparent);
 }
@@ -41,18 +41,20 @@
 /* Main column hosts the title row. */
 .chat-composite-bar-header-main {
 	display: flex;
-	flex-direction: column;
-	gap: 2px;
+	flex-direction: row;
+	align-items: center;
 	flex: 1 1 auto;
 	min-width: 0;
 }
 
-/* Title row: title + actions */
+/* Title row: title + meta pills + actions */
 .chat-composite-bar-title-row {
 	display: flex;
 	align-items: center;
 	gap: 6px;
 	height: 34px;
+	flex: 1 1 auto;
+	min-width: 0;
 }
 
 /* Status icon column — sits beside the main column, centered on the title line.
@@ -83,6 +85,12 @@
 		input's text occupy the same horizontal position. */
 	padding: 0 4px;
 	margin: 0 -4px;
+}
+
+/* Title lives in the window titlebar as display text. Hide the duplicate
+	header title unless the user is inline-renaming from the context menu. */
+.session-header-bar .chat-composite-bar-session-title:not(.editing) {
+	display: none;
 }
 
 .chat-composite-bar-session-title-text {

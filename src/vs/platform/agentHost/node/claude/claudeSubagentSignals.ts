@@ -11,7 +11,7 @@ import type { AgentSignal, IAgentSubagentStartedSignal } from '../../common/agen
 import { ActionType } from '../../common/state/sessionActions.js';
 import { ResponsePartKind, ToolCallConfirmationReason, ToolCallContributorKind } from '../../common/state/sessionState.js';
 import type { ClaudeMapperState } from './claudeMapSessionEvents.js';
-import { SUBAGENT_TOOL_NAMES, type SubagentRegistry } from './claudeSubagentRegistry.js';
+import { SUBAGENT_TOOL_NAMES, type ISubagentSpawnInit, type SubagentRegistry, type SubagentSpawn } from './claudeSubagentRegistry.js';
 import { buildClaudeToolCallMeta, buildClaudeToolMeta, getClaudeInvocationMessage, getClaudeToolDisplayName, getClaudeToolInputString } from './claudeToolDisplay.js';
 import { hasClientToolNamePrefix, stripClientToolNamePrefix } from './clientTools/claudeClientToolMcpServer.js';
 
@@ -86,15 +86,22 @@ export function tagWithParent(
 }
 
 /**
- * Phase 12 step 7 — handle the two `type: 'system'` subtypes that drive
- * background-subagent lifecycle. `task_started` flips the matching
- * spawning entry to background so the foreground `tool_result` path
- * skips its `subagent_completed`. `task_notification` (with a terminal
- * status) is the deferred completion trigger for those background
- * entries.
+ * Phase 12 step 7 — handle the `type: 'system'` subtypes that drive
+ * background-subagent lifecycle. A background `task_started` flips the
+ * matching spawning entry so the foreground `tool_result` path skips its
+ * `subagent_completed`, and announces the subagent: a
+ * background subagent's inner content does not flow through the parent
+ * stream, so {@link tagWithParent}'s first-inner-message announcement
+ * never fires for it — without announcing here the child session (tab,
+ * background-activities pill) would simply not exist in the UI.
+ * Explicitly foreground starts remain on the normal tool-result path. If
+ * the CLI later backgrounds one, `task_updated.patch.is_backgrounded`
+ * performs the same transition using the task-id correlation recorded at
+ * start. `task_notification` (with a terminal status) is the deferred
+ * completion trigger for background entries.
  *
- * All other system subtypes (`compact_boundary`, `task_progress`,
- * `task_updated`, hooks, etc.) fall through with `[]`; non-subagent
+ * All other system subtypes (`compact_boundary`, `task_progress`, hooks,
+ * etc.) fall through with `[]`; non-subagent
  * system handling stays in the mapper proper.
  */
 export function mapSubagentSystemMessage(
@@ -102,33 +109,106 @@ export function mapSubagentSystemMessage(
 	chat: URI,
 	registry: SubagentRegistry,
 ): AgentSignal[] {
-	const sub = (message as { subtype?: string }).subtype;
-	if (sub === 'task_started') {
-		const toolUseId = (message as { tool_use_id?: string }).tool_use_id;
+	if (message.subtype === 'task_started') {
+		const toolUseId = message.tool_use_id;
 		const spawn = toolUseId ? registry.getSpawn(toolUseId) : undefined;
-		if (spawn) {
-			spawn.background = true;
-		}
-		return [];
-	}
-	if (sub === 'task_notification') {
-		const m = message as { tool_use_id?: string; status?: string };
-		if (!m.tool_use_id) {
+		if (!spawn) {
 			return [];
 		}
-		const status = m.status;
+		registry.noteTask(message.task_id, spawn.toolUseId);
+		// Pre-0.3.238 SDKs omitted this field and only surfaced this frame
+		// for background work, so `undefined` deliberately preserves the
+		// historical background interpretation.
+		if (message.is_backgrounded === false) {
+			return [];
+		}
+		return markSubagentBackgrounded(spawn, chat, registry);
+	}
+	if (message.subtype === 'task_updated') {
+		if (message.patch.is_backgrounded !== true) {
+			return [];
+		}
+		const spawn = registry.getSpawnForTask(message.task_id);
+		return spawn ? markSubagentBackgrounded(spawn, chat, registry) : [];
+	}
+	if (message.subtype === 'task_notification') {
+		if (!message.tool_use_id) {
+			return [];
+		}
+		const status = message.status;
 		if (status !== 'completed' && status !== 'failed' && status !== 'stopped') {
 			return [];
 		}
-		const spawn = registry.getSpawn(m.tool_use_id);
+		const spawn = registry.getSpawn(message.tool_use_id);
 		if (!spawn || !spawn.markCompleted()) {
 			return [];
 		}
-		const toolUseId = m.tool_use_id;
+		const toolUseId = message.tool_use_id;
 		registry.removeSpawn(toolUseId);
 		return [{ kind: 'subagent_completed', chat, toolCallId: toolUseId }];
 	}
 	return [];
+}
+
+/**
+ * Close every subagent chat orphaned by an SDK subprocess that is being
+ * replaced (a pipeline rebind: crash/abort recovery, or a deliberate
+ * yield-restart).
+ *
+ * A subagent chat's turn is only ever closed by a `subagent_completed`
+ * signal, and the SDK raises exactly one of those per spawn — either from the
+ * foreground `tool_result` or, for a backgrounded task, from a later
+ * `system.task_notification`. Both are emissions of the subprocess that owns
+ * the spawn, so when that subprocess dies mid-turn neither can arrive: the
+ * child chat keeps a live `activeTurn` forever, and because the session
+ * summary aggregates `InProgress` across the whole chat catalog, the session
+ * is pinned to "running" for the rest of its life with nothing left to
+ * finish it.
+ *
+ * Draining here is safe precisely because the rebind is the moment the old
+ * subprocess is known dead — there is no live executor left to mis-kill, at
+ * any nesting depth. The child chats stay registered host-side, so a subagent
+ * the rebuilt process genuinely carries on with simply opens a fresh turn
+ * through the normal resume path.
+ *
+ * Scope: Claude only. Codex spawns child threads through its own lifecycle
+ * (`codexAgent.ts`) and may have the symmetric gap, but it is deliberately
+ * not touched here.
+ */
+export function mapSubagentProcessRebuild(chat: URI, registry: SubagentRegistry): AgentSignal[] {
+	const signals: AgentSignal[] = [];
+	for (const spawn of registry.drainAllSpawns()) {
+		// `markCompleted` is the same idempotency guard the two real
+		// completion routes take, so a spawn already closed by one of them
+		// contributes nothing.
+		if (spawn.markCompleted()) {
+			signals.push({ kind: 'subagent_completed', chat, toolCallId: spawn.toolUseId });
+		}
+	}
+	return signals;
+}
+
+function markSubagentBackgrounded(
+	spawn: SubagentSpawn,
+	chat: URI,
+	registry: SubagentRegistry,
+): AgentSignal[] {
+	spawn.background = true;
+	if (!spawn.markAnnounced()) {
+		return [];
+	}
+	const started: IAgentSubagentStartedSignal = {
+		kind: 'subagent_started',
+		chat,
+		toolCallId: spawn.toolUseId,
+		agentName: spawn.subagentType ?? 'subagent',
+		agentDisplayName: spawn.subagentType ?? 'Subagent',
+		agentDescription: spawn.description,
+		taskDescription: spawn.description,
+		taskPrompt: spawn.prompt,
+		parentToolCallId: registry.getParentSpawn(spawn.toolUseId)?.toolUseId,
+	};
+	return [started];
 }
 
 /**
@@ -160,10 +240,7 @@ export function buildTopLevelSubagentReadyAction(
 	turnId: string,
 	registry: SubagentRegistry,
 ): AgentSignal {
-	const input = block.input as Record<string, unknown> | undefined;
-	const description = typeof input?.description === 'string' ? input.description : undefined;
-	const agentName = typeof input?.subagent_type === 'string' ? input.subagent_type : undefined;
-	const prompt = typeof input?.prompt === 'string' ? input.prompt : undefined;
+	const { subagentType: agentName, description, prompt } = readSubagentSpawnInit(block.input);
 	const inputJson = block.input !== undefined ? safeStringify(block.input) : undefined;
 	registry.recordSpawn(block.id, { subagentType: agentName, description, prompt });
 	const meta: Mutable<IToolCallMeta> = { ...buildClaudeToolCallMeta(block.name) };
@@ -263,7 +340,13 @@ export function emitInnerAssistantSignals(
 			const toolName = stripClientToolNamePrefix(block.name);
 			const isClientTool = hasClientToolNamePrefix(block.name);
 			const clientId = isClientTool ? clientToolOwner?.(toolName) : undefined;
-			state.startToolBlock(index, block.id, toolName, turnId, isClientTool);
+			// Cross-message tracking only. `index` is this inner message's
+			// own content-block index, not a position in the top-level
+			// partial stream, so it must not be published into the shared
+			// per-message index map: a subagent reporting mid-stream would
+			// leave a residue the next top-level `content_block_stop` picks
+			// up as its own tool block.
+			state.toolCalls.begin(block.id, toolName, turnId, isClientTool);
 			// Inner tool input arrives pre-parsed on the synthesized
 			// `assistant` message (not via `input_json_delta` chunks), so
 			// seed the registry directly. Without this the live
@@ -271,6 +354,14 @@ export function emitInnerAssistantSignals(
 			// `"{displayName} finished"` past-tense and replay (which
 			// always computes rich text) drifts from live — violating D6.
 			state.toolCalls.seedParsedInput(block.id, block.input);
+			if (!isClientTool && SUBAGENT_SPAWNING_TOOL_NAMES.has(toolName)) {
+				// A Task inside a subagent spawns a nested subagent. Its input
+				// bag is complete on this canonical envelope, so record the
+				// spawn here: without it nothing announces the nested child and
+				// every signal it produces is buffered against a subagent that
+				// never starts.
+				registry.recordSpawn(block.id, readSubagentSpawnInit(block.input));
+			}
 			registry.noteInnerTool(block.id, parentToolUseId);
 			const displayName = isClientTool ? toolName : getClaudeToolDisplayName(toolName);
 			const meta = isClientTool ? undefined : buildClaudeToolMeta(toolName);
@@ -308,6 +399,20 @@ export function emitInnerAssistantSignals(
 		// here just for one trace).
 	}
 	return signals;
+}
+
+/**
+ * Read the Task/Agent `tool_use.input` fields the registry tracks per
+ * spawn. Wrong-typed fields read as absent — the input bag is model
+ * output, so a missing label must not become a rendered `"42"`.
+ */
+function readSubagentSpawnInit(rawInput: unknown): ISubagentSpawnInit {
+	const input = rawInput as Record<string, unknown> | undefined;
+	return {
+		subagentType: typeof input?.subagent_type === 'string' ? input.subagent_type : undefined,
+		description: typeof input?.description === 'string' ? input.description : undefined,
+		prompt: typeof input?.prompt === 'string' ? input.prompt : undefined,
+	};
 }
 
 function safeStringify(value: unknown): string | undefined {

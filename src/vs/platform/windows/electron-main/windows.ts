@@ -42,6 +42,11 @@ export interface IWindowsMainService {
 	openExistingWindow(window: ICodeWindow, openConfig: IOpenConfiguration): void;
 
 	openAgentsWindow(openConfig: IOpenConfiguration, folderUri?: URI, sessionResource?: URI, source?: AgentsWindowOpenSource): Promise<ICodeWindow[]>;
+	/**
+	 * macOS dock / app activate with no visible windows. Restores the Agents
+	 * window when that was the last closed surface; otherwise an empty editor.
+	 */
+	openWindowOnActivate(openConfig: IOpenEmptyConfiguration): Promise<ICodeWindow[]>;
 
 	sendToFocused(channel: string, ...args: unknown[]): void;
 	sendToOpeningWindow(channel: string, ...args: unknown[]): void;

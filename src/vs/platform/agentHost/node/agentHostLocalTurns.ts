@@ -31,6 +31,8 @@ export class AgentHostLocalTurns {
 	private readonly _byChat = new Map<string, Map<string, { readonly anchorTurnId: string | undefined; readonly seq: number }>>();
 	/** session URI → highest `seq` assigned so far (seq is session-global for stable ordering). */
 	private readonly _seqBySession = new Map<string, number>();
+	/** Restore must not race a local turn whose database write is still pending. */
+	private readonly _writesBySession = new Map<string, Promise<void>>();
 
 	constructor(
 		private readonly _sessionDataService: ISessionDataService,
@@ -65,19 +67,36 @@ export class AgentHostLocalTurns {
 	 * none). `session` identifies the database to persist into.
 	 */
 	record(session: string, chat: string, turn: Turn, anchorTurnId: string | undefined): void {
+		void this.recordAndWait(session, chat, turn, anchorTurnId).catch(err => {
+			this._logService.warn(`[AgentHostLocalTurns] Failed to persist local turn ${turn.id}`, err);
+		});
+	}
+
+	/** Like record, but propagates persistence failures to callers requiring durability. */
+	recordAndWait(session: string, chat: string, turn: Turn, anchorTurnId: string | undefined): Promise<void> {
 		const seq = (this._seqBySession.get(session) ?? 0) + 1;
 		this._noteInMemory(session, chat, turn.id, anchorTurnId, seq);
 		const record: ILocalTurnRecord = { turnId: turn.id, chatUri: chat, anchorTurnId, seq, payload: JSON.stringify(turn) };
-		let ref: IReference<ISessionDatabase>;
-		try {
-			ref = this._sessionDataService.openDatabase(URI.parse(session));
-		} catch (err) {
-			this._logService.warn(`[AgentHostLocalTurns] Failed to open database to persist local turn ${turn.id}`, err);
-			return;
-		}
-		ref.object.insertLocalTurn(record).catch(err => {
-			this._logService.warn(`[AgentHostLocalTurns] Failed to persist local turn ${turn.id}`, err);
-		}).finally(() => ref.dispose());
+		// Start the database operation immediately, as record historically did.
+		// The database serializes writes; a previous failed save must not prevent
+		// a later retry from reaching it.
+		const write = (async () => {
+			const ref = this._sessionDataService.openDatabase(URI.parse(session));
+			try {
+				await ref.object.insertLocalTurn(record);
+			} finally {
+				ref.dispose();
+			}
+		})();
+		const previous = this._writesBySession.get(session);
+		const pending = previous ? Promise.all([previous.catch(() => undefined), write]).then(() => undefined) : write;
+		this._writesBySession.set(session, pending);
+		void pending.then(() => {
+			if (this._writesBySession.get(session) === pending) {
+				this._writesBySession.delete(session);
+			}
+		}, () => { /* Keep the failed save visible to restore until another save retries. */ });
+		return pending;
 	}
 
 	/**
@@ -87,6 +106,7 @@ export class AgentHostLocalTurns {
 	 * turns during restore.
 	 */
 	async loadForChat(session: string, chat: string): Promise<ILocalTurnRecord[]> {
+		await this._writesBySession.get(session);
 		const records = await this._load(session);
 		return records.filter(r => r.chatUri === chat);
 	}

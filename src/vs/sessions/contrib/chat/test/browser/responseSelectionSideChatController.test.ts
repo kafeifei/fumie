@@ -11,6 +11,8 @@ import { constObservable } from '../../../../../base/common/observable.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { upcastPartial } from '../../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
+import { TestClipboardService } from '../../../../../platform/clipboard/test/common/testClipboardService.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
 import { TestInstantiationService } from '../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
 import { INotificationHandle, INotificationService, Severity } from '../../../../../platform/notification/common/notification.js';
@@ -179,11 +181,21 @@ suite('ResponseSelectionSideChatController', () => {
 		}));
 		instantiationService.stub(INotificationService, notificationService);
 		instantiationService.stub(ILogService, new NullLogService());
+		const clipboardService = new TestClipboardService();
+		instantiationService.stub(IClipboardService, clipboardService);
 
 		const controller = store.add(instantiationService.createInstance(ResponseSelectionSideChatController, widget));
 		controller.setChat(chat);
 
-		return { controller, setSelection, setSelectionOutsideTranscript, setTranscriptRect, detachSelectedRow, scroll, autoScrollHolds: () => autoScrollHolds, callOrder, doc, chat, sideChat, focusResponseItemCalls, notificationService, highlightedRanges, inputHeight: () => inputDomNode(controller).offsetHeight };
+		return { controller, setSelection, setSelectionOutsideTranscript, setTranscriptRect, detachSelectedRow, scroll, autoScrollHolds: () => autoScrollHolds, callOrder, doc, chat, sideChat, focusResponseItemCalls, notificationService, clipboardService, highlightedRanges, inputHeight: () => overlayDomNode(controller).offsetHeight };
+	}
+
+	function overlayDomNode(controller: ResponseSelectionSideChatController): HTMLElement {
+		return (controller as unknown as { _overlay: HTMLElement })._overlay;
+	}
+
+	function copyButton(controller: ResponseSelectionSideChatController): HTMLButtonElement {
+		return (controller as unknown as { _copyButton: HTMLButtonElement })._copyButton;
 	}
 
 	function inputDomNode(controller: ResponseSelectionSideChatController): HTMLElement {
@@ -218,9 +230,28 @@ suite('ResponseSelectionSideChatController', () => {
 	test('shows the ask-question input for a valid markdown selection', () => {
 		const { controller, setSelection } = setup();
 		assert.strictEqual(inputDomNode(controller).style.display, 'none');
+		assert.strictEqual(overlayDomNode(controller).hidden, true);
 
 		setSelection('hello world');
 		assert.notStrictEqual(inputDomNode(controller).style.display, 'none');
+		assert.strictEqual(overlayDomNode(controller).hidden, false);
+		assert.strictEqual(copyButton(controller).textContent, 'Copy');
+	});
+
+	test('copies the selected markdown text from the overlay', async () => {
+		const { controller, setSelection, clipboardService } = setup();
+		setSelection('hello world');
+		copyButton(controller).click();
+		assert.strictEqual(await clipboardService.readText(), 'hello world');
+		assert.strictEqual(copyButton(controller).textContent, 'Copied');
+	});
+
+	test('shows Copy without Ask Question for a transcript selection that does not resolve to a single response', () => {
+		const { controller, setSelection } = setup({ getElementFromNode: () => undefined });
+		setSelection('hello world');
+
+		assert.strictEqual(inputDomNode(controller).style.display, 'none', 'Ask Question stays hidden for an unresolvable selection');
+		assert.strictEqual(overlayDomNode(controller).hidden, false, 'Copy still appears');
 	});
 
 	test('hides the input again once the selection is cleared', () => {
@@ -311,8 +342,8 @@ suite('ResponseSelectionSideChatController', () => {
 		setTranscriptRect({ top: 0, left: 0, width: 600, height: 20 });
 		setSelection('hello world', 10);
 
-		const style = inputDomNode(controller).style;
-		assert.notStrictEqual(style.display, 'none');
+		const style = overlayDomNode(controller).style;
+		assert.notStrictEqual(inputDomNode(controller).style.display, 'none');
 		assert.strictEqual(parseFloat(style.top), 0);
 	});
 
@@ -334,7 +365,7 @@ suite('ResponseSelectionSideChatController', () => {
 	test('follows the selection as the transcript scrolls instead of staying pinned', () => {
 		const { controller, setSelection, scroll } = setup();
 		setSelection('hello world', 100);
-		const style = inputDomNode(controller).style;
+		const style = overlayDomNode(controller).style;
 		const initialTop = parseFloat(style.top);
 
 		// The transcript scrolls the anchor up by 40px; the overlay must move with it.
@@ -353,7 +384,7 @@ suite('ResponseSelectionSideChatController', () => {
 
 		scroll(5000);
 
-		const top = parseFloat(inputDomNode(controller).style.top);
+		const top = parseFloat(overlayDomNode(controller).style.top);
 		assert.ok(top <= 300 - inputHeight(), `top ${top} must stay within the 300px transcript, not the 600px widget`);
 	});
 
@@ -367,8 +398,8 @@ suite('ResponseSelectionSideChatController', () => {
 		// Scroll the selection far above the transcript's top edge.
 		scroll(-800);
 
-		const style = inputDomNode(controller).style;
-		assert.notStrictEqual(style.display, 'none', 'the overlay stays visible at the edge');
+		const style = overlayDomNode(controller).style;
+		assert.notStrictEqual(inputDomNode(controller).style.display, 'none', 'the overlay stays visible at the edge');
 		assert.strictEqual(parseFloat(style.top), 100, 'parks at the transcript top, not the widget top');
 		assert.ok(inputHeight() > 0);
 	});
@@ -383,7 +414,7 @@ suite('ResponseSelectionSideChatController', () => {
 		// Scroll the selection far below the transcript's bottom edge.
 		scroll(900);
 
-		const top = parseFloat(inputDomNode(controller).style.top);
+		const top = parseFloat(overlayDomNode(controller).style.top);
 		assert.strictEqual(top, 300 - inputHeight(), 'parks flush with the transcript bottom');
 	});
 
@@ -392,7 +423,7 @@ suite('ResponseSelectionSideChatController', () => {
 		setTranscriptRect({ top: 0, left: 40, width: 120, height: 300 });
 		setSelection('hello world');
 
-		const left = parseFloat(inputDomNode(controller).style.left);
+		const left = parseFloat(overlayDomNode(controller).style.left);
 		assert.ok(left >= 40, `left ${left} must not start before the transcript's left edge`);
 		assert.ok(left <= 160, `left ${left} must not start past the transcript's right edge`);
 	});
@@ -424,7 +455,7 @@ suite('ResponseSelectionSideChatController', () => {
 		const { controller, setSelection, autoScrollHolds } = setup({ getElementFromNode: () => undefined });
 		setSelection('hello world');
 
-		assert.strictEqual(inputDomNode(controller).style.display, 'none', 'no affordance for an unresolvable selection');
+		assert.strictEqual(inputDomNode(controller).style.display, 'none', 'Ask Question stays hidden for an unresolvable selection');
 		assert.strictEqual(autoScrollHolds(), 1);
 	});
 

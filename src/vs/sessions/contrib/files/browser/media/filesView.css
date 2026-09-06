@@ -7,25 +7,49 @@
 	display: flex;
 	flex-direction: column;
 	height: 100%;
-	padding: 4px 8px;
+	padding: 8px 12px;
 	box-sizing: border-box;
 }
 
-/* Welcome/Empty state */
+/* Welcome/Empty state — quiet inspector, not workbench Welcome. */
 .files-empty-view-body .files-empty-welcome {
 	display: flex;
 	flex-direction: column;
 	align-items: center;
 	justify-content: center;
 	flex: 1;
-	padding: 32px;
+	padding: 32px 16px;
 	text-align: center;
-	gap: 8px;
+	gap: 4px;
+}
+
+.files-empty-view-body .files-empty-welcome-icon {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	margin-bottom: 6px;
+	color: var(--vscode-descriptionForeground);
+	opacity: 0.55;
+}
+
+.files-empty-view-body .files-empty-welcome-icon .codicon {
+	font-size: 18px;
+}
+
+.files-empty-view-body .files-empty-welcome-title {
+	color: var(--vscode-descriptionForeground);
+	font-size: var(--vscode-agents-fontSize-label1, 12px);
+	font-weight: var(--vscode-agents-fontWeight-medium, 500);
 }
 
 .files-empty-view-body .files-empty-welcome-message {
 	color: var(--vscode-descriptionForeground);
-	font-size: var(--vscode-agents-fontSize-label1);
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	max-width: 200px;
+	line-height: 1.45;
+	opacity: 0.85;
 }
 
 /* Sync Changes Action */

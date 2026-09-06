@@ -22,6 +22,56 @@ function agent(protectedResources: ProtectedResourceMetadata[] | undefined, mode
 	} as AgentInfo;
 }
 
+function nativeClaudeAgent(protectedResources: ProtectedResourceMetadata[]): AgentInfo {
+	return {
+		provider: 'claude',
+		displayName: 'Claude',
+		description: '',
+		models: [{ id: '@provider=anthropic:claude-sonnet-4-5' }],
+		protectedResources,
+	} as AgentInfo;
+}
+
+function customClaudeAgent(protectedResources: ProtectedResourceMetadata[]): AgentInfo {
+	return {
+		provider: 'claude',
+		displayName: 'Claude',
+		description: '',
+		models: [{ id: '@provider=custom:claude-opus-4-8' }],
+		protectedResources,
+	} as AgentInfo;
+}
+
+function customCodexAgent(protectedResources: ProtectedResourceMetadata[]): AgentInfo {
+	return {
+		provider: 'codex',
+		displayName: 'Codex',
+		description: '',
+		models: [{ id: '@provider=custom:codex/gpt-5.6-sol' }],
+		protectedResources,
+	} as AgentInfo;
+}
+
+function kimiAgent(protectedResources: ProtectedResourceMetadata[]): AgentInfo {
+	return {
+		provider: 'kimi',
+		displayName: 'Kimi',
+		description: '',
+		models: [{ id: 'moonshot/kimi-example' }],
+		protectedResources,
+	} as AgentInfo;
+}
+
+function copilotOnlyAgent(protectedResources: ProtectedResourceMetadata[]): AgentInfo {
+	return {
+		provider: 'copilotcli',
+		displayName: 'Copilot',
+		description: '',
+		models: [{ id: '@provider=copilot:gpt-5' }],
+		protectedResources,
+	} as AgentInfo;
+}
+
 const copilotRequired = GITHUB_COPILOT_PROTECTED_RESOURCE;
 const copilotOptional: ProtectedResourceMetadata = { ...GITHUB_COPILOT_PROTECTED_RESOURCE, required: false };
 
@@ -37,21 +87,33 @@ suite('Agent Host - session type auth requirement', () => {
 		// GitHub" even when neither half of the merged catalog could be enumerated.
 		// Its empty model catalog is what distinguishes it.
 		const cases = [
-			{ name: 'unresolved (no resources yet)', agent: agent(undefined, 4) },
+			{ name: 'unresolved (no resources, no models)', agent: agent(undefined, 0) },
+			{ name: 'published without resources (Kimi)', agent: agent(undefined, 4) },
 			{ name: 'proxy: Copilot required', agent: agent([copilotRequired], 4) },
 			{ name: 'proxy: required, no models', agent: agent([copilotRequired], 0) },
 			{ name: 'native with credentials', agent: agent([copilotOptional], 4) },
 			{ name: 'native WITHOUT credentials', agent: agent([copilotOptional], 0) },
+			{ name: 'Copilot required but native @provider=anthropic catalog', agent: nativeClaudeAgent([copilotRequired]) },
+			{ name: 'Copilot required but custom LiteLLM catalog', agent: customCodexAgent([copilotRequired]) },
+			{ name: 'Copilot required but Claude custom gateway catalog', agent: customClaudeAgent([copilotRequired]) },
+			{ name: 'Copilot required but Kimi bare catalog', agent: kimiAgent([copilotRequired]) },
+			{ name: 'Copilot required and exclusively Copilot-routed catalog', agent: copilotOnlyAgent([copilotRequired]) },
 		];
 
 		assert.deepStrictEqual(
 			cases.map(c => `${c.name}: ${resolveAgentAuthRequirement(c.agent)}`),
 			[
-				'unresolved (no resources yet): github',
+				'unresolved (no resources, no models): github',
+				'published without resources (Kimi): none',
 				'proxy: Copilot required: github',
 				'proxy: required, no models: github',
 				'native with credentials: none',
 				'native WITHOUT credentials: unusable',
+				'Copilot required but native @provider=anthropic catalog: none',
+				'Copilot required but custom LiteLLM catalog: none',
+				'Copilot required but Claude custom gateway catalog: none',
+				'Copilot required but Kimi bare catalog: none',
+				'Copilot required and exclusively Copilot-routed catalog: github',
 			],
 		);
 	});

@@ -45,6 +45,14 @@ suite('gitDiffContent', () => {
 		});
 	});
 
+	test('marks only explicitly resolved object IDs as immutable', () => {
+		const refQuery = JSON.parse(URI.parse(buildGitBlobUri('copilot:/abc', '0123456789abcdef0123456789abcdef01234567', 'src/app.ts', '/repo/src/app.ts')).query);
+		const oidQuery = JSON.parse(URI.parse(buildGitBlobUri('copilot:/abc', '0123456789abcdef0123456789abcdef01234567', 'src/app.ts', '/repo/src/app.ts', true)).query);
+
+		assert.strictEqual(refQuery.immutable, undefined);
+		assert.strictEqual(oidQuery.immutable, true);
+	});
+
 	test('returns undefined when the query is missing or incomplete', () => {
 		const noQuery = URI.from({ scheme: 'git-blob', path: '/src/app.ts' }).toString();
 		const partialQuery = URI.from({

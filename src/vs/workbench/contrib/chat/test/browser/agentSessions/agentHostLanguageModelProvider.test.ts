@@ -5,9 +5,12 @@
 
 import assert from 'assert';
 import { CancellationToken } from '../../../../../../base/common/cancellation.js';
+import { Emitter } from '../../../../../../base/common/event.js';
+import Severity from '../../../../../../base/common/severity.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
 import { SessionModelInfo } from '../../../../../../platform/agentHost/common/state/sessionState.js';
-import { ILanguageModelChatMetadata } from '../../../common/languageModels.js';
+import { IAgentHostModelProviderPresentation, IAgentHostModelProviderPresentationContext } from '../../../../../services/agentHost/browser/agentHostModelProviderPresentation.js';
+import { ILanguageModelChatMetadata, ILanguageModelChatProvider } from '../../../common/languageModels.js';
 import { AgentHostLanguageModelProvider } from '../../../browser/agentSessions/agentHost/agentHostLanguageModelProvider.js';
 
 suite('AgentHostLanguageModelProvider', () => {
@@ -20,6 +23,123 @@ suite('AgentHostLanguageModelProvider', () => {
 	function createProvider(): AgentHostLanguageModelProvider {
 		return store.add(new AgentHostLanguageModelProvider('agent-host-copilotcli', 'copilotcli'));
 	}
+
+	test('reports the same model availability status for every Agent Host vendor', async () => {
+		const results = [];
+		for (const vendor of ['codex', 'claude']) {
+			const provider = store.add(new AgentHostLanguageModelProvider(`agent-host-${vendor}`, vendor));
+			const languageModelProvider: ILanguageModelChatProvider = provider;
+			const options = { silent: false };
+			const loading = await languageModelProvider.provideLanguageModelChatStatus?.(options, CancellationToken.None);
+			provider.updateModels([]);
+			const empty = await languageModelProvider.provideLanguageModelChatStatus?.(options, CancellationToken.None);
+			provider.updateModels([{ id: 'model', provider: vendor, name: 'Model' }]);
+			const ready = await languageModelProvider.provideLanguageModelChatStatus?.(options, CancellationToken.None);
+			results.push({ vendor, loading, empty, ready });
+		}
+
+		assert.deepStrictEqual(results, [
+			{
+				vendor: 'codex',
+				loading: { message: 'Loading models…', severity: Severity.Info },
+				empty: { message: 'No models available', severity: Severity.Warning },
+				ready: undefined,
+			},
+			{
+				vendor: 'claude',
+				loading: { message: 'Loading models…', severity: Severity.Info },
+				empty: { message: 'No models available', severity: Severity.Warning },
+				ready: undefined,
+			},
+		]);
+	});
+
+	// An agent that owns its own model choice (the ACP connector) publishes a
+	// single placeholder row. It has no context window, no pricing and no
+	// config schema — the picker must still offer it and drop the empty state,
+	// otherwise the harness is unusable even though the agent is ready.
+	test('surfaces an agent-managed placeholder catalog as a selectable model', async () => {
+		const provider = store.add(new AgentHostLanguageModelProvider('agent-host-acp', 'agent-host-acp'));
+		const options = { silent: false };
+
+		provider.updateModels([{ id: 'agent-managed', provider: 'acp', name: 'Agent default', supportsVision: false }]);
+
+		assert.strictEqual(await provider.provideLanguageModelChatStatus(options, CancellationToken.None), undefined);
+		const models = await provider.provideLanguageModelChatInfo(options, CancellationToken.None);
+		assert.deepStrictEqual(models.map(model => [model.identifier, model.metadata.name, model.metadata.targetChatSessionType, model.metadata.isUserSelectable]), [
+			['agent-host-acp:agent-managed', 'Agent default', 'agent-host-acp', true],
+		]);
+	});
+
+	// A subscription's rows reach the picker through the provider the user added
+	// for it, so the agent's own vendor must not offer them a second time — but it
+	// must still publish them, or nothing can resolve the model a session is
+	// running back to a context window.
+	test('publishes an unselectable model but does not count it as an available one', async () => {
+		const provider = store.add(new AgentHostLanguageModelProvider('agent-host-claude', 'claude'));
+		const options = { silent: false };
+
+		provider.updateModels([{ id: '@provider=anthropic:claude-opus', provider: 'claude', name: 'Claude Opus', isUserSelectable: false }]);
+		const subscriptionOnly = await provider.provideLanguageModelChatStatus(options, CancellationToken.None);
+		const models = await provider.provideLanguageModelChatInfo(options, CancellationToken.None);
+
+		provider.updateModels([
+			{ id: '@provider=anthropic:claude-opus', provider: 'claude', name: 'Claude Opus', isUserSelectable: false },
+			{ id: '@provider=copilot:claude-opus', provider: 'claude', name: 'Claude Opus' },
+		]);
+		const withGateway = await provider.provideLanguageModelChatStatus(options, CancellationToken.None);
+
+		assert.deepStrictEqual(models.map(model => [model.identifier, model.metadata.isUserSelectable]), [
+			['claude:@provider=anthropic:claude-opus', false],
+		]);
+		// Nothing left to pick under this vendor reads as no models available, exactly
+		// as it did when the row was dropped instead of hidden.
+		assert.deepStrictEqual(subscriptionOnly, { message: 'No models available', severity: Severity.Warning });
+		assert.strictEqual(withGateway, undefined);
+	});
+
+	test('keeps projected models selectable without exposing a standalone empty Provider', async () => {
+		const provider = store.add(new AgentHostLanguageModelProvider('agent-host-projection', 'projection', 'projected'));
+		const options = { silent: false };
+
+		assert.strictEqual(await provider.provideLanguageModelChatStatus(options, CancellationToken.None), undefined);
+		provider.updateModels([]);
+		assert.strictEqual(await provider.provideLanguageModelChatStatus(options, CancellationToken.None), undefined);
+
+		provider.updateModels([{ id: 'shared/model', provider: 'projection', name: 'Shared model' }]);
+		const models = await provider.provideLanguageModelChatInfo(options, CancellationToken.None);
+		assert.deepStrictEqual(models.map(model => model.identifier), ['projection:shared/model']);
+	});
+
+	test('lets a generic presentation recover an owned Provider hidden by BYOK projections', async () => {
+		const presentationChanges = store.add(new Emitter<void>());
+		const contexts: IAgentHostModelProviderPresentationContext[] = [];
+		const presentation: IAgentHostModelProviderPresentation = {
+			onDidChange: presentationChanges.event,
+			provideStatus: context => {
+				contexts.push(context);
+				return context.hasNativeModels ? undefined : { message: 'Connect account', severity: Severity.Warning };
+			},
+		};
+		const provider = store.add(new AgentHostLanguageModelProvider('agent-host-owned', 'owned', 'owned', presentation));
+		let presentationRefreshes = 0;
+		store.add(provider.onDidChange(() => presentationRefreshes++));
+
+		provider.updateModels([makeModel('shared/model', { byokModelIdentifier: 'shared/model' })]);
+		assert.deepStrictEqual(await provider.provideLanguageModelChatStatus({}, CancellationToken.None), {
+			message: 'Connect account',
+			severity: Severity.Warning,
+		});
+		assert.deepStrictEqual(contexts.at(-1), { hasModelSnapshot: true, hasNativeModels: false });
+
+		presentationRefreshes = 0;
+		presentationChanges.fire();
+		assert.strictEqual(presentationRefreshes, 1);
+
+		provider.updateModels([makeModel('native-model')]);
+		assert.strictEqual(await provider.provideLanguageModelChatStatus({}, CancellationToken.None), undefined);
+		assert.deepStrictEqual(contexts.at(-1), { hasModelSnapshot: true, hasNativeModels: true });
+	});
 
 	test('renders the auto-mode discount as the Auto model detail (and a tooltip)', async () => {
 		const provider = createProvider();
@@ -126,6 +246,23 @@ suite('AgentHostLanguageModelProvider', () => {
 		});
 	});
 
+	// The bare id the agent's runtime reports is the only handle a turn replayed
+	// from a transcript has; if the vendor drops it here, nothing downstream can
+	// match that turn's model back to the row it was run on.
+	test('carries the underlying model id onto the published metadata, and omits it when the agent published none', async () => {
+		const provider = createProvider();
+		provider.updateModels([
+			{ id: '@provider=anthropic:claude-opus-4-8', underlyingModelId: 'claude-opus-4-8', provider: 'claude', name: 'Claude Opus 4.8' },
+			{ id: 'claude-haiku-4.5', provider: 'claude', name: 'Claude Haiku 4.5' },
+		]);
+
+		const infos = await provider.provideLanguageModelChatInfo(undefined, CancellationToken.None);
+		assert.deepStrictEqual(infos.map(info => ({ id: info.metadata.id, underlyingModelId: info.metadata.underlyingModelId })), [
+			{ id: '@provider=anthropic:claude-opus-4-8', underlyingModelId: 'claude-opus-4-8' },
+			{ id: 'claude-haiku-4.5', underlyingModelId: undefined },
+		]);
+	});
+
 	test('omits the model group when the provider is empty', async () => {
 		const provider = createProvider();
 		provider.updateModels([{ id: 'x', provider: '', name: 'X' }]);
@@ -158,6 +295,52 @@ suite('AgentHostLanguageModelProvider', () => {
 
 		const info = (await provider.provideLanguageModelChatInfo(undefined, CancellationToken.None))[0];
 		assert.deepStrictEqual(info.metadata.modelGroup, { id: 'chatgpt' });
+	});
+
+	test('projects service tier metadata into the generic performance group', async () => {
+		const provider = store.add(new AgentHostLanguageModelProvider('agent-host-codex', 'codex'));
+		provider.updateModels([{
+			id: 'gpt-5.6-sol',
+			provider: 'chatgpt',
+			name: 'GPT-5.6 Sol',
+			configSchema: {
+				type: 'object',
+				properties: {
+					thinkingLevel: { type: 'string', title: 'Thinking Effort', enum: ['medium'], enumLabels: ['Medium'] },
+					serviceTier: {
+						type: 'string',
+						title: 'Speed',
+						description: 'Select response speed',
+						enum: ['standard', 'priority'],
+						enumLabels: ['Standard', 'Fast'],
+						enumDescriptions: ['Default speed and usage', '1.5x speed, increased usage'],
+						default: 'standard',
+					},
+					contextSize: { type: 'number', title: 'Context Size', enum: [65536], enumLabels: ['64K'] },
+				},
+			},
+		}]);
+
+		const info = (await provider.provideLanguageModelChatInfo(undefined, CancellationToken.None))[0];
+		assert.deepStrictEqual(info.metadata.configurationSchema, {
+			type: 'object',
+			required: undefined,
+			properties: {
+				thinkingLevel: {
+					type: 'string', title: 'Thinking Effort', description: undefined, default: undefined,
+					enum: ['medium'], enumItemLabels: ['Medium'], enumDescriptions: undefined, readOnly: undefined, group: 'navigation',
+				},
+				serviceTier: {
+					type: 'string', title: 'Speed', description: 'Select response speed', default: 'standard',
+					enum: ['standard', 'priority'], enumItemLabels: ['Standard', 'Fast'],
+					enumDescriptions: ['Default speed and usage', '1.5x speed, increased usage'], readOnly: undefined, group: 'performance',
+				},
+				contextSize: {
+					type: 'number', title: 'Context Size', description: undefined, default: undefined,
+					enum: [65536], enumItemLabels: ['64K'], enumDescriptions: undefined, readOnly: undefined, group: 'tokens',
+				},
+			},
+		});
 	});
 
 	test('groups Claude models by transport provider: Copilot-routed vs native Anthropic', async () => {

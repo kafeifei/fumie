@@ -239,6 +239,65 @@ suite('AhpJsonlLogger', () => {
 		assert.ok(lines[1].length < 1024 * 1024);
 	});
 
+	test('elides a payload that is oversized in bytes but not in code units', async () => {
+		const fileService = store.add(new FileService(new NullLogService()));
+		store.add(fileService.registerProvider('file', store.add(new InMemoryFileSystemProvider())));
+
+		const logger = store.add(new AhpJsonlLogger(
+			{ logsHome: URI.file('/logs'), connectionId: 'conn:1', transport: 'websocket' },
+			fileService,
+			new NullLogService(),
+		));
+
+		// Every CJK character is one UTF-16 code unit but three UTF-8 bytes, so a
+		// budget measured in code units has to leave room for that. This payload
+		// is well under a mebi-code-unit yet ~1.5 MB once written — the shape that
+		// previously slipped past the trim and produced 78 MB log files.
+		const cjk = '中'.repeat(500_000);
+		logger.log({ jsonrpc: '2.0', id: 1, result: { data: cjk } }, 's2c');
+		await logger.flush();
+
+		const content = (await fileService.readFile(logger.resource)).value.toString();
+		const line = content.split('\n').filter(Boolean)[0];
+		const parsed = JSON.parse(line);
+
+		assert.ok(cjk.length < 1024 * 1024, 'payload is deliberately under a mebi-code-unit');
+		assert.strictEqual(parsed._ahpLog.truncated, true);
+		assert.ok(parsed.result.data.includes('chars elided'));
+		assert.ok(getAhpLogByteLength(line) < 1024 * 1024, `written line must stay under 1 MiB, got ${getAhpLogByteLength(line)} bytes`);
+	});
+
+	test('reports once and stops writing when the log store goes away', async () => {
+		const fileService = store.add(new FileService(new NullLogService()));
+		const provider = store.add(new ClosedStoreFileSystemProvider());
+		store.add(fileService.registerProvider('file', provider));
+		const logService = new CountingLogService();
+
+		const logger = store.add(new AhpJsonlLogger(
+			{ logsHome: URI.file('/logs'), connectionId: 'closed-store', transport: 'websocket' },
+			fileService,
+			logService,
+		));
+
+		// Messages keep arriving after the store is gone (e.g. the AHP traffic
+		// that still lands while the page unloads) — only the first failure is
+		// reported and nothing is retained.
+		for (let i = 0; i < 10; i++) {
+			logger.log({ jsonrpc: '2.0', id: i, result: 'x' }, 's2c');
+			await logger.flush();
+		}
+
+		assert.deepStrictEqual({
+			errors: logService.errorCount,
+			warnings: logService.warnCount,
+			writeAttempts: provider.writeCount,
+		}, {
+			errors: 0,
+			warnings: 1,
+			writeAttempts: 1,
+		});
+	});
+
 	suite('stringifyAhpLogEntry', () => {
 
 		test('serialises a top-level URI as its string form', () => {
@@ -295,5 +354,25 @@ class RecordingInMemoryFileSystemProvider extends InMemoryFileSystemProvider {
 	override async writeFile(resource: URI, content: Uint8Array, opts: IFileWriteOptions): Promise<void> {
 		this.writeCount++;
 		return super.writeFile(resource, content, opts);
+	}
+}
+
+/** Stands in for the web IndexedDB store after it has been closed for good. */
+class ClosedStoreFileSystemProvider extends InMemoryFileSystemProvider {
+	writeCount = 0;
+	override async writeFile(): Promise<void> {
+		this.writeCount++;
+		throw new Error(`IndexedDB database 'vscode-web-db' is closed.`);
+	}
+}
+
+class CountingLogService extends NullLogService {
+	warnCount = 0;
+	errorCount = 0;
+	override warn(): void {
+		this.warnCount++;
+	}
+	override error(): void {
+		this.errorCount++;
 	}
 }

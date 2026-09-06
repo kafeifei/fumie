@@ -19,13 +19,13 @@ suite('Copilot PermissionPicker', () => {
 		})), [
 			{
 				level: ChatPermissionLevel.Default,
-				label: 'Default permissions',
-				detail: 'Asks when approval settings don\'t apply',
+				label: 'Default Permissions',
+				detail: 'Ask when needed',
 			},
 			{
 				level: ChatPermissionLevel.AutoApprove,
-				label: 'Allow all',
-				detail: 'Runs tool calls without asking',
+				label: 'Full Access',
+				detail: 'Run tools without asking',
 			},
 			{
 				level: ChatPermissionLevel.Autopilot,

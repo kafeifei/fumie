@@ -1,0 +1,75 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.monaco-action-bar .action-item.agent-sessions-titlebar-workspace {
+	display: flex;
+	align-items: center;
+	height: 22px;
+	cursor: default;
+	-webkit-app-region: no-drag;
+}
+
+.agent-sessions-titlebar-workspace-row {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	min-width: 0;
+	height: 22px;
+}
+
+.monaco-action-bar .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	flex: 0 0 auto;
+	max-width: 180px;
+	height: 22px;
+	padding: 0 6px;
+	border: none;
+	border-radius: var(--vscode-cornerRadius-small);
+	background: transparent;
+	color: var(--vscode-titleBar-activeForeground);
+	font-size: var(--vscode-agents-fontSize-label1, 12px);
+	opacity: 0.75;
+	cursor: pointer;
+	-webkit-app-region: no-drag;
+	overflow: hidden;
+}
+
+.monaco-action-bar .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip .codicon {
+	font-size: var(--vscode-codiconFontSize-compact, 12px);
+	width: var(--vscode-codiconFontSize-compact, 12px);
+	height: var(--vscode-codiconFontSize-compact, 12px);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+}
+
+.monaco-action-bar .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip-label {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.monaco-action-bar .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip:hover {
+	background-color: var(--vscode-toolbar-hoverBackground);
+	opacity: 1;
+}
+
+.monaco-action-bar .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.monaco-action-bar .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip.static {
+	cursor: default;
+}
+
+.monaco-action-bar .action-item.agent-sessions-titlebar-workspace .agent-sessions-titlebar-chip.static:hover {
+	background-color: transparent;
+	opacity: 0.75;
+}

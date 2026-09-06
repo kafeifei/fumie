@@ -6,7 +6,7 @@
 import { IMarkdownString, MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { localize } from '../../../../../nls.js';
 import { ChatEntitlement, IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
-import { IChatSessionsService, SessionType } from '../../common/chatSessionsService.js';
+import { IChatSessionsService, isLocalAgentHostTarget } from '../../common/chatSessionsService.js';
 import { ILanguageModelsService } from '../../common/languageModels.js';
 
 /**
@@ -39,7 +39,9 @@ export function getSessionTypePickerAvailability(type: string, availability: Ses
 	if (!allowSignedOutWhenUsable) {
 		return availability;
 	}
-	if (type === SessionType.AgentHostCopilot && availability === SessionTypeAvailability.SignInRequired) {
+	// Fumie's native Agent Host providers use their own credentials, so every
+	// local Agent Host target remains selectable without a Copilot sign-in.
+	if (isLocalAgentHostTarget(type) && availability === SessionTypeAvailability.SignInRequired) {
 		return SessionTypeAvailability.Available;
 	}
 	if (hasSetupBanner && availability === SessionTypeAvailability.NoModels) {
@@ -133,6 +135,7 @@ export function hasVisibleByokModelsTargetingSessionType(languageModelsService: 
 		return metadata?.targetChatSessionType === type
 			&& byokIdentifier !== undefined
 			&& byokSource?.isBYOK === true
+			&& !metadata.byokModelHidden
 			&& !languageModelsService.isModelHidden(id)
 			&& !languageModelsService.isModelHidden(byokIdentifier);
 	});

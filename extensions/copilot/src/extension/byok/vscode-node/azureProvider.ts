@@ -140,7 +140,10 @@ export class AzureBYOKModelProvider extends AbstractCustomOAIBYOKModelProvider {
 			streaming: modelConfiguration?.streaming,
 			requestHeaders: modelConfiguration?.requestHeaders,
 			editTools: model.capabilities?.editTools?.filter(isEndpointEditToolName),
-			zeroDataRetentionEnabled: modelConfiguration?.zeroDataRetentionEnabled
+			zeroDataRetentionEnabled: modelConfiguration?.zeroDataRetentionEnabled,
+			supportsReasoningEffort: modelConfiguration?.supportsReasoningEffort,
+			defaultReasoningEffort: modelConfiguration?.defaultReasoningEffort,
+			reasoningEffortFormat: modelConfiguration?.reasoningEffortFormat
 		};
 		const modelInfo = resolveModelInfo(model.id, this._name, undefined, modelCapabilities);
 		// Mirror the API-key path (customOAIProvider.createOpenAIEndPoint): when the resolved Azure URL

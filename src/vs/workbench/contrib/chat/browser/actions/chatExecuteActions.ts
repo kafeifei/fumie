@@ -45,6 +45,8 @@ export interface IVoiceChatExecuteActionContext {
 }
 
 export interface IChatExecuteActionContext {
+	/** Input target for standalone composers without a transcript widget. */
+	inputEditor?: IChatWidget['inputEditor'];
 	widget?: IChatWidget;
 	inputValue?: string;
 	acceptInputOptions?: IChatAcceptInputOptions;

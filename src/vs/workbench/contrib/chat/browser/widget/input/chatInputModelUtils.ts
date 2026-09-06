@@ -115,12 +115,16 @@ export const getAgentHostByokManageModelsIdentifier = ILanguageModelChatMetadata
  * identifier (see {@link getAgentHostByokManageModelsIdentifier}) — which includes
  * any user-configured provider group carried across the bridge — so a BYOK model
  * hidden in Manage Models is also hidden in the agent-host picker.
+ *
+ * A copy may also arrive already marked hidden by the host that owns the provider
+ * configuration. This window may hold no visibility state for it at all — that is
+ * the Agents window in a browser — so the host's answer stands on its own.
  */
 export function isModelHiddenInPicker(
 	model: ILanguageModelChatMetadataAndIdentifier,
 	isModelHidden: (identifier: string) => boolean,
 ): boolean {
-	if (isModelHidden(model.identifier)) {
+	if (model.metadata.byokModelHidden || isModelHidden(model.identifier)) {
 		return true;
 	}
 	const manageModelsIdentifier = getAgentHostByokManageModelsIdentifier(model.metadata);

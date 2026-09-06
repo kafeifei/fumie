@@ -83,6 +83,21 @@ suite('LayoutController (desktop)', () => {
 		return store.add(harness.instaService.createInstance(TestSinglePaneController));
 	}
 
+	/**
+	 * Creates a single-pane controller with an explicit Editor-visible Existing
+	 * profile. Tests that exercise editor/detail and managed-tab transitions need
+	 * this precondition instead of inheriting Fumie's details-only product default.
+	 */
+	function createEditorVisibleSinglePaneController(options: ICreateOptions = {}): TestSinglePaneController {
+		return createSinglePaneController({
+			...options,
+			sidePaneVisibilityState: {
+				newSession: { editorVisible: false, auxiliaryBarVisible: true },
+				existingSession: { editorVisible: true, auxiliaryBarVisible: true },
+			},
+		});
+	}
+
 	function makeFileEditor(path: string = '/repo/package.json'): FileEditorInput {
 		const fileEditor = Object.create(FileEditorInput.prototype) as FileEditorInput;
 		Object.defineProperty(fileEditor, 'resource', { value: URI.file(path) });
@@ -179,11 +194,65 @@ suite('LayoutController (desktop)', () => {
 		});
 	});
 
-	test('[D3d] does not switch a side pane that is already showing Files when a change lands', () => {
+	test('[D6b] jumps from Files to Changes when the session first becomes dirty', () => {
 		createController();
 		const session = makeSession(URI.parse('session:1'), { status: SessionStatus.Untitled });
 		harness.activeSessionObs.set(session, undefined);
 		harness.activePaneCompositeId = SESSIONS_FILES_CONTAINER_ID;
+		harness.partVisibility.set(Parts.AUXILIARYBAR_PART, true);
+
+		harness.openedViews = [];
+		harness.openedViewContainers = [];
+		(session.changes as ISettableObservable<readonly ISessionFileChange[]>).set([makeChange('/file.ts')], undefined);
+
+		assert.deepStrictEqual({
+			openedFiles: harness.openedViewContainers.includes(SESSIONS_FILES_CONTAINER_ID),
+			openedChanges: harness.openedViews.includes(CHANGES_VIEW_ID),
+		}, {
+			openedFiles: false,
+			openedChanges: true,
+		});
+	});
+
+	test('[D6b] keeps Files after the user switches back, even when more edits land', () => {
+		createController();
+		const session = makeSession(URI.parse('session:1'), { status: SessionStatus.Untitled });
+		harness.activeSessionObs.set(session, undefined);
+		harness.activePaneCompositeId = SESSIONS_FILES_CONTAINER_ID;
+		harness.partVisibility.set(Parts.AUXILIARYBAR_PART, true);
+
+		(session.changes as ISettableObservable<readonly ISessionFileChange[]>).set([makeChange('/file.ts')], undefined);
+		assert.ok(harness.openedViews.includes(CHANGES_VIEW_ID), 'first dirty should jump to Changes');
+
+		harness.activePaneCompositeId = SESSIONS_FILES_CONTAINER_ID;
+		harness.onDidChangeViewContainerVisibility.fire({
+			id: SESSIONS_FILES_CONTAINER_ID,
+			visible: true,
+			location: ViewContainerLocation.AuxiliaryBar,
+		});
+
+		harness.openedViews = [];
+		harness.openedViewContainers = [];
+		(session.changes as ISettableObservable<readonly ISessionFileChange[]>).set(
+			[makeChange('/file.ts'), makeChange('/other.ts')],
+			undefined,
+		);
+
+		assert.deepStrictEqual({
+			openedFiles: harness.openedViewContainers.includes(SESSIONS_FILES_CONTAINER_ID),
+			openedChanges: harness.openedViews.includes(CHANGES_VIEW_ID),
+		}, {
+			openedFiles: false,
+			openedChanges: false,
+		});
+	});
+
+	test('[D6b] does not open a hidden side pane when the session becomes dirty', () => {
+		createController();
+		const session = makeSession(URI.parse('session:1'), { status: SessionStatus.Untitled });
+		harness.activeSessionObs.set(session, undefined);
+		harness.partVisibility.set(Parts.AUXILIARYBAR_PART, false);
+		harness.onDidChangePartVisibility.fire({ partId: Parts.AUXILIARYBAR_PART, visible: false });
 
 		harness.openedViews = [];
 		harness.openedViewContainers = [];
@@ -196,6 +265,39 @@ suite('LayoutController (desktop)', () => {
 			openedFiles: false,
 			openedChanges: false,
 		});
+	});
+
+	test('[D3b] remembers an explicit Files tab across new sessions even when the next draft is dirty', () => {
+		createController();
+		const sessionA = makeSession(URI.parse('session:a'), { status: SessionStatus.Untitled });
+		harness.activeSessionObs.set(sessionA, undefined);
+		harness.activePaneCompositeId = SESSIONS_FILES_CONTAINER_ID;
+		harness.partVisibility.set(Parts.AUXILIARYBAR_PART, true);
+
+		(sessionA.changes as ISettableObservable<readonly ISessionFileChange[]>).set([makeChange('/a.ts')], undefined);
+		harness.activePaneCompositeId = SESSIONS_FILES_CONTAINER_ID;
+		harness.onDidChangeViewContainerVisibility.fire({
+			id: SESSIONS_FILES_CONTAINER_ID,
+			visible: true,
+			location: ViewContainerLocation.AuxiliaryBar,
+		});
+
+		harness.openedViews = [];
+		harness.openedViewContainers = [];
+		const sessionB = makeSession(URI.parse('session:b'), {
+			status: SessionStatus.Untitled,
+			changes: [makeChange('/b.ts')],
+		});
+		harness.activeSessionObs.set(sessionB, undefined);
+
+		assert.ok(
+			harness.openedViewContainers.includes(SESSIONS_FILES_CONTAINER_ID),
+			'should reopen the user\'s Files tab on the next new session'
+		);
+		assert.ok(
+			!harness.openedViews.includes(CHANGES_VIEW_ID),
+			'should not fall back to the dirty D3d default'
+		);
 	});
 
 	test('[D3d] does not force-open Files when the Files pane is hidden', () => {
@@ -325,7 +427,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[single-pane] hides details for self-contained editors and restores them for files', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await timeout(0);
 		const hasDockedDetails = () => harness.contextKeyService.getContextKeyValue(HasDockedDetailsContext.key);
 
@@ -354,7 +456,7 @@ suite('LayoutController (desktop)', () => {
 
 		harness.setPartHiddenCalls = [];
 		harness.openedViewContainers = [];
-		harness.activeEditorInput = store.add(new EmptyFileEditorInput(undefined, harness.layoutService));
+		harness.activeEditorInput = makeFileEditor();
 		harness.onDidActiveEditorChange.fire();
 		assert.strictEqual(hasDockedDetails(), true, 'files target should enable the editor chevron context');
 		await timeout(0);
@@ -412,7 +514,7 @@ suite('LayoutController (desktop)', () => {
 		);
 
 		harness.setPartHiddenCalls = [];
-		harness.activeEditorInput = store.add(new EmptyFileEditorInput(undefined, harness.layoutService));
+		harness.activeEditorInput = makeFileEditor();
 		harness.onDidActiveEditorChange.fire();
 		await timeout(0);
 		assert.ok(
@@ -453,7 +555,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[single-pane] Hide Editor while a Browser tab is active shows the Changes/Files fallback instead of hiding it again', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await timeout(0);
 		const hasDockedDetails = () => harness.contextKeyService.getContextKeyValue(HasDockedDetailsContext.key);
 
@@ -488,7 +590,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[single-pane] hides the detail panel when the main editor part is empty and keeps it closed on tab open', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await timeout(0);
 		const hasDockedDetails = () => harness.contextKeyService.getContextKeyValue(HasDockedDetailsContext.key);
 
@@ -855,7 +957,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[single-pane] persists resize-driven Details visibility for Existing Sessions', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await timeout(0);
 		harness.activeSessionObs.set(makeSession(URI.parse('session:existing')), undefined);
 		await timeout(0);
@@ -2686,7 +2788,7 @@ suite('LayoutController (desktop)', () => {
 	}
 
 	test('[managed tabs] ensures the Changes and Files tabs for a created session under suppression', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		harness.activeSessionObs.set(makeSession(URI.parse('session:1')), undefined);
@@ -2703,7 +2805,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs] updates the Files root when the active session changes', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		const first = makeSession(URI.parse('session:1'), {
@@ -3014,7 +3116,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / details-only] restores Files when the editor area hides without an editor change', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		harness.activeSessionObs.set(makeSession(URI.parse('session:1')), undefined);
@@ -3039,7 +3141,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / details-only] an editor reveal does NOT force back a closed managed tab', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		harness.activeSessionObs.set(makeSession(URI.parse('session:1')), undefined);
@@ -3389,7 +3491,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / lifecycle removal] does not re-open a missing managed tab while the group stays non-empty', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		harness.activeSessionObs.set(makeSession(URI.parse('session:1')), undefined);
@@ -3408,7 +3510,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / close] re-opens the default tabs for the new session after switching (empty group)', async () => {
-		const controller = createSinglePaneController({ activateAux: true });
+		const controller = createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		harness.activeSessionObs.set(makeSession(URI.parse('session:1')), undefined);
@@ -3435,7 +3537,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / session switch] preserves a dismissed Files tab while replacing Changes in place', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		const session1 = makeSession(URI.parse('session:1'));
@@ -3465,7 +3567,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / session switch] removes a dismissed Files tab restored by a previously visited session', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		const sessionA = makeSession(URI.parse('session:a'));
@@ -3528,7 +3630,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / add-tab] a missing Changes tab flips SinglePaneChangesTabMissingContext', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		harness.activeSessionObs.set(makeSession(URI.parse('session:1')), undefined);
@@ -3550,7 +3652,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / add-tab] a missing Files tab flips SinglePaneFilesTabMissingContext', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		harness.activeSessionObs.set(makeSession(URI.parse('session:1')), undefined);
@@ -3572,7 +3674,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / add-tab] reopening the Changes tab clears the missing context and is retained', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		const session = URI.parse('session:1');
@@ -3604,7 +3706,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / add-tab] reopening managed tabs from the plus menu adds them at the end', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		const session = URI.parse('session:1');
@@ -3641,7 +3743,7 @@ suite('LayoutController (desktop)', () => {
 	});
 
 	test('[managed tabs / session switch] replaces a stale Changes tab in place', async () => {
-		createSinglePaneController({ activateAux: true });
+		createEditorVisibleSinglePaneController({ activateAux: true });
 		await settle();
 
 		// A stale Changes tab for a previous session is restored into the group.

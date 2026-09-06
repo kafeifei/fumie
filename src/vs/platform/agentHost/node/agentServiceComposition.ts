@@ -38,7 +38,6 @@ import { AgentServerToolHost } from './shared/agentServerToolHost.js';
 import { buildServerToolGroups } from './shared/serverToolGroups.js';
 import { type IAgentServiceFoundation } from './agentServiceFoundation.js';
 import { IAgentHostOctoKitService } from './shared/agentHostOctoKitService.js';
-import { ICopilotApiService } from './shared/copilotApiService.js';
 
 export interface IAgentServiceComposition {
 	readonly agentService: AgentService;
@@ -98,7 +97,6 @@ export function createAgentServiceComposition(
 		};
 		// AgentService subscribes after this graph is complete, so collaborator constructors must not emit state-manager events.
 		const octoKitService = accessor.get(IAgentHostOctoKitService);
-		const copilotApiService = accessor.get(ICopilotApiService);
 		const customizationEnablementService = accessor.get(IAgentHostCustomizationEnablementService);
 		if (!supportsCustomizationEnablementWorktreeBinding(customizationEnablementService)) {
 			throw new Error('AgentService requires customization enablement worktree binding support');
@@ -130,11 +128,6 @@ export function createAgentServiceComposition(
 				localTurns,
 				agents,
 				hostLaunchKind: options.hostLaunchKind ?? AgentHostLaunchKind.Unknown,
-				copilotApiService,
-				getGitHubCopilotToken: () => {
-					const resource = gitHubEndpointService.getCopilotResource();
-					return core.authenticationService.getAuthToken({ resource: resource.resource, scopes: resource.scopes_supported });
-				},
 				getGitHubToken: () => {
 					const resource = gitHubEndpointService.getRepoResource();
 					return core.authenticationService.getAuthToken({ resource: resource.resource, scopes: resource.scopes_supported });

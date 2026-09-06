@@ -17,7 +17,9 @@ import { getResolvedShellEnv } from '../../shell/node/shellEnv.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { IAgentHostConnection, IAgentHostStarter } from '../common/agent.js';
 import { AgentHostLaunchKind, AgentHostLaunchKindEnvVar, telemetryLevelToAgentHostValue } from '../common/agentHostTelemetry.js';
-import { AgentHostClaudeAgentEnabledSettingId, AgentHostCodexAgentBinaryArgsSettingId, AgentHostCodexAgentEnabledSettingId, AgentHostCodexAgentSdkRootSettingId, AgentHostCodexAgentCodexHomeSettingId, AgentHostIpcChannels, AgentHostOTelCaptureContentSettingId, AgentHostOTelDbSpanExporterEnabledSettingId, AgentHostOTelEnabledSettingId, AgentHostOTelExporterTypeSettingId, AgentHostOTelOtlpEndpointSettingId, AgentHostOTelOtlpProtocolSettingId, AgentHostOTelOutfileSettingId, AgentHostOTelResourceAttributesSettingId, AgentHostOTelServiceNameSettingId, buildAgentHostOTelEnv, buildAgentSdkEnv, IAgentHostManagementService } from '../common/agentService.js';
+import { AgentHostAcpAgentEnabledSettingId, AgentHostClaudeAgentEnabledSettingId, AgentHostCodexAgentBinaryArgsSettingId, AgentHostCodexAgentBinaryPathSettingId, AgentHostCodexAgentEnabledSettingId, AgentHostCodexAgentSdkRootSettingId, AgentHostCodexAgentCodexHomeSettingId, AgentHostDeepSeekAgentEnabledSettingId, AgentHostIpcChannels, AgentHostKimiAgentEnabledSettingId, AgentHostOTelCaptureContentSettingId, AgentHostOTelDbSpanExporterEnabledSettingId, AgentHostOTelEnabledSettingId, AgentHostOTelExporterTypeSettingId, AgentHostOTelOtlpEndpointSettingId, AgentHostOTelOtlpProtocolSettingId, AgentHostOTelOutfileSettingId, AgentHostOTelResourceAttributesSettingId, AgentHostOpencodeAgentEnabledSettingId, AgentHostOTelServiceNameSettingId, AgentHostPiAgentEnabledSettingId, buildAgentHostOTelEnv, buildAgentSdkEnv, IAgentHostManagementService } from '../common/agentService.js';
+import { AgentHostLegacyUserDataDirEnvVar, applyAgentHostProductEnv, getAgentHostUserDataPath } from '../common/agentHostProductEnv.js';
+import product from '../../product/common/product.js';
 import '../common/agentHostStarter.config.contribution.js';
 
 /**
@@ -83,9 +85,15 @@ export class NodeAgentHostStarter extends Disposable implements IAgentHostStarte
 		const sdkEnv = buildAgentSdkEnv({
 			codexSdkRoot: this._configurationService.getValue<string>(AgentHostCodexAgentSdkRootSettingId),
 			codexHome: this._configurationService.getValue<string>(AgentHostCodexAgentCodexHomeSettingId),
+			codexBinaryPath: this._configurationService.getValue<string>(AgentHostCodexAgentBinaryPathSettingId),
 			codexBinaryArgs: this._configurationService.getValue<readonly string[]>(AgentHostCodexAgentBinaryArgsSettingId),
 			claudeAgentEnabled: this._configurationService.getValue<boolean>(AgentHostClaudeAgentEnabledSettingId),
 			codexAgentEnabled: this._configurationService.getValue<boolean>(AgentHostCodexAgentEnabledSettingId),
+			kimiAgentEnabled: this._configurationService.getValue<boolean>(AgentHostKimiAgentEnabledSettingId),
+			deepSeekAgentEnabled: this._configurationService.getValue<boolean>(AgentHostDeepSeekAgentEnabledSettingId),
+			piAgentEnabled: this._configurationService.getValue<boolean>(AgentHostPiAgentEnabledSettingId),
+			acpAgentEnabled: this._configurationService.getValue<boolean>(AgentHostAcpAgentEnabledSettingId),
+			opencodeAgentEnabled: this._configurationService.getValue<boolean>(AgentHostOpencodeAgentEnabledSettingId),
 		}, process.env);
 		Object.assign(env, sdkEnv);
 
@@ -112,6 +120,11 @@ export class NodeAgentHostStarter extends Disposable implements IAgentHostStarte
 			resourceAttributes: policyValue<Record<string, string>>(AgentHostOTelResourceAttributesSettingId),
 		});
 		Object.assign(env, otelEnv);
+		applyAgentHostProductEnv(env, product); // Fumie/Codex/Copilot defaults + `~` expansion; keep out of providers
+		const agentHostUserDataPath = getAgentHostUserDataPath(this._environmentService.userDataPath, env);
+		if (agentHostUserDataPath !== this._environmentService.userDataPath) {
+			env[AgentHostLegacyUserDataDirEnvVar] = this._environmentService.userDataPath;
+		}
 
 		// Forward WebSocket server configuration to the child process via env vars
 		if (this._wsConfig) {
@@ -132,7 +145,7 @@ export class NodeAgentHostStarter extends Disposable implements IAgentHostStarte
 		const args = [
 			'--type=agentHost',
 			'--logsPath', this._environmentService.logsHome.with({ scheme: Schemas.file }).fsPath,
-			'--user-data-dir', this._environmentService.userDataPath,
+			'--user-data-dir', agentHostUserDataPath,
 			'--telemetry-level', telemetryLevelToAgentHostValue(this._telemetryService.telemetryLevel),
 		];
 

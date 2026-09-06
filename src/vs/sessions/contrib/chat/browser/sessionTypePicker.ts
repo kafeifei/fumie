@@ -6,17 +6,19 @@
 import * as dom from '../../../../base/browser/dom.js';
 import { Gesture, EventType as TouchEventType } from '../../../../base/browser/touch.js';
 import { Codicon } from '../../../../base/common/codicons.js';
+import { ThemeIcon } from '../../../../base/common/themables.js';
 import { Disposable, DisposableStore, MutableDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { renderIcon } from '../../../../base/browser/ui/iconLabel/iconLabels.js';
 import { localize } from '../../../../nls.js';
 import { IActionWidgetService } from '../../../../platform/actionWidget/browser/actionWidget.js';
+import { withActionWidgetDropdownMotion } from '../../../../platform/actionWidget/browser/actionWidgetDropdown.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { ActionListItemKind, IActionListDelegate, IActionListItem } from '../../../../platform/actionWidget/browser/actionList.js';
 import { IProviderSessionType, ISessionsManagementService } from '../../../services/sessions/common/sessionsManagement.js';
 import { ISessionsProvidersService } from '../../../services/sessions/browser/sessionsProvidersService.js';
 import { autorun, IObservable, observableValue } from '../../../../base/common/observable.js';
-import { ISession, SessionStatus } from '../../../services/sessions/common/session.js';
+import { ISession, ISessionType, SessionStatus, SessionTypeAuthRequirement } from '../../../services/sessions/common/session.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { isWeb } from '../../../../base/common/platform.js';
 import { isEqual } from '../../../../base/common/resources.js';
@@ -34,7 +36,8 @@ import { reportNewChatPickerClosed } from './newChatPickerTelemetry.js';
 import { SessionHarnessPickerVisibleContext } from '../../../common/contextkeys.js';
 import { isAllowSignedOutWhenUsableEnabled } from '../../../browser/sessionsAuthGate.js';
 
-const STORAGE_KEY_LAST_SESSION_TYPE = 'sessions.userSelectedSessionType';
+/** Storage key for the user's last-picked session type, shared with the Agent Settings view. */
+export const STORAGE_KEY_LAST_SESSION_TYPE = 'sessions.userSelectedSessionType';
 
 /**
  * A picked session type, paired with the provider that serves it. Two
@@ -65,6 +68,32 @@ function pickEquals(a: IPreferredSessionType | undefined, b: IPreferredSessionTy
 interface IStoredSessionTypePick {
 	readonly providerId?: string;
 	readonly sessionTypeId: string;
+}
+
+/**
+ * The session type the user last picked, as stored profile-wide. Exported so the new-session
+ * composer can name the same default before there is a session (or a folder) to read one from.
+ */
+export function readPreferredSessionType(storageService: IStorageService): IPreferredSessionType | undefined {
+	const raw = storageService.get(STORAGE_KEY_LAST_SESSION_TYPE, StorageScope.PROFILE);
+	if (!raw) {
+		return undefined;
+	}
+	// Try parsing as the new JSON shape first; fall back to the legacy
+	// shape where only the sessionTypeId string was stored.
+	try {
+		const parsed = JSON.parse(raw) as IStoredSessionTypePick;
+		if (parsed && typeof parsed.sessionTypeId === 'string') {
+			return typeof parsed.providerId === 'string'
+				? { providerId: parsed.providerId, sessionTypeId: parsed.sessionTypeId }
+				: { sessionTypeId: parsed.sessionTypeId };
+		}
+	} catch {
+		// Not JSON — fall through to legacy raw-string handling.
+	}
+	// Legacy raw string was just the session type id. Resolution to a
+	// provider happens lazily once the active folder is known.
+	return { sessionTypeId: raw };
 }
 
 /** Default telemetry source used when the picker serves the New Session composer. */
@@ -103,6 +132,8 @@ interface ISessionTypePickerItem {
 	readonly sessionTypeId: string;
 	readonly label: string;
 	readonly checked?: boolean;
+	/** Set when the type's SDK install failed: selecting requests a retry instead of picking. */
+	readonly sdkRetry?: boolean;
 	/**
 	 * Provider display label, set when the picker shows section headers so the
 	 * accessibility label can disambiguate same-named types (e.g. "Claude")
@@ -323,6 +354,26 @@ export class SessionTypePicker extends Disposable {
 	}
 
 	/**
+	 * Apply a harness pick as if the user chose it in the dropdown. Used by
+	 * the new-session composer when a model selection implies a different
+	 * advertised session type.
+	 */
+	selectSessionType(pick: IPickedSessionType): void {
+		this._handleSelectedSessionType(pick);
+	}
+
+	/**
+	 * A type the agent-host already marked usable without GitHub stays
+	 * selectable even when the workbench availability helper still reports
+	 * Sign-in / No models (e.g. Kimi publishing no protected resources, or
+	 * Claude native while Copilot is signed out).
+	 */
+	protected _isSessionTypeDisabled(sessionType: ISessionType, availability: SessionTypeAvailability): boolean {
+		return sessionType.authRequirement !== SessionTypeAuthRequirement.None
+			&& availability !== SessionTypeAvailability.Available;
+	}
+
+	/**
 	 * The session types to offer for a session: all quick-chat types when the
 	 * session is a workspace-less quick chat, otherwise the folder's types.
 	 */
@@ -459,6 +510,34 @@ export class SessionTypePicker extends Disposable {
 			}
 			for (const { providerId, sessionType } of types) {
 				const isCurrent = this._picked?.providerId === providerId && this._picked?.sessionTypeId === sessionType.id;
+				// An agent whose SDK the host is still preparing (or failed to
+				// prepare) is listed but cannot start a session: installing rows
+				// are disabled with a spinner, failed rows retry on select.
+				const readiness = sessionType.sdkReadiness;
+				if (readiness) {
+					const installing = readiness.state === 'installing';
+					groupedItems.push({
+						kind: ActionListItemKind.Action,
+						label: sessionType.label,
+						disabled: installing,
+						description: installing
+							? localize('sessionTypePicker.sdkInstalling', "Setting up…")
+							: localize('sessionTypePicker.sdkFailed', "Setup failed — select to retry"),
+						...(readiness.error ? { hover: { content: readiness.error } } : {}),
+						group: {
+							title: '',
+							icon: installing ? ThemeIcon.modify(Codicon.loading, 'spin') : Codicon.warning,
+						},
+						item: {
+							providerId,
+							sessionTypeId: sessionType.id,
+							label: sessionType.label,
+							...(installing ? {} : { sdkRetry: true }),
+							...(showSectionHeaders ? { groupLabel: groupTitle } : {}),
+						},
+					});
+					continue;
+				}
 				const modelTarget = sessionType.chatSessionType ?? sessionType.id;
 				const allowSignedOutWhenUsable = isAllowSignedOutWhenUsableEnabled(this.configurationService);
 				const availability = getSessionTypePickerAvailability(
@@ -467,7 +546,7 @@ export class SessionTypePicker extends Disposable {
 					allowSignedOutWhenUsable,
 					hasAgentSdkSetupNotification(this.chatInputNotificationService, modelTarget),
 				);
-				const unavailable = availability !== SessionTypeAvailability.Available;
+				const unavailable = this._isSessionTypeDisabled(sessionType, availability);
 				const item: ISessionTypePickerItem = {
 					providerId,
 					sessionTypeId: sessionType.id,
@@ -496,6 +575,10 @@ export class SessionTypePicker extends Disposable {
 		const delegate: IActionListDelegate<ISessionTypePickerItem> = {
 			onSelect: (item) => {
 				this.actionWidgetService.hide();
+				if (item.sdkRetry) {
+					void this.sessionsProvidersService.getProvider(item.providerId)?.retryAgentSdkInstall?.(item.sessionTypeId);
+					return;
+				}
 				this._handleSelectedSessionType(item);
 			},
 			onHide: () => { triggerElement.focus(); },
@@ -513,7 +596,7 @@ export class SessionTypePicker extends Disposable {
 				getAriaLabel: (element) => element.item?.groupLabel ? localize('sessionTypePicker.itemAriaLabel', "{0}, {1}", element.label ?? '', element.item.groupLabel) : (element.label ?? ''),
 				getWidgetAriaLabel: () => localize('sessionTypePicker.ariaLabel', "Session Type"),
 			},
-			{ minWidth: 200 },
+			withActionWidgetDropdownMotion({ minWidth: 200 }),
 		);
 	}
 
@@ -586,25 +669,7 @@ export class SessionTypePicker extends Disposable {
 	}
 
 	private _readStoredPick(): IPreferredSessionType | undefined {
-		const raw = this.storageService.get(STORAGE_KEY_LAST_SESSION_TYPE, StorageScope.PROFILE);
-		if (!raw) {
-			return undefined;
-		}
-		// Try parsing as the new JSON shape first; fall back to the legacy
-		// shape where only the sessionTypeId string was stored.
-		try {
-			const parsed = JSON.parse(raw) as IStoredSessionTypePick;
-			if (parsed && typeof parsed.sessionTypeId === 'string') {
-				return typeof parsed.providerId === 'string'
-					? { providerId: parsed.providerId, sessionTypeId: parsed.sessionTypeId }
-					: { sessionTypeId: parsed.sessionTypeId };
-			}
-		} catch {
-			// Not JSON — fall through to legacy raw-string handling.
-		}
-		// Legacy raw string was just the session type id. Resolution to a
-		// provider happens lazily once the active folder is known.
-		return { sessionTypeId: raw };
+		return readPreferredSessionType(this.storageService);
 	}
 
 	private _writeStoredPick(pick: IPickedSessionType): void {

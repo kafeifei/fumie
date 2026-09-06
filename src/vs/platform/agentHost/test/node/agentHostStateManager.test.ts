@@ -10,7 +10,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
 import { NullLogService } from '../../../log/common/log.js';
 import { ActionType, NotificationType, type ActionEnvelope, type INotification } from '../../common/state/sessionActions.js';
-import { ChatInputQuestionKind, ChatInputResponseKind, MessageKind, SessionSummary, ResponsePartKind, ROOT_STATE_URI, SessionLifecycle, SessionStatus, TurnState, buildChatUri, buildDefaultChatUri, buildSubagentSessionUri, buildSubagentSessionUriPrefix, isSubagentSession, mergeSessionWithDefaultChat, parseSubagentSessionUri, readHostBuildInfo, readSessionEhcliAdoptable, withSessionEhcliAdoptable, type ChatState, type MarkdownResponsePart, type SessionState, type Turn } from '../../common/state/sessionState.js';
+import { ChatInputQuestionKind, ChatInputResponseKind, ChatOriginKind, MessageKind, SessionSummary, ResponsePartKind, ROOT_STATE_URI, SessionLifecycle, SessionStatus, TurnState, buildChatUri, buildDefaultChatUri, buildSubagentSessionUri, buildSubagentSessionUriPrefix, isSubagentSession, mergeSessionWithDefaultChat, parseSubagentSessionUri, readHostBuildInfo, readSessionEhcliAdoptable, withSessionEhcliAdoptable, type ChatState, type MarkdownResponsePart, type SessionState, type Turn } from '../../common/state/sessionState.js';
 import { type SessionSummaryChangedParams } from '../../common/state/protocol/notifications.js';
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { buildChangesetUri, buildSessionChangesetUri } from '../../common/changesetUri.js';
@@ -327,7 +327,7 @@ suite('AgentHostStateManager', () => {
 		});
 	});
 
-	test('listed provisional session still applies the materialization upsert', () => {
+	test('listed provisional session still applies the materialization upsert', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
 		const provisional = { ...makeSessionSummary(), workingDirectories: ['file:///provisional'] };
 		manager.createSession(provisional, { emitNotification: false });
 		manager.dispatchServerAction(sessionChatUri, {
@@ -346,24 +346,25 @@ suite('AgentHostStateManager', () => {
 			workingDirectories: ['file:///resolved-worktree'],
 		};
 		manager.markSessionPersisted(sessionUri, persisted);
+		await new Promise(resolve => setTimeout(resolve, 150));
 
-		const added = notifications.find(notification => notification.type === NotificationType.SessionAdded);
+		const changed = notifications.find(notification => notification.type === NotificationType.SessionSummaryChanged);
 		assert.deepStrictEqual({
 			status: manager.getSessionState(sessionUri)?.status,
 			project: manager.getSessionState(sessionUri)?.project,
 			workingDirectories: manager.getSessionState(sessionUri)?.workingDirectories,
-			addedStatus: added?.type === NotificationType.SessionAdded ? added.summary.status : undefined,
-			addedProject: added?.type === NotificationType.SessionAdded ? added.summary.project : undefined,
-			addedWorkingDirectories: added?.type === NotificationType.SessionAdded ? added.summary.workingDirectories : undefined,
+			changedStatus: changed?.type === NotificationType.SessionSummaryChanged ? changed.changes.status : undefined,
+			changedProject: changed?.type === NotificationType.SessionSummaryChanged ? changed.changes.project : undefined,
+			changedWorkingDirectories: changed?.type === NotificationType.SessionSummaryChanged ? changed.changes.workingDirectories : undefined,
 		}, {
 			status: SessionStatus.InProgress,
 			project: persisted.project,
 			workingDirectories: persisted.workingDirectories,
-			addedStatus: SessionStatus.InProgress,
-			addedProject: persisted.project,
-			addedWorkingDirectories: persisted.workingDirectories,
+			changedStatus: undefined,
+			changedProject: persisted.project,
+			changedWorkingDirectories: persisted.workingDirectories,
 		});
-	});
+	}));
 
 	test('getActiveTurnId returns active turn id after turnStarted', () => {
 		manager.createSession(makeSessionSummary());
@@ -711,7 +712,11 @@ suite('AgentHostStateManager', () => {
 		assert.strictEqual(changed.length, 1);
 		assert.strictEqual(changed[0].session, sessionUri);
 		assert.strictEqual(Object.prototype.hasOwnProperty.call(changed[0].changes, '_meta'), true);
-		assert.strictEqual(readSessionEhcliAdoptable(changed[0].changes._meta), false);
+		assert.strictEqual(readSessionEhcliAdoptable(changed[0].changes._meta ?? undefined), false);
+		// The clear has to be an explicit `null`. Spelled as `undefined` it reads
+		// correctly here and then vanishes in `JSON.stringify`, so the client is
+		// handed a diff with no `_meta` at all and never learns the marker went away.
+		assert.strictEqual(JSON.parse(JSON.stringify(changed[0].changes))._meta, null);
 	});
 
 	test('publishing a restored session announces it to clients that never saw it', () => {
@@ -824,6 +829,62 @@ suite('AgentHostStateManager', () => {
 			assert.strictEqual(notification.session, sessionUri);
 			assert.strictEqual(notification.changes.title, 'New Title');
 			assert.strictEqual(notification.changes.status, undefined, 'unchanged fields should be omitted');
+		});
+	});
+
+	test('clearing activity is broadcast as an explicit null, so it survives serialization', () => {
+		// Regression: the diff spelled a cleared field as `undefined`, which
+		// `JSON.stringify` drops entirely — the client received `changes: {}`,
+		// learned nothing, and left the activity line and its spinner on the
+		// session-list row for the rest of the session's life.
+		return runWithFakedTimers({ useFakeTimers: true }, async () => {
+			manager.createSession(makeSessionSummary());
+			manager.dispatchServerAction(sessionUri, { type: ActionType.SessionReady });
+			manager.dispatchServerAction(sessionUri, { type: ActionType.SessionActivityChanged, activity: 'Creating isolated worktree' });
+			await new Promise(r => setTimeout(r, 150));
+
+			const notifications: INotification[] = [];
+			disposables.add(manager.onDidEmitNotification(n => notifications.push(n)));
+
+			manager.dispatchServerAction(sessionUri, { type: ActionType.SessionActivityChanged, activity: undefined });
+			await new Promise(r => setTimeout(r, 150));
+
+			const changed = notifications.filter(n => n.type === NotificationType.SessionSummaryChanged) as SessionSummaryChangedParams[];
+			assert.strictEqual(changed.length, 1);
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(changed[0].changes)), { activity: null });
+		});
+	});
+
+	test('setting activity still carries the value, not a null', () => {
+		return runWithFakedTimers({ useFakeTimers: true }, async () => {
+			manager.createSession(makeSessionSummary());
+			manager.dispatchServerAction(sessionUri, { type: ActionType.SessionReady });
+
+			const notifications: INotification[] = [];
+			disposables.add(manager.onDidEmitNotification(n => notifications.push(n)));
+
+			manager.dispatchServerAction(sessionUri, { type: ActionType.SessionActivityChanged, activity: 'Running tests' });
+			await new Promise(r => setTimeout(r, 150));
+
+			const changed = notifications.filter(n => n.type === NotificationType.SessionSummaryChanged) as SessionSummaryChangedParams[];
+			assert.strictEqual(changed.length, 1);
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(changed[0].changes)), { activity: 'Running tests' });
+		});
+	});
+
+	test('materialization updates an already-announced catalog entry without re-adding it', () => {
+		return runWithFakedTimers({ useFakeTimers: true }, async () => {
+			manager.createSession(makeSessionSummary());
+			const notifications: INotification[] = [];
+			disposables.add(manager.onDidEmitNotification(notification => notifications.push(notification)));
+
+			manager.markSessionPersisted(sessionUri, { ...makeSessionSummary(), modifiedAt: new Date(1000).toISOString(), workingDirectories: ['file:///resolved'] });
+			await new Promise(resolve => setTimeout(resolve, 150));
+
+			assert.strictEqual(notifications.filter(notification => notification.type === NotificationType.SessionAdded).length, 0);
+			const [changed] = notifications.filter(notification => notification.type === NotificationType.SessionSummaryChanged) as SessionSummaryChangedParams[];
+			assert.strictEqual(changed.changes.modifiedAt, new Date(1000).toISOString());
+			assert.deepStrictEqual(changed.changes.workingDirectories, ['file:///resolved']);
 		});
 	});
 
@@ -1061,6 +1122,8 @@ suite('AgentHostStateManager', () => {
 
 	suite('multi-chat catalog', () => {
 		const peerChat = buildChatUri(sessionUri, 'peer-1');
+		/** A provider-spawned child chat (`ChatOriginKind.Tool`), as a subagent delegation creates. */
+		const subagentChat = buildChatUri(sessionUri, 'subagent-1');
 
 		test('addChat grows the catalog, creates chat state and emits SessionChatAdded', () => {
 			manager.createSession(makeSessionSummary());
@@ -1465,6 +1528,100 @@ suite('AgentHostStateManager', () => {
 					whilePeerRunsHasInProgress: true,
 					afterPeerCompleteHasInProgress: false,
 					defaultChatStillIdle: true,
+				},
+			);
+		});
+
+		test('a subagent chat left mid-turn pins the session to InProgress even after the parent chat finishes', () => {
+			// Baseline for the orphaned-subagent fix: this is the aggregation
+			// design, not a bug — a spawned child chat that is genuinely still
+			// working must keep the session marked running. The bug it enables
+			// is that nothing else ever closes that child's turn if the process
+			// hosting it dies, which is why the provider has to close it
+			// explicitly (`mapSubagentProcessRebuild`) rather than the
+			// aggregation being loosened here.
+			manager.createSession(makeSessionSummary());
+			const defaultChat = buildDefaultChatUri(sessionUri);
+			manager.addChat(sessionUri, subagentChat, { title: 'Subagent', origin: { kind: ChatOriginKind.Tool, chat: defaultChat, toolCallId: 'toolu_task' } });
+
+			// Parent spawns the subagent, then finishes its own turn.
+			manager.dispatchServerAction(defaultChat, {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-parent',
+				startedAt: '2025-01-01T00:00:00.000Z',
+				message: { text: 'delegate', origin: { kind: MessageKind.User } },
+			});
+			manager.dispatchServerAction(subagentChat, {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-subagent',
+				startedAt: '2025-01-01T00:00:01.000Z',
+				message: { text: 'go', origin: { kind: MessageKind.User } },
+			});
+			manager.dispatchServerAction(defaultChat, {
+				type: ActionType.ChatTurnComplete,
+				turnId: 'turn-parent',
+				duration: 1000,
+			});
+
+			assert.deepStrictEqual(
+				{
+					parentChatInProgress: ((manager.getChatState(defaultChat)?.status ?? 0) & SessionStatus.InProgress) === SessionStatus.InProgress,
+					subagentChatInProgress: ((manager.getChatState(subagentChat)?.status ?? 0) & SessionStatus.InProgress) === SessionStatus.InProgress,
+					sessionInProgress: ((manager.getSessionState(sessionUri)?.status ?? 0) & SessionStatus.InProgress) === SessionStatus.InProgress,
+					sessionHasActiveTurn: manager.hasActiveTurn(sessionUri),
+				},
+				{
+					parentChatInProgress: false,
+					subagentChatInProgress: true,
+					sessionInProgress: true,
+					sessionHasActiveTurn: true,
+				},
+			);
+		});
+
+		test('closing an orphaned subagent chat re-aggregates the session back to idle', () => {
+			// What the provider's rebind cleanup buys: when the SDK subprocess
+			// that owned a subagent spawn is replaced, its `subagent_completed`
+			// signal can never arrive on its own, so the provider re-issues it.
+			// That signal reduces to exactly this ChatTurnComplete, and the
+			// assertion is that the ordinary reduction path — not a bespoke
+			// state mutation — clears the session's `InProgress` and notifies.
+			manager.createSession(makeSessionSummary());
+			const defaultChat = buildDefaultChatUri(sessionUri);
+			manager.addChat(sessionUri, subagentChat, { title: 'Subagent', origin: { kind: ChatOriginKind.Tool, chat: defaultChat, toolCallId: 'toolu_task' } });
+
+			manager.dispatchServerAction(subagentChat, {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-subagent',
+				startedAt: '2025-01-01T00:00:01.000Z',
+				message: { text: 'go', origin: { kind: MessageKind.User } },
+			});
+			const orphaned = manager.getSessionState(sessionUri)?.status ?? 0;
+
+			const statusEvents: SessionStatus[] = [];
+			disposables.add(manager.onDidChangeSessionStatus(e => statusEvents.push(e.status & ~(SessionStatus.IsRead | SessionStatus.IsArchived))));
+
+			// The re-issued completion, arriving through the normal action route.
+			manager.dispatchServerAction(subagentChat, {
+				type: ActionType.ChatTurnComplete,
+				turnId: 'turn-subagent',
+				duration: 1000,
+			});
+
+			assert.deepStrictEqual(
+				{
+					orphanedInProgress: (orphaned & SessionStatus.InProgress) === SessionStatus.InProgress,
+					afterCloseInProgress: ((manager.getSessionState(sessionUri)?.status ?? 0) & SessionStatus.InProgress) === SessionStatus.InProgress,
+					subagentCatalogInProgress: ((manager.getSessionState(sessionUri)?.chats.find(c => c.resource === subagentChat)?.status ?? 0) & SessionStatus.InProgress) === SessionStatus.InProgress,
+					sessionHasActiveTurn: manager.hasActiveTurn(sessionUri),
+					statusEvents,
+				},
+				{
+					orphanedInProgress: true,
+					afterCloseInProgress: false,
+					subagentCatalogInProgress: false,
+					sessionHasActiveTurn: false,
+					statusEvents: [SessionStatus.Idle],
 				},
 			);
 		});

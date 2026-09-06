@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type Anthropic from '@anthropic-ai/sdk';
+import { readFileSync } from 'fs';
+import { getMediaMime } from '../../../../base/common/mime.js';
 import { URI } from '../../../../base/common/uri.js';
 import { isAgentFeedbackAnnotationsAttachment, renderAgentFeedbackAnnotationsAttachment } from '../../common/meta/agentFeedbackAttachments.js';
 import { isHostSnapshotAttachment } from '../../common/meta/agentSnapshotAttachmentMeta.js';
@@ -14,19 +16,17 @@ import { MessageAttachmentKind, type MessageAttachment } from '../../common/stat
  * {@link SDKUserMessage} from a plain text prompt and the protocol
  * attachments accompanying the user message.
  *
- * Phase 6 keeps the resolver pure and minimal: a single `text` block
- * carrying the prompt, plus additional text blocks for attachments. This
- * mirrors the production extension's resolver shape so a future phase that
- * adds image rendering or inline range substitution can extend without
- * restructuring.
+ * The first block carries the prompt. Image attachments follow as native
+ * Anthropic image blocks; the remaining supported attachments are rendered as
+ * additional text blocks.
  *
  * Selections are rendered as URI references with an optional line
  * suffix. The protocol's {@link TextSelection} carries range metadata
  * only; the selected text is not included inline.
  *
- * Resource attachments and simple attachments with model representations
- * are honoured today. Embedded resources are dropped because the current
- * Claude path does not have a place to consume them.
+ * Agent Host normally snapshots embedded images to local `file:` resources
+ * before this resolver runs. Embedded images are still accepted as a fallback
+ * when that rewrite could not be completed.
  */
 export function resolvePromptToContentBlocks(
 	prompt: string,
@@ -37,6 +37,7 @@ export function resolvePromptToContentBlocks(
 		return blocks;
 	}
 	const refLines: string[] = [];
+	const imageBlocks: Anthropic.ImageBlockParam[] = [];
 	const simpleBlocks: string[] = [];
 	const feedbackBlocks: string[] = [];
 	for (const att of attachments) {
@@ -53,10 +54,24 @@ export function resolvePromptToContentBlocks(
 			}
 			continue;
 		}
+		if (att.type === MessageAttachmentKind.EmbeddedResource) {
+			const mediaType = toClaudeImageMediaType(att.contentType);
+			if (mediaType) {
+				imageBlocks.push(createImageBlock(mediaType, att.data));
+			}
+			continue;
+		}
 		if (att.type !== MessageAttachmentKind.Resource) {
 			continue;
 		}
 		const uri = URI.parse(att.uri);
+		if (att.displayKind === 'image' && uri.scheme === 'file') {
+			const mediaType = toClaudeImageMediaType(getMediaMime(uri.path));
+			if (mediaType) {
+				imageBlocks.push(createImageBlock(mediaType, readFileSync(uri.fsPath).toString('base64')));
+				continue;
+			}
+		}
 		// A host-created snapshot (pasted content, unsaved editor, git: diff, …) is read-only context;
 		// annotate the path inline so the model doesn't edit the copy (#331154). This is an advisory
 		// signal: the host attachments-dir write-deny only fires for interactive permission prompts, so
@@ -69,6 +84,7 @@ export function resolvePromptToContentBlocks(
 			refLines.push(`- ${uriToString(uri)}${readonlySuffix}`);
 		}
 	}
+	blocks.push(...imageBlocks);
 	if (feedbackBlocks.length > 0) {
 		blocks.push({
 			type: 'text',
@@ -93,6 +109,33 @@ export function resolvePromptToContentBlocks(
 			'</system-reminder>',
 	});
 	return blocks;
+}
+
+type ClaudeImageMediaType = Anthropic.Base64ImageSource['media_type'];
+
+function toClaudeImageMediaType(contentType: string | undefined): ClaudeImageMediaType | undefined {
+	switch (contentType) {
+		case 'image/jpg':
+		case 'image/jpeg':
+			return 'image/jpeg';
+		case 'image/png':
+		case 'image/gif':
+		case 'image/webp':
+			return contentType;
+		default:
+			return undefined;
+	}
+}
+
+function createImageBlock(mediaType: ClaudeImageMediaType, data: string): Anthropic.ImageBlockParam {
+	return {
+		type: 'image',
+		source: {
+			type: 'base64',
+			media_type: mediaType,
+			data,
+		},
+	};
 }
 
 function uriToString(uri: URI): string {

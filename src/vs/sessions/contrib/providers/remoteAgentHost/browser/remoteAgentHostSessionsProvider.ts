@@ -22,11 +22,11 @@ import { IRemoteAgentHostService, RemoteAgentHostConnectionStatus } from '../../
 import type { ISessionGitState } from '../../../../../platform/agentHost/common/state/sessionState.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { IDialogService, IFileDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
-import { IWorkspaceTrustManagementService } from '../../../../../platform/workspace/common/workspaceTrust.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILabelService } from '../../../../../platform/label/common/label.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { INotificationService } from '../../../../../platform/notification/common/notification.js';
+import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { IStorageService } from '../../../../../platform/storage/common/storage.js';
 import { IAgentHostActiveClientService } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostActiveClientService.js';
 import { IChatWidgetService } from '../../../../../workbench/contrib/chat/browser/chat.js';
@@ -41,10 +41,7 @@ import { IGitHubService } from '../../../github/browser/githubService.js';
 import { BaseAgentHostSessionsProvider } from '../../agentHost/browser/baseAgentHostSessionsProvider.js';
 import { remoteAgentHostSessionTypeId } from '../../../../../platform/agentHost/common/agentHostSessionType.js';
 
-/** Storage key prefix for cached session summaries, per remote address. */
-const CACHED_SESSIONS_STORAGE_PREFIX = 'remoteAgentHost.cachedSessions.v2.';
-// TODO@sandy081 Remove this legacy cache-key cleanup after 2026-10-14.
-const CACHED_SESSIONS_STORAGE_PREFIX_LEGACY = 'remoteAgentHost.cachedSessions.';
+import { CACHED_SESSIONS_STORAGE_PREFIX, CACHED_SESSIONS_STORAGE_PREFIX_LEGACY } from '../../../../services/remoteAgentHostInventory/common/remoteAgentHostInventory.js';
 
 function toLocalProjectUri(uri: URI, connectionAuthority: string): URI {
 	return uri.scheme === Schemas.file ? toAgentHostUri(uri, connectionAuthority) : uri;
@@ -65,6 +62,13 @@ export interface IRemoteAgentHostSessionsProviderConfig {
 	readonly connectOnDemand?: () => Promise<void>;
 	/** Optional hook to tear down the active connection on demand (e.g. tunnel relay). */
 	readonly disconnectOnDemand?: () => Promise<void>;
+	/**
+	 * Optional hook to forget this host entirely (e.g. drop a dev tunnel from
+	 * the recent list), as opposed to {@link disconnectOnDemand}, which leaves
+	 * the entry in place so the user can reconnect. Hosts without a hook fall
+	 * back to removing the remote agent host entry.
+	 */
+	readonly forgetOnDemand?: () => Promise<void>;
 	/** Optional progress messages during on-demand connect. */
 	readonly onDidReportConnectProgress?: Event<IAgentHostConnectProgress>;
 	/**
@@ -134,6 +138,17 @@ export class RemoteAgentHostSessionsProvider extends BaseAgentHostSessionsProvid
 	readonly connectionStatus: IObservable<RemoteAgentHostConnectionStatus> = this._connectionStatus;
 
 	/**
+	 * Whether a live connection is wired up right now.
+	 *
+	 * Deliberately separate from {@link connectionStatus}, which a tunnel host
+	 * also uses to mean "the host is online and worth clicking". Only this one
+	 * answers the question the sessions list has to ask before it lets someone
+	 * open a session: is there a transport behind these rows.
+	 */
+	private readonly _hasLiveConnection = observableValue<boolean>('hasLiveConnection', false);
+	readonly hasLiveConnection: IObservable<boolean> = this._hasLiveConnection;
+
+	/**
 	 * `true` while we are still resolving and pushing tokens for the host's
 	 * `protectedResources`. Defaults to `true` so that sessions surface as
 	 * loading until the first authentication pass settles.
@@ -158,6 +173,7 @@ export class RemoteAgentHostSessionsProvider extends BaseAgentHostSessionsProvid
 	private readonly _connectionAuthority: string;
 	private readonly _connectOnDemand: (() => Promise<void>) | undefined;
 	private readonly _disconnectOnDemand: (() => Promise<void>) | undefined;
+	private readonly _forgetOnDemand: (() => Promise<void>) | undefined;
 	private readonly _sessionSchemeAlias: ISessionSchemeAlias | undefined;
 	private readonly _omitHostFromWorkspaceLabel: boolean;
 	private readonly _workspaceTypeIcon: ThemeIcon | undefined;
@@ -191,13 +207,14 @@ export class RemoteAgentHostSessionsProvider extends BaseAgentHostSessionsProvid
 		@ISessionsService sessionsService: ISessionsService,
 		@IAgentHostActiveClientService activeClientService: IAgentHostActiveClientService,
 		@IDialogService dialogService: IDialogService,
-		@IWorkspaceTrustManagementService workspaceTrustManagementService: IWorkspaceTrustManagementService,
+		@IProductService productService: IProductService,
 	) {
-		super(chatSessionsService, chatService, chatWidgetService, languageModelsService, _configurationService, logService, gitHubService, instantiationService, sessionsService, activeClientService, storageService, dialogService, workspaceTrustManagementService);
+		super(chatSessionsService, chatService, chatWidgetService, languageModelsService, _configurationService, logService, gitHubService, instantiationService, sessionsService, activeClientService, storageService, dialogService, productService);
 
 		this._connectionAuthority = agentHostAuthority(config.address);
 		this._connectOnDemand = config.connectOnDemand;
 		this._disconnectOnDemand = config.disconnectOnDemand;
+		this._forgetOnDemand = config.forgetOnDemand;
 		this._sessionSchemeAlias = config.sessionSchemeAlias;
 		this._omitHostFromWorkspaceLabel = config.omitHostFromWorkspaceLabel === true;
 		this._workspaceTypeIcon = config.workspaceTypeIcon;
@@ -302,9 +319,17 @@ export class RemoteAgentHostSessionsProvider extends BaseAgentHostSessionsProvid
 	 */
 	async connect(): Promise<void> {
 		if (this._connectOnDemand) {
+			// The hook owns this host's status for the whole attempt, including
+			// the early returns where no connect actually starts.
 			await this._connectOnDemand();
 			return;
 		}
+		// Report the attempt before starting it. The generic reconnect path
+		// mutates the service entry without announcing a `connecting` status,
+		// so a host that never answers would otherwise sit at `disconnected`
+		// for the whole attempt and the sessions list would offer retry while
+		// a retry was already running.
+		this._connectionStatus.set(RemoteAgentHostConnectionStatus.connecting, undefined);
 		this._remoteAgentHostService.reconnect(this.remoteAddress);
 	}
 
@@ -319,6 +344,25 @@ export class RemoteAgentHostSessionsProvider extends BaseAgentHostSessionsProvid
 		this.unpublishCachedSessions();
 		if (this._disconnectOnDemand) {
 			await this._disconnectOnDemand();
+			return;
+		}
+		await this._remoteAgentHostService.removeRemoteAgentHost(this.remoteAddress);
+	}
+
+	/**
+	 * Forget this host: drop its persisted session snapshot and remove the
+	 * entry that recreates its provider on the next launch.
+	 *
+	 * Distinct from {@link disconnect}, which keeps both so the user can
+	 * reconnect. This is the "I don't want this list any more" path, and it has
+	 * to clear the persisted cache explicitly — the cache deliberately outlives
+	 * an offline host, so nothing else ever removes it.
+	 */
+	async forget(): Promise<void> {
+		this._clearPersistedSessionCache();
+		this.unpublishCachedSessions();
+		if (this._forgetOnDemand) {
+			await this._forgetOnDemand();
 			return;
 		}
 		await this._remoteAgentHostService.removeRemoteAgentHost(this.remoteAddress);
@@ -423,6 +467,7 @@ export class RemoteAgentHostSessionsProvider extends BaseAgentHostSessionsProvid
 		this._connection = connection;
 		this._defaultDirectory = defaultDirectory;
 		this._unpublished = false;
+		this._hasLiveConnection.set(true, undefined);
 
 		this._syncRootState(connection.rootState.value);
 		this._connectionListeners.add(connection.rootState.onDidChange(() => {
@@ -455,16 +500,12 @@ export class RemoteAgentHostSessionsProvider extends BaseAgentHostSessionsProvid
 		this._onDidDisconnect.fire();
 		this._connection = undefined;
 		this._defaultDirectory = undefined;
+		this._hasLiveConnection.set(false, undefined);
+		// Drops the transient drafts (including the row a sent-but-uncommitted
+		// draft still owns, which it retracts) but keeps the persisted cache so
+		// the workspace picker keeps showing offline sessions.
 		this._disposeAllNewSessions();
 		this._syncRootState(undefined);
-
-		// Drop only the transient pending/draft session; keep the persisted
-		// cache so the workspace picker keeps showing offline sessions.
-		if (this._pendingSession) {
-			const pending = this._pendingSession;
-			this._pendingSession = undefined;
-			this._onDidChangeSessions.fire({ added: [], removed: [pending], changed: [] });
-		}
 
 		// Reset the in-memory cache-initialized flag so a fresh connection
 		// triggers a full list refresh (which will reconcile against the

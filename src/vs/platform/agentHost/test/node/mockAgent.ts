@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { timeout } from '../../../../base/common/async.js';
+import type { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { observableValue } from '../../../../base/common/observable.js';
 import type { IAuthorizationProtectedResourceMetadata } from '../../../../base/common/oauth.js';
@@ -78,7 +79,7 @@ export class MockAgent implements IAgent {
 	readonly disposeSessionCalls: URI[] = [];
 	readonly releaseSessionCalls: URI[] = [];
 	readonly abortSessionCalls: URI[] = [];
-	readonly respondToPermissionCalls: { requestId: string; approved: boolean }[] = [];
+	readonly respondToPermissionCalls: { requestId: string; approved: boolean; selectedOptionId?: string }[] = [];
 	readonly changeModelCalls: { session: URI; model: ModelSelection; chat?: URI }[] = [];
 	readonly changeAgentCalls: { session: URI; agent: AgentSelection | undefined; chat?: URI }[] = [];
 	readonly authenticateCalls: { resource: string; token: string }[] = [];
@@ -98,6 +99,11 @@ export class MockAgent implements IAgent {
 	readonly sessionCustomizationsCalls: { session: URI; hostCustomizations: readonly Customization[] | undefined }[] = [];
 	readonly clientToolCallCompleteCalls: { chat: URI; toolCallId: string; result: ToolCallResult; context?: IAgentChatContext }[] = [];
 	readonly truncateChatCalls: { chat: URI; turnId: string | undefined; context: URI | IAgentChatContext | undefined }[] = [];
+	readonly generateTitleCalls: { session: URI; prompt: string; modelId: string | undefined }[] = [];
+	/** Reply for {@link generateTitle}; `undefined` means the harness could not name the session. */
+	generatedTitle: string | undefined = undefined;
+	/** Overrides {@link generatedTitle} when a test needs to delay, hang, or fail the naming request. */
+	generateTitleHandler: ((session: URI, request: { readonly prompt: string; readonly modelId?: string }, token: CancellationToken) => Promise<string | undefined>) | undefined;
 	/** Configurable return value for getCustomizations. */
 	customizations: Customization[] = [];
 	private readonly _onDidCustomizationsChange = new Emitter<void>();
@@ -273,8 +279,18 @@ export class MockAgent implements IAgent {
 		this.truncateChatCalls.push({ chat, turnId, context });
 	}
 
-	respondToPermissionRequest(requestId: string, approved: boolean): void {
-		this.respondToPermissionCalls.push({ requestId, approved });
+	async generateTitle(session: URI, request: { readonly prompt: string; readonly modelId?: string }, token: CancellationToken): Promise<string | undefined> {
+		this.generateTitleCalls.push({ session, prompt: request.prompt, modelId: request.modelId });
+		return this.generateTitleHandler
+			? this.generateTitleHandler(session, request, token)
+			: this.generatedTitle;
+	}
+
+	respondToPermissionRequest(requestId: string, approved: boolean, selectedOptionId?: string): void {
+		// Only record the picked option when there was one, so the many
+		// assertions that compare a whole call against `{ requestId, approved }`
+		// keep matching.
+		this.respondToPermissionCalls.push({ requestId, approved, ...(selectedOptionId ? { selectedOptionId } : {}) });
 	}
 
 	respondToUserInputRequest(): void {
@@ -337,6 +353,16 @@ export class MockAgent implements IAgent {
 				}));
 			}
 			return this.createChat(session, chatUri, options);
+		},
+		deleteChat: (chatUri: URI, context?: URI | IAgentChatContext): Promise<void> => {
+			this._recordContext('deleteChat', chatUri, context);
+			const { session, chat } = this._resolveChatTarget(chatUri, context);
+			return this.disposeChat(session, chat).then(() => {
+				if (this._initialChats.delete(chatUri.toString())) {
+					this.disposeSessionCalls.push(session);
+					this._sessions.delete(AgentSession.id(session));
+				}
+			});
 		},
 		disposeChat: (chatUri: URI, context: URI | IAgentChatContext): Promise<void> => {
 			this._recordContext('disposeChat', chatUri, context);
@@ -1090,6 +1116,11 @@ export class ScriptedMockAgent implements IAgent {
 			}
 			throw new Error('Scripted mock agent does not support multiple chats');
 		},
+		deleteChat: (chat: URI, context?: URI | IAgentChatContext): Promise<void> => {
+			const { session } = this._resolveChatTarget(chat, context);
+			this._sessions.delete(AgentSession.id(session));
+			return Promise.resolve();
+		},
 		disposeChat: (chat: URI, context: URI | IAgentChatContext): Promise<void> => {
 			const { session } = this._resolveChatTarget(chat, context);
 			this._sessions.delete(AgentSession.id(session));
@@ -1149,6 +1180,11 @@ export class ScriptedMockAgent implements IAgent {
 
 	async authenticate(_resource: string, _token: string): Promise<boolean> {
 		return true;
+	}
+
+	/** The scripted agent never names a session; the host keeps its placeholder. */
+	async generateTitle(): Promise<string | undefined> {
+		return undefined;
 	}
 
 	async shutdown(): Promise<void> { }

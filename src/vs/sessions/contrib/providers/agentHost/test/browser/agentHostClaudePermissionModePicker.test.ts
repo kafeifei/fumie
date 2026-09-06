@@ -30,7 +30,7 @@ const PROVIDER_ID = 'local-agent-host';
 const SESSION_ID = 'local-agent-host:s1';
 const LEARN_MORE_URL = 'https://code.claude.com/docs/en/permission-modes#available-modes';
 
-function makeClaudePermissionModeConfig(): ResolveSessionConfigResult {
+function makeClaudePermissionModeConfig(currentValue = 'default'): ResolveSessionConfigResult {
 	return {
 		schema: {
 			type: 'object',
@@ -51,7 +51,7 @@ function makeClaudePermissionModeConfig(): ResolveSessionConfigResult {
 				},
 			},
 		},
-		values: { permissionMode: 'default' },
+		values: { permissionMode: currentValue },
 	} as ResolveSessionConfigResult;
 }
 
@@ -59,9 +59,10 @@ class FakeProvider implements Pick<IAgentHostSessionsProvider, 'id' | 'onDidChan
 	readonly id = PROVIDER_ID;
 	readonly onDidChangeSessionConfig: Event<string> = Event.None;
 	readonly setCalls: Array<[string, string, unknown]> = [];
+	constructor(private readonly currentValue = 'default') { }
 
 	getSessionConfig(_sessionId: string): ResolveSessionConfigResult {
-		return makeClaudePermissionModeConfig();
+		return makeClaudePermissionModeConfig(this.currentValue);
 	}
 
 	isSessionConfigResolving(_sessionId: string) {
@@ -73,8 +74,8 @@ class FakeProvider implements Pick<IAgentHostSessionsProvider, 'id' | 'onDidChan
 	}
 }
 
-function setupPicker(store: Pick<ReturnType<typeof ensureNoDisposablesAreLeakedInTestSuite>, 'add'>) {
-	const provider = new FakeProvider();
+function setupPicker(store: Pick<ReturnType<typeof ensureNoDisposablesAreLeakedInTestSuite>, 'add'>, currentValue = 'default') {
+	const provider = new FakeProvider(currentValue);
 	const openedResources: string[] = [];
 	const actionWidgetItems: IActionListItem<IAgentHostSessionEnumPickerItem>[] = [];
 	let onSelect: ((item: IAgentHostSessionEnumPickerItem) => void) | undefined;
@@ -115,34 +116,51 @@ function setupPicker(store: Pick<ReturnType<typeof ensureNoDisposablesAreLeakedI
 	picker.render(container);
 	container.querySelector<HTMLElement>('a.action-label')?.click();
 
-	return { actionWidgetItems, openedResources, onSelect: () => onSelect, provider };
+	return { actionWidgetItems, container, openedResources, onSelect: () => onSelect, provider };
 }
 
 suite('AgentHostClaudePermissionModePicker', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('renders Claude-native permission modes with distinct icons', () => {
-		const { actionWidgetItems } = setupPicker(store);
-		const modeItems = actionWidgetItems.slice(0, 5);
+	test('renders the three Fumie permission levels over exact Claude-native values', () => {
+		const { actionWidgetItems, container } = setupPicker(store);
+		const modeItems = actionWidgetItems.slice(0, 3);
 
 		assert.deepStrictEqual(modeItems.map(item => item.label), [
-			'Ask Before Edits',
-			'Edit Automatically',
-			'Plan Mode',
-			'Auto Mode',
-			'Bypass Permissions',
+			'Default Permissions',
+			'Auto-Review',
+			'Full Access',
 		]);
-		assert.ok(!actionWidgetItems.some(item => item.label === 'Don\'t Ask'));
+		assert.deepStrictEqual(modeItems.map(item => item.item?.value), ['default', 'auto', 'bypassPermissions']);
+		assert.strictEqual(container.querySelector('.sessions-chat-dropdown-label')?.textContent, 'Default Permissions');
 
 		const iconIds = modeItems.map(item => item.group?.icon?.id);
 		assert.deepStrictEqual(iconIds, [
 			Codicon.shield.id,
-			Codicon.edit.id,
-			Codicon.lightbulb.id,
 			Codicon.sparkle.id,
 			Codicon.warning.id,
 		]);
 		assert.strictEqual(new Set(iconIds).size, modeItems.length);
+	});
+
+	test('writes the Claude-native bypass value for Fumie Full Access', () => {
+		const { actionWidgetItems, onSelect, provider } = setupPicker(store);
+		const select = onSelect();
+		const fullAccess = actionWidgetItems.find(item => item.label === 'Full Access')?.item;
+		assert.ok(select && fullAccess);
+		select(fullAccess);
+		assert.deepStrictEqual(provider.setCalls, [[SESSION_ID, 'permissionMode', 'bypassPermissions']]);
+	});
+
+	test('keeps a non-product legacy mode visible only while it is active', () => {
+		const { actionWidgetItems, container } = setupPicker(store, 'plan');
+		assert.deepStrictEqual(actionWidgetItems.slice(0, 4).map(item => item.label), [
+			'Plan Mode',
+			'Default Permissions',
+			'Auto-Review',
+			'Full Access',
+		]);
+		assert.strictEqual(container.querySelector('.sessions-chat-dropdown-label')?.textContent, 'Plan Mode');
 	});
 
 	test('Learn More footer opens docs without writing session config', () => {

@@ -155,6 +155,12 @@ export interface IChatAgentRequest {
 	acceptedConfirmationData?: unknown[];
 	rejectedConfirmationData?: unknown[];
 	agentHostSessionConfig?: Record<string, unknown>;
+	/**
+	 * Initial agent-host session metadata (`_meta`) supplied by the sender, to
+	 * be merged into the `createSession` `_meta` bag when this request is the
+	 * one that materializes the backend session.
+	 */
+	agentHostSessionMetadata?: Record<string, unknown>;
 	userSelectedModelId?: string;
 	modelConfiguration?: IStringDictionary<unknown>;
 	userSelectedTools?: UserSelectedTools;

@@ -15,6 +15,9 @@ import { ILogService, NullLogService } from '../../../../../platform/log/common/
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { ISessionDataService } from '../../../common/sessionDataService.js';
 import { CodexAgent } from '../../../node/codex/codexAgent.js';
+import { ByokLmBridgeRegistry, IByokLmBridgeRegistry } from '../../../node/byokLmBridgeRegistry.js';
+import { IChatGptSubscriptionService } from '../../../node/chatGptSubscription.js';
+import { createTestChatGptSubscriptionService } from '../testChatGptSubscriptionService.js';
 import { ICodexProxyService } from '../../../node/codex/codexProxyService.js';
 import { IAgentConfigurationService } from '../../../node/agentConfigurationService.js';
 import { IAgentHostCustomizationEnablementService } from '../../../node/agentHostCustomizationEnablementService.js';
@@ -49,6 +52,8 @@ function createAgent(disposables: Pick<DisposableStore, 'add'>): CodexAgent {
 	instantiationService.stub(IProductService, { _serviceBrand: undefined, version: '1.0.0-test' } as IProductService);
 	instantiationService.stub(INativeEnvironmentService, { userHome: URI.file('/tmp') });
 	instantiationService.stub(ILogService, logService);
+	instantiationService.stub(IByokLmBridgeRegistry, new ByokLmBridgeRegistry());
+	instantiationService.stub(IChatGptSubscriptionService, createTestChatGptSubscriptionService());
 	return disposables.add(instantiationService.createInstance(CodexAgent));
 }
 
@@ -61,7 +66,9 @@ suite('codexSessionConfigKeys', () => {
 			selected: getCodexAutonomousSessionConfig(false),
 			restricted: getCodexAutonomousSessionConfig(true),
 		}, {
-			selected: { [CodexSessionConfigKey.PermissionsPreset]: 'auto-review' },
+			// Autonomous turns select the shared `assisted` tier, which Codex
+			// expands through its `auto-review` preset.
+			selected: { [SessionConfigKey.AutoApprove]: 'assisted' },
 			restricted: undefined,
 		});
 	});
@@ -100,9 +107,15 @@ suite('codexSessionConfigKeys', () => {
 				autoReview: resolveCodexPermissionsPreset('auto-review'),
 				fullAccess: resolveCodexPermissionsPreset('full-access'),
 			},
-			// A stored preset is the source of truth and expands to all three axes.
+			// The shared approvals tier is the source of truth and expands to all
+			// three axes through the preset it maps to.
+			fromTier: resolveCodexPermissions({ [SessionConfigKey.AutoApprove]: 'autoApprove' }, legacyDefaults),
+			// A session persisted before the tier switch carries only the legacy
+			// preset key, which is still honored.
 			fromPreset: resolveCodexPermissions({ [CodexSessionConfigKey.PermissionsPreset]: 'full-access' }, legacyDefaults),
-			// Without a preset, legacy per-axis keys are honored with a `user` reviewer.
+			// The tier wins over a stale legacy preset left on the same session.
+			tierOverLegacyPreset: resolveCodexPermissions({ [SessionConfigKey.AutoApprove]: 'assisted', [CodexSessionConfigKey.PermissionsPreset]: 'full-access' }, legacyDefaults),
+			// Without either, legacy per-axis keys are honored with a `user` reviewer.
 			fromLegacyKeys: resolveCodexPermissions({ [CodexSessionConfigKey.SandboxMode]: 'read-only', [CodexSessionConfigKey.ApprovalPolicy]: 'never' }, legacyDefaults),
 			// Empty config falls back entirely to the provided defaults.
 			fromDefaults: resolveCodexPermissions(undefined, legacyDefaults),
@@ -112,35 +125,48 @@ suite('codexSessionConfigKeys', () => {
 				autoReview: { approvalPolicy: 'on-request', sandboxMode: 'workspace-write', approvalsReviewer: 'auto_review' },
 				fullAccess: { approvalPolicy: 'never', sandboxMode: 'danger-full-access', approvalsReviewer: 'user' },
 			},
+			fromTier: { approvalPolicy: 'never', sandboxMode: 'danger-full-access', approvalsReviewer: 'user' },
 			fromPreset: { approvalPolicy: 'never', sandboxMode: 'danger-full-access', approvalsReviewer: 'user' },
+			tierOverLegacyPreset: { approvalPolicy: 'on-request', sandboxMode: 'workspace-write', approvalsReviewer: 'auto_review' },
 			fromLegacyKeys: { approvalPolicy: 'never', sandboxMode: 'read-only', approvalsReviewer: 'user' },
 			fromDefaults: { approvalPolicy: 'on-request', sandboxMode: 'workspace-write', approvalsReviewer: 'user' },
 		});
 	});
 
-	test('resolveChatConfig exposes a single permissions-preset chip', async () => {
+	test('resolveChatConfig exposes the shared approvals tier chip', async () => {
 		const agent = createAgent(disposables);
 
 		const defaulted = await agent.resolveChatConfig({ config: {} });
-		const fullAccess = await agent.resolveChatConfig({ config: { [CodexSessionConfigKey.PermissionsPreset]: 'full-access' } });
+		const fullAccess = await agent.resolveChatConfig({ config: { [SessionConfigKey.AutoApprove]: 'autoApprove' } });
+		const legacyPreset = await agent.resolveChatConfig({ config: { [CodexSessionConfigKey.PermissionsPreset]: 'full-access' } });
 
 		assert.deepStrictEqual({
-			// The visible schema is reduced to Mode + one permissions preset + Permissions.
+			// The visible schema is reduced to Mode + the platform approvals tier +
+			// Permissions. Advertising the platform key is what makes Codex share
+			// the product-wide approvals picker instead of its own.
 			schemaProperties: Object.keys(defaulted.schema.properties).sort(),
+			tierEnum: defaulted.schema.properties[SessionConfigKey.AutoApprove].enum,
 			// Codex drops "Autopilot" (no native equivalent — it would duplicate
 			// "Interactive"), so the Mode picker offers only interactive + plan.
 			modeEnum: defaulted.schema.properties[SessionConfigKey.Mode].enum,
 			defaultedValues: {
 				mode: defaulted.values[SessionConfigKey.Mode],
-				preset: defaulted.values[CodexSessionConfigKey.PermissionsPreset],
+				tier: defaulted.values[SessionConfigKey.AutoApprove],
 			},
-			// The preset is session-mutable and echoed back unchanged.
-			fullAccessPreset: fullAccess.values[CodexSessionConfigKey.PermissionsPreset],
+			// The tier is session-mutable and echoed back unchanged.
+			fullAccessTier: fullAccess.values[SessionConfigKey.AutoApprove],
+			// A session persisted before the tier switch is migrated onto the
+			// equivalent tier, and the legacy key is dropped.
+			legacyMigratedTier: legacyPreset.values[SessionConfigKey.AutoApprove],
+			legacyPresetKey: legacyPreset.values[CodexSessionConfigKey.PermissionsPreset],
 		}, {
-			schemaProperties: [SessionConfigKey.Mode, CodexSessionConfigKey.PermissionsPreset, SessionConfigKey.Permissions].sort(),
+			schemaProperties: [SessionConfigKey.Mode, SessionConfigKey.AutoApprove, SessionConfigKey.Permissions].sort(),
+			tierEnum: ['default', 'assisted', 'autoApprove'],
 			modeEnum: ['interactive', 'plan'],
-			defaultedValues: { mode: 'interactive', preset: 'default' },
-			fullAccessPreset: 'full-access',
+			defaultedValues: { mode: 'interactive', tier: 'default' },
+			fullAccessTier: 'autoApprove',
+			legacyMigratedTier: 'autoApprove',
+			legacyPresetKey: undefined,
 		});
 	});
 
@@ -155,7 +181,9 @@ suite('codexSessionConfigKeys', () => {
 				fullAccess: presetForResolvedPermissions(resolveCodexPermissionsPreset('full-access')),
 				readOnly: presetForResolvedPermissions({ approvalPolicy: 'on-request', sandboxMode: 'read-only', approvalsReviewer: 'user' }),
 			},
-			// An explicit preset is kept verbatim.
+			// An explicit tier is kept verbatim.
+			explicitTier: migrateCodexPermissionValues({ [SessionConfigKey.AutoApprove]: 'assisted' }, defaults),
+			// A legacy preset key is folded onto the tier it maps to.
 			explicit: migrateCodexPermissionValues({ [CodexSessionConfigKey.PermissionsPreset]: 'auto-review' }, defaults),
 			// Legacy axes equal to a preset are migrated to it (raw axes dropped).
 			migrated: migrateCodexPermissionValues({ [CodexSessionConfigKey.SandboxMode]: 'workspace-write', [CodexSessionConfigKey.ApprovalPolicy]: 'on-request' }, defaults),
@@ -173,12 +201,13 @@ suite('codexSessionConfigKeys', () => {
 			empty: migrateCodexPermissionValues(undefined, defaults),
 		}, {
 			invert: { default: 'default', autoReview: 'auto-review', fullAccess: 'full-access', readOnly: undefined },
-			explicit: { [CodexSessionConfigKey.PermissionsPreset]: 'auto-review' },
-			migrated: { [CodexSessionConfigKey.PermissionsPreset]: 'default' },
-			snappedDefault: { [CodexSessionConfigKey.PermissionsPreset]: 'default' },
-			snappedFullAccess: { [CodexSessionConfigKey.PermissionsPreset]: 'full-access' },
+			explicitTier: { [SessionConfigKey.AutoApprove]: 'assisted' },
+			explicit: { [SessionConfigKey.AutoApprove]: 'assisted' },
+			migrated: { [SessionConfigKey.AutoApprove]: 'default' },
+			snappedDefault: { [SessionConfigKey.AutoApprove]: 'default' },
+			snappedFullAccess: { [SessionConfigKey.AutoApprove]: 'autoApprove' },
 			preserved: { [CodexSessionConfigKey.ApprovalPolicy]: 'on-request', [CodexSessionConfigKey.SandboxMode]: 'read-only' },
-			empty: { [CodexSessionConfigKey.PermissionsPreset]: 'default' },
+			empty: { [SessionConfigKey.AutoApprove]: 'default' },
 		});
 	});
 
@@ -204,23 +233,23 @@ suite('codexSessionConfigKeys', () => {
 		});
 
 		assert.deepStrictEqual({
-			// read-only has no equivalent preset: axes preserved, NO preset
+			// read-only has no equivalent preset: axes preserved, NO tier
 			// inserted, and the effective permissions stay read-only.
-			legacyPreset: legacy.values[CodexSessionConfigKey.PermissionsPreset],
+			legacyTier: legacy.values[SessionConfigKey.AutoApprove],
 			legacySandbox: legacy.values[CodexSessionConfigKey.SandboxMode],
 			legacyEffective: resolveCodexPermissions(legacy.values, legacyDefaults),
 			// Non-permission settings survive the restore round-trip.
 			legacyEffort: legacy.values[CodexSessionConfigKey.ModelReasoningEffort],
-			// danger-full-access + never == the full-access preset: migrated, raw
-			// axes dropped.
-			migratablePreset: migratable.values[CodexSessionConfigKey.PermissionsPreset],
+			// danger-full-access + never == the full-access preset: migrated onto
+			// the `autoApprove` tier, raw axes dropped.
+			migratableTier: migratable.values[SessionConfigKey.AutoApprove],
 			migratableSandbox: migratable.values[CodexSessionConfigKey.SandboxMode],
 		}, {
-			legacyPreset: undefined,
+			legacyTier: undefined,
 			legacySandbox: 'read-only',
 			legacyEffective: { approvalPolicy: 'on-request', sandboxMode: 'read-only', approvalsReviewer: 'user' },
 			legacyEffort: 'high',
-			migratablePreset: 'full-access',
+			migratableTier: 'autoApprove',
 			migratableSandbox: undefined,
 		});
 	});

@@ -31,7 +31,7 @@ export class RenameLocalCommand extends Disposable implements ILocalChatCommand 
 		if (title === undefined) {
 			return undefined;
 		}
-		return { run: async () => this._run(request.turnChannel, request.turnId, title), suggestedTitle: title };
+		return { run: async () => this._run(request.turnChannel, request.turnId, title) };
 	}
 
 	private _run(channel: ProtocolURI, turnId: string, title: string): void {

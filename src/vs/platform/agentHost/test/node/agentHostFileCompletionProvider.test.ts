@@ -10,6 +10,7 @@ import { DisposableStore } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
+import { AH_META_COMPLETIONS_WORKING_DIRECTORIES } from '../../common/agentHostWorkingDirectories.js';
 import { ActionType } from '../../common/state/sessionActions.js';
 import { buildDefaultChatUri, SessionStatus, type SessionSummary } from '../../common/state/sessionState.js';
 import { CompletionItemKind } from '../../common/state/protocol/commands.js';
@@ -163,6 +164,59 @@ suite('AgentHostFileCompletionProvider', () => {
 				CancellationToken.None,
 			);
 			assert.deepStrictEqual(result, []);
+		});
+
+		test('falls back to the _meta working directories when the session does not exist yet', async () => {
+			// A client-local composer draft has no session on the host, so it
+			// carries its working directories on the request's `_meta`.
+			const wd = URI.file('/wd');
+			const files = [URI.joinPath(wd, 'src/util.ts')];
+			const { provider } = setup({ files });
+			const result = await provider.provideCompletionItems(
+				{
+					kind: CompletionItemKind.UserMessage,
+					channel: URI.from({ scheme: 'copilot', path: '/draft' }).toString(),
+					text: 'see @util',
+					offset: 9,
+					_meta: { [AH_META_COMPLETIONS_WORKING_DIRECTORIES]: [wd.toString()] },
+				},
+				CancellationToken.None,
+			);
+			assert.deepStrictEqual(result, [{
+				insertText: '@util.ts',
+				rangeStart: 4,
+				rangeEnd: 9,
+				attachment: {
+					type: MessageAttachmentKind.Resource,
+					uri: files[0].toString(),
+					label: 'util.ts',
+					displayKind: 'document',
+				},
+			}]);
+		});
+
+		test('prefers session working directories over the _meta fallback', async () => {
+			const wd = URI.file('/wd');
+			const other = URI.file('/other');
+			const results = new Map<string, readonly URI[]>([
+				[wd.path, [URI.joinPath(wd, 'src/util.ts')]],
+				[other.path, [URI.joinPath(other, 'src/util.ts')]],
+			]);
+			const { sessionUri, provider } = setup({ workingDirectory: wd, results });
+			const result = await provider.provideCompletionItems(
+				{
+					kind: CompletionItemKind.UserMessage,
+					channel: sessionUri,
+					text: 'see @util',
+					offset: 9,
+					_meta: { [AH_META_COMPLETIONS_WORKING_DIRECTORIES]: [other.toString()] },
+				},
+				CancellationToken.None,
+			);
+			assert.deepStrictEqual(
+				result.map(item => item.attachment.type === MessageAttachmentKind.Resource ? item.attachment.uri : undefined),
+				[URI.joinPath(wd, 'src/util.ts').toString()],
+			);
 		});
 
 		test('returns [] for non-file working directory', async () => {

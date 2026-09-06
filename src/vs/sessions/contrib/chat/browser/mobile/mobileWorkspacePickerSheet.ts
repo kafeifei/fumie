@@ -26,6 +26,7 @@ const SEARCH_RESULT_ID_PREFIX = 'searchResult:';
 type MobilePickerRow = {
 	readonly sheetItem: IMobilePickerSheetItem;
 	readonly run: () => void;
+	readonly isWorkspace: boolean;
 };
 
 type BrowsedFolder = {
@@ -77,6 +78,7 @@ export function buildMobileWorkspacePickerRows(
 						sectionTitle: isFirst ? (sectionTitle ?? item.label ?? '') : undefined,
 					},
 					run: () => child.run(),
+					isWorkspace: false,
 				});
 				isFirst = false;
 			}
@@ -108,6 +110,7 @@ export function buildMobileWorkspacePickerRows(
 					dispatch(data);
 				}
 			},
+			isWorkspace: isWorkspaceRow,
 		});
 	}
 
@@ -198,13 +201,17 @@ export async function showMobileWorkspacePickerSheet(
 	// the sheet can resolve folder taps back to a provider selection.
 	const folderRunById = new Map<string, () => void>();
 	const folderLabelById = new Map<string, string>();
-	let currentFolder: BrowsedFolder | undefined;
+	const selectedWorkspace = rows.find(row => row.isWorkspace && row.sheetItem.checked && !row.sheetItem.disabled);
+	let currentFolder: BrowsedFolder | undefined = selectedWorkspace
+		? { query: '', label: selectedWorkspace.sheetItem.label, run: selectedWorkspace.run }
+		: undefined;
 	// Track the current search query so drill-down can append to it.
 	let currentSearchQuery = '';
 	const search: IMobilePickerSheetSearchSource | undefined = inlineFolderActions.length > 0
 		? {
-			placeholder: localize('mobileWorkspacePicker.searchFolders', "Search folders…"),
-			resultsSectionTitle: localize('mobileWorkspacePicker.foldersSection', "Folders"),
+			placeholder: localize('mobileWorkspacePicker.searchFolders', "Search or browse folders"),
+			autoFocus: false,
+			resultsSectionTitle: localize('mobileWorkspacePicker.foldersSection', "Browse folders"),
 			emptyMessage: localize('mobileWorkspacePicker.noFolders', "No folders match"),
 			loadItems: async (query, token) => {
 				currentSearchQuery = query;
@@ -252,7 +259,7 @@ export async function showMobileWorkspacePickerSheet(
 				}
 				const folder = currentFolder;
 				return {
-					label: localize('mobileWorkspacePicker.selectCurrentFolder', "Select '{0}'", folder.label),
+					label: localize('mobileWorkspacePicker.selectCurrentFolder', "Use '{0}'", folder.label),
 					icon: Codicon.arrowRight,
 					run: folder.run,
 				};
@@ -271,7 +278,7 @@ export async function showMobileWorkspacePickerSheet(
 			{
 				headerActions,
 				search,
-				caption: localize('mobileWorkspacePicker.caption', "Search to browse folders on the host"),
+				caption: localize('mobileWorkspacePicker.caption', "Open a folder, then tap Use"),
 				stayOpenOnSelect: true,
 				doneLabel: localize('mobileWorkspacePicker.cancel', "Cancel"),
 				onDidSelect: (id) => {
@@ -311,7 +318,7 @@ export async function showMobileWorkspacePickerSheet(
 		);
 	} finally {
 		triggerElement.setAttribute('aria-expanded', 'false');
-		triggerElement.focus();
+		triggerElement.focus({ preventScroll: true });
 	}
 	if (result?.startsWith(MOBILE_PICKER_SHEET_HEADER_ACTION_PREFIX)) {
 		const index = Number(result.slice(MOBILE_PICKER_SHEET_HEADER_ACTION_PREFIX.length));

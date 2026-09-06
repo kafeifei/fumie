@@ -201,4 +201,3 @@ suite('createClaudeThinkingLevelSchema (Phase 6.1 / Cycle D3)', () => {
 		});
 	});
 });
-

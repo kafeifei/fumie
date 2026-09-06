@@ -12,22 +12,6 @@
 		overflow: hidden;
 	}
 
-	.agent-sessions-sidebar-splitview-container {
-		flex: 1;
-		min-height: 0;
-		overflow: hidden;
-	}
-
-	.agent-sessions-sidebar-splitview-container .monaco-split-view2.separator-border.vertical > .monaco-scrollable-element > .split-view-container > .split-view-view:not(:first-child)::before {
-		left: var(--vscode-spacing-size40, 4px);
-		width: calc(100% - (2 * var(--vscode-spacing-size40, 4px)));
-	}
-
-	.agent-sessions-sidebar-splitview-container .monaco-split-view2.vertical > .sash-container > .monaco-sash.horizontal {
-		left: var(--vscode-spacing-size40, 4px) !important;
-		width: calc(100% - (2 * var(--vscode-spacing-size40, 4px))) !important;
-	}
-
 	/* Section headers - more prominent than time-based groupings */
 	.agent-sessions-header {
 		font-size: var(--vscode-agents-fontSize-body2);
@@ -49,7 +33,7 @@
 		opacity: 0.7;
 	}
 
-	/* Sessions section - fills remaining space above customizations */
+	/* Sessions section - fills remaining space above the footer account row */
 	.agent-sessions-section {
 		display: flex;
 		flex-direction: column;
@@ -84,36 +68,188 @@
 		overflow: hidden;
 	}
 
-	.agent-sessions-content.collapsed {
-		display: none;
+	/* Top navigation: New Chat, Automations, Customize */
+	.agent-sessions-sidebar-nav {
+		display: flex;
+		flex-direction: column;
+		flex-shrink: 0;
+		gap: 4px;
+		padding: 4px 8px 8px;
 	}
 
-	/* Header row: label + action buttons */
-	.agent-sessions-header-row {
+	.agent-sessions-nav-item {
 		display: flex;
 		align-items: center;
-		padding: 8px 10px;
-		min-height: 40px;
+		gap: 10px;
+		width: 100%;
+		padding: 8px 8px;
+		border: none;
+		border-radius: var(--vscode-cornerRadius-medium);
+		background: transparent;
+		color: var(--vscode-foreground);
+		font-family: inherit;
+		font-size: var(--vscode-agents-fontSize-body1, 13px);
+		font-weight: var(--vscode-agents-fontWeight-regular, 400);
+		line-height: 20px;
+		text-align: left;
+		cursor: pointer;
+		appearance: none;
 		box-sizing: border-box;
-		-webkit-user-select: none;
-		user-select: none;
 	}
 
-	.agent-sessions-header-label {
+	.agent-sessions-nav-item:hover {
+		background: var(--vscode-list-hoverBackground);
+	}
+
+	.agent-sessions-nav-item:focus {
+		outline: none;
+	}
+
+	.agent-sessions-nav-item:focus-visible {
+		outline: 1px solid var(--vscode-focusBorder);
+		outline-offset: -1px;
+	}
+
+	.agent-sessions-nav-item.active {
+		background: var(--vscode-list-inactiveSelectionBackground);
+		color: var(--vscode-list-inactiveSelectionForeground, var(--vscode-foreground));
+	}
+
+	.agent-sessions-nav-icon {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 16px;
+		height: 16px;
+		font-size: 16px;
+		color: inherit;
+	}
+
+	.agent-sessions-nav-label {
 		flex: 1;
 		min-width: 0;
-		font-size: var(--vscode-agents-fontSize-label1, 12px);
-		font-weight: var(--vscode-agents-fontWeight-semiBold, 600);
-		color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
 
+	.agent-sessions-workspaces-header {
+		display: flex;
+		align-items: center;
+		flex-shrink: 0;
+		gap: 4px;
+		padding: 8px 8px 6px 16px;
+		-webkit-user-select: none;
+		user-select: none;
+	}
+
+	.agent-sessions-workspaces-label {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: var(--vscode-agents-fontSize-label2, 11px);
+		font-weight: var(--vscode-agents-fontWeight-semiBold, 600);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--vscode-descriptionForeground);
+	}
+
+	.agent-sessions-machine-filter {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		min-width: 0;
+		margin: -2px 0 -2px -6px;
+		padding: 2px 4px 2px 6px;
+		border: none;
+		border-radius: 4px;
+		background: transparent;
+		cursor: pointer;
+		appearance: none;
+		font-size: var(--vscode-agents-fontSize-label2, 11px);
+		font-weight: var(--vscode-agents-fontWeight-semiBold, 600);
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--vscode-descriptionForeground);
+	}
+
+	.agent-sessions-machine-filter:hover {
+		background: var(--vscode-list-hoverBackground);
+		color: var(--vscode-foreground);
+	}
+
+	.agent-sessions-machine-filter:focus {
+		outline: none;
+	}
+
+	.agent-sessions-machine-filter:focus-visible {
+		outline: 1px solid var(--vscode-focusBorder);
+		outline-offset: -1px;
+	}
+
+	.agent-sessions-machine-filter-label {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.agent-sessions-machine-filter-chevron {
+		flex-shrink: 0;
+		font-size: 12px;
+	}
+
+	.agent-sessions-workspaces-actions {
+		display: flex;
+		align-items: center;
+		flex-shrink: 0;
+		margin-left: auto;
+	}
+
+	.agent-sessions-workspaces-actions .actions-container {
+		gap: 2px;
+	}
+
+	.agent-sessions-workspaces-actions .action-label {
+		color: var(--vscode-icon-foreground, var(--vscode-descriptionForeground));
+	}
+
+	.agent-sessions-content.collapsed {
+		display: none;
+	}
+
+	/* Header row: find widget only (hidden until search opens) */
+	.agent-sessions-header-row {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		padding: 4px 10px 8px;
+		min-height: 32px;
+		box-sizing: border-box;
+		-webkit-user-select: none;
+		user-select: none;
+	}
+
+	.agent-sessions-header-row.find-only {
+		justify-content: flex-end;
+		padding: 0 10px 4px;
+		min-height: 0;
+	}
+
+	.agent-sessions-header-row.find-only:not(.find-open) {
+		display: none;
+	}
+
+	.agent-sessions-header-row.find-only:not(.find-open) .agent-sessions-find-widget-container {
+		display: none !important;
+	}
+
 	.agent-sessions-header-actions {
 		display: flex;
 		align-items: center;
-		margin-left: auto;
 		flex-shrink: 0;
 	}
 
@@ -121,7 +257,7 @@
 		gap: 4px;
 	}
 
-	/* Inline search input — replaces label + actions when active */
+	/* Inline search input — occupies the search slot; filter overflow stays visible */
 	.agent-sessions-find-widget-container {
 		flex: 1;
 		min-width: 0;
@@ -172,11 +308,6 @@
 	.agent-sessions-control-container {
 		flex: 1;
 		overflow: hidden;
-	}
-
-	.agent-sessions-customizations-section {
-		overflow: hidden;
-		min-height: 0;
 	}
 }
 .agent-sessions-workbench.shell-gradient-background .agent-sessions-viewpane {

@@ -683,7 +683,8 @@ MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {
 		id: NEW_UNTITLED_FILE_COMMAND_ID,
 		title: nls.localize({ key: 'miNewFile', comment: ['&& denotes a mnemonic'] }, "&&New Text File")
 	},
-	order: 1
+	order: 1,
+	when: IsSessionsWindowContext.negate()
 });
 
 MenuRegistry.appendMenuItem(MenuId.MenubarFileMenu, {

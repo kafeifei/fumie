@@ -151,12 +151,43 @@ export interface IByokLmModelInfo {
 	readonly modelIdentifier?: string;
 	/** Maximum context window tokens (prompt + output), when known. */
 	readonly maxContextWindowTokens?: number;
+	/** Maximum output tokens, when known. */
+	readonly maxOutputTokens?: number;
 	/** Whether the model accepts image inputs, when known. */
 	readonly supportsVision?: boolean;
 	/** Reasoning effort values advertised by the renderer model, when known. */
 	readonly supportedReasoningEfforts?: readonly string[];
 	/** Default reasoning effort advertised by the renderer model, when known. */
 	readonly defaultReasoningEffort?: string;
+	/** Harness ids the provider declares this model compatible with. */
+	readonly supportedHarnesses?: readonly string[];
+	/**
+	 * Set when the serving renderer has this model hidden in "Manage Models".
+	 * Hidden rows still cross the bridge: a client that reaches the catalog only
+	 * through the host (the Agents window in a browser) has no other way to learn
+	 * the row exists, and a page that omits it cannot show the user why. Nothing
+	 * offers a hidden model for selection — see {@link visibleByokLmModels}.
+	 */
+	readonly hidden?: boolean;
+}
+
+/**
+ * The rows a model picker, a proxy `/models` listing or a harness session config
+ * may offer, i.e. the catalog minus what the user hid in "Manage Models".
+ * Callers that describe the catalog rather than offer from it — the harness model
+ * lists published to clients — keep the hidden rows and carry the flag on.
+ */
+export function visibleByokLmModels(models: readonly IByokLmModelInfo[]): readonly IByokLmModelInfo[] {
+	return models.filter(model => !model.hidden);
+}
+
+/** Resolved provider configuration for one renderer BYOK model. */
+export interface IByokLmProviderConfiguration {
+	readonly modelIdentifier: string;
+	readonly vendor: string;
+	readonly groupName: string;
+	readonly modelId: string;
+	readonly configuration: Record<string, unknown>;
 }
 
 /**
@@ -174,6 +205,27 @@ export function getByokLmSelectionModelId(model: IByokLmModelInfo): string {
 /** Returns the provider-qualified model id advertised by the agent host. */
 export function getByokLmAgentModelId(model: IByokLmModelInfo): string {
 	return `${model.vendor}/${getByokLmSelectionModelId(model)}`;
+}
+
+/**
+ * Split an id produced by {@link getByokLmAgentModelId} back into the vendor
+ * (which selects the proxy route, `/v/<vendor>/…`) and the provider-local
+ * selection id (which goes into the request body's `model`).
+ *
+ * The split is structural — first `/` wins — because a harness has to make this
+ * call on a persisted {@link ModelSelection} whose model may no longer be in the
+ * catalog. It is only sound because a BYOK id is the *only* model id a harness
+ * advertises that carries a `/`: the subscription catalogs are bare slugs
+ * (`claude-opus-4.6`, `gpt-5.6-sol`) and the per-session provider ids are
+ * `@provider=`-prefixed with their halves url-encoded. Callers must therefore
+ * peel off any `@provider=` qualification before asking.
+ */
+export function parseByokLmAgentModelId(agentModelId: string): { readonly vendor: string; readonly modelId: string } | undefined {
+	const slash = agentModelId.indexOf('/');
+	if (slash <= 0 || slash === agentModelId.length - 1) {
+		return undefined;
+	}
+	return { vendor: agentModelId.slice(0, slash), modelId: agentModelId.slice(slash + 1) };
 }
 
 /** Resolves BYOK enablement and trace context from synchronized root configuration. */
@@ -210,6 +262,9 @@ export interface IAgentHostByokLmHandler {
 	 */
 	chat(request: IByokLmChatRequest, token: CancellationToken): Promise<IByokLmChatResult>;
 
+	/** Resolve the owning provider group for trusted native-harness routing. */
+	resolveProviderConfiguration?(modelIdentifier: string, token: CancellationToken): Promise<IByokLmProviderConfiguration | undefined>;
+
 	/**
 	 * Enumerate the renderer's BYOK models (vendor `isBYOK`, excluding
 	 * session-scoped agent-host copies) so the node agent host can synthesize
@@ -225,6 +280,7 @@ export interface IAgentHostByokLmHandler {
  */
 export interface IByokLmBridgeConnection {
 	chat(request: IByokLmChatRequest): Promise<IByokLmChatResult>;
+	resolveProviderConfiguration?(modelIdentifier: string): Promise<IByokLmProviderConfiguration | undefined>;
 	/** Emits the renderer's current BYOK model snapshot on subscribe and on every change. */
 	readonly onDidChangeModels: Event<IByokLmModelInfo[]>;
 }

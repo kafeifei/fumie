@@ -64,6 +64,15 @@ export class RemoteAgentHostLocationPreferenceService extends Disposable impleme
 		this._onDidChangePreference.fire(hostKey);
 	}
 
+	clearPreference(hostKey: string): void {
+		const preferences = this._readPreferences();
+		if (!preferences.delete(hostKey)) {
+			return;
+		}
+		this._writePreferences(preferences);
+		this._onDidChangePreference.fire(hostKey);
+	}
+
 	private _readPreferences(): Map<string, RemoteAgentHostLocationPreference> {
 		return parseRemoteAgentHostLocationPreferences(this._storageService.get(REMOTE_AGENT_HOST_LOCATION_PREFERENCE_STORAGE_KEY, StorageScope.APPLICATION));
 	}

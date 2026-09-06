@@ -343,6 +343,12 @@ class TestRemoteAgentHostLocationPreferenceService implements IRemoteAgentHostLo
 		return this._preferences.get(hostKey);
 	}
 
+	clearPreference(hostKey: string): void {
+		if (this._preferences.delete(hostKey)) {
+			this._onDidChangePreference.fire(hostKey);
+		}
+	}
+
 	setPreference(hostKey: string, preference: RemoteAgentHostLocationPreference): void {
 		this._preferences.set(hostKey, preference);
 		this._onDidChangePreference.fire(hostKey);

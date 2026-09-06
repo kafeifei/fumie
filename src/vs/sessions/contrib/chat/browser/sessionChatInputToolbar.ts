@@ -357,7 +357,6 @@ export class SessionChatInputToolbar extends Disposable {
 
 	setDebugData(data: ISessionChatPillsDebugData | undefined): void {
 		this._debugData.set(data, undefined);
-		this._browsers.setDebugData(data);
 		this._backgroundActivities.setDebugData(data);
 	}
 

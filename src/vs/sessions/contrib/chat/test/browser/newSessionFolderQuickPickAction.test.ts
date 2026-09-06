@@ -4,76 +4,51 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { Codicon } from '../../../../../base/common/codicons.js';
-import { Event } from '../../../../../base/common/event.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { upcastPartial } from '../../../../../base/test/common/mock.js';
-import { ILabelService } from '../../../../../platform/label/common/label.js';
-import { IQuickPickSeparator } from '../../../../../platform/quickinput/common/quickInput.js';
-import { ISessionWorkspace } from '../../../../services/sessions/common/session.js';
-import { IRecentWorkspace, ISessionsRecentWorkspacesService } from '../../../../services/sessions/browser/sessionsRecentWorkspacesService.js';
-import { buildFolderQuickPickItems, IFolderQuickPickItem } from '../../browser/newSessionFolderQuickPickAction.js';
+import { IFileDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
+import { ISessionsService } from '../../../../services/sessions/browser/sessionsService.js';
+import { pickFolderAndOpenNewSession, pickNativeSessionFolder } from '../../browser/newSessionFolderQuickPickAction.js';
 
-function isSeparator(item: IFolderQuickPickItem | IQuickPickSeparator): item is IQuickPickSeparator {
-	return (item as IQuickPickSeparator).type === 'separator';
-}
-
-function createResolvedRecent(uri: URI, providerId = 'local-1', checked = false): IRecentWorkspace {
-	const name = uri.path.substring(1) || uri.path;
-	const workspace: ISessionWorkspace = {
-		uri,
-		label: name,
-		icon: Codicon.folder,
-		folders: [{ root: uri, workingDirectory: uri, name, description: undefined }],
-		requiresWorkspaceTrust: false,
-		isVirtualWorkspace: false,
-	};
-	return { workspace, providerId, checked };
-}
-
-function createRecentWorkspacesService(recent: IRecentWorkspace[]): ISessionsRecentWorkspacesService {
-	return upcastPartial<ISessionsRecentWorkspacesService>({
-		_serviceBrand: undefined,
-		onDidChangeRecentWorkspaces: Event.None,
-		getRecentWorkspaces: () => recent,
-	});
-}
-
-const labelService = upcastPartial<ILabelService>({ getUriLabel: (uri: URI) => uri.fsPath });
-
-suite('New Session Folder Quick Pick', () => {
+suite('New Session Folder Dialog', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('lists the sessions\' own recents followed by VS Code\'s recents, then a Browse entry', () => {
-		const ownRecentUri = URI.file('/repo-a');
-		const vsCodeRecentUri = URI.file('/repo-b');
-
-		const recentWorkspacesService = createRecentWorkspacesService([
-			createResolvedRecent(ownRecentUri, 'provider-a'),
-			createResolvedRecent(vsCodeRecentUri, 'provider-b'),
-		]);
-
-		const items = buildFolderQuickPickItems(recentWorkspacesService, labelService);
-
-		const folderItems = items.filter((i): i is IFolderQuickPickItem => !isSeparator(i) && !i.browse);
-		assert.deepStrictEqual(folderItems.map(i => i.folderUri?.toString()), [ownRecentUri.toString(), vsCodeRecentUri.toString()]);
-		assert.deepStrictEqual(folderItems.map(i => i.providerId), ['provider-a', 'provider-b'], 'each item carries its recent entry\'s provider ID');
-
-		const separators = items.filter(isSeparator);
-		assert.strictEqual(separators.length, 2);
-
-		const lastItem = items[items.length - 1];
-		assert.ok(!isSeparator(lastItem) && lastItem.browse, 'last item is the Browse action');
+	test('opens a new session for the folder chosen in the native dialog', async () => {
+		const folderUri = URI.file('/repo');
+		let opened: URI | undefined;
+		await pickFolderAndOpenNewSession(
+			upcastPartial<IFileDialogService>({ showOpenDialog: async () => [folderUri] }),
+			upcastPartial<ISessionsService>({
+				openNewSession: async options => {
+					opened = options?.folderUri;
+					return { session: undefined, trustDeclined: false };
+				},
+			}),
+		);
+		assert.strictEqual(opened?.toString(), folderUri.toString());
 	});
 
-	test('always includes the Browse entry, even with no recents', () => {
-		const recentWorkspacesService = createRecentWorkspacesService([]);
+	test('does nothing when the native dialog is cancelled', async () => {
+		let opened = false;
+		await pickFolderAndOpenNewSession(
+			upcastPartial<IFileDialogService>({ showOpenDialog: async () => undefined }),
+			upcastPartial<ISessionsService>({
+				openNewSession: async () => {
+					opened = true;
+					return { session: undefined, trustDeclined: false };
+				},
+			}),
+		);
+		assert.strictEqual(opened, false);
+	});
 
-		const items = buildFolderQuickPickItems(recentWorkspacesService, labelService);
-
-		assert.strictEqual(items.length, 1);
-		assert.ok(!isSeparator(items[0]) && items[0].browse, 'the single item is the Browse action');
+	test('returns the folder chosen in the native dialog', async () => {
+		const folderUri = URI.file('/repo');
+		const picked = await pickNativeSessionFolder(
+			upcastPartial<IFileDialogService>({ showOpenDialog: async () => [folderUri] }),
+		);
+		assert.strictEqual(picked?.toString(), folderUri.toString());
 	});
 });

@@ -11,7 +11,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { URI } from '../../../../../base/common/uri.js';
 import Severity from '../../../../../base/common/severity.js';
-import { SubmenuAction } from '../../../../../base/common/actions.js';
+import { SubmenuAction, toAction } from '../../../../../base/common/actions.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { ChatMessageRole, LanguageModelsService, IChatMessage, IChatResponsePart, ILanguageModelChatMetadata, createModelConfigurationActions, ILanguageModelConfigurationSchema, getByokProviderTelemetryName, THIRD_PARTY_PROVIDER_TELEMETRY_NAME, COPILOT_VENDOR_ID, getLanguageModelDisplayNameWithProvider, ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService } from '../../common/languageModels.js';
 import { IPromptChoice, IPromptOptions } from '../../../../../platform/notification/common/notification.js';
@@ -38,14 +38,23 @@ suite('LanguageModels', function () {
 
 	const store = new DisposableStore();
 	const activationEvents = new Set<string>();
+	const configuredGroups: ILanguageModelsProviderGroup[] = [];
+	let activateByEventHook: ((name: string) => Promise<void>) | undefined;
+	let configurationReady: DeferredPromise<void>;
 
 	setup(function () {
+		configuredGroups.length = 0;
+		activateByEventHook = undefined;
+		configurationReady = new DeferredPromise<void>();
 
 		languageModels = new LanguageModelsService(
 			new class extends mock<IExtensionService>() {
+				override whenInstalledExtensionsRegistered() {
+					return Promise.resolve(true);
+				}
 				override activateByEvent(name: string) {
 					activationEvents.add(name);
-					return Promise.resolve();
+					return activateByEventHook?.(name) ?? Promise.resolve();
 				}
 			},
 			new NullLogService(),
@@ -53,8 +62,9 @@ suite('LanguageModels', function () {
 			new MockContextKeyService(),
 			new class extends mock<ILanguageModelsConfigurationService>() {
 				override onDidChangeLanguageModelGroups = Event.None;
+				override readonly whenReady = configurationReady.p;
 				override getLanguageModelsProviderGroups() {
-					return [];
+					return configuredGroups;
 				}
 			},
 			new class extends mock<IQuickInputService>() { },
@@ -141,6 +151,278 @@ suite('LanguageModels', function () {
 
 		const result2 = await languageModels.selectLanguageModels({ vendor: 'test-vendor', family: 'FAKE' });
 		assert.deepStrictEqual(result2.length, 0);
+	});
+
+	test('preserves explicit status for a successful empty provider resolution', async function () {
+		const vendor = 'status-only-vendor';
+		const action = toAction({ id: 'recover-status-only-vendor', label: 'Connect', run: () => undefined });
+		languageModels.deltaLanguageModelChatProviderDescriptors([{
+			vendor,
+			displayName: 'Status Only Vendor',
+			configuration: undefined,
+			managementCommand: undefined,
+			when: undefined,
+		}], []);
+		store.add(languageModels.registerLanguageModelProvider(vendor, {
+			onDidChange: Event.None,
+			provideLanguageModelChatInfo: async () => [],
+			provideLanguageModelChatStatus: async () => ({
+				message: 'No models available',
+				severity: Severity.Warning,
+				action,
+			}),
+			sendChatRequest: async () => { throw new Error(); },
+			provideTokenCount: async () => { throw new Error(); },
+		}));
+
+		await languageModels.selectLanguageModels({ vendor });
+
+		const groups = languageModels.getLanguageModelGroups(vendor);
+		assert.deepStrictEqual(groups.map(group => ({
+			modelIdentifiers: group.modelIdentifiers,
+			status: group.status && { message: group.status.message, severity: group.status.severity },
+		})), [{
+			modelIdentifiers: [],
+			status: {
+				message: 'No models available',
+				severity: Severity.Warning,
+			},
+		}]);
+		assert.strictEqual(groups[0].status?.action, action);
+	});
+
+	test('preserves provider status alongside resolved model identifiers', async function () {
+		const vendor = 'status-with-model-vendor';
+		languageModels.deltaLanguageModelChatProviderDescriptors([{
+			vendor,
+			displayName: 'Status With Model Vendor',
+			configuration: undefined,
+			managementCommand: undefined,
+			when: undefined,
+		}], []);
+		store.add(languageModels.registerLanguageModelProvider(vendor, {
+			onDidChange: Event.None,
+			provideLanguageModelChatInfo: async () => [{
+				identifier: `${vendor}/projected-model`,
+				metadata: {
+					extension: nullExtensionDescription.identifier,
+					name: 'Projected model',
+					id: 'projected-model',
+					vendor,
+					family: 'projected-model',
+					version: '1.0',
+					maxInputTokens: 100,
+					maxOutputTokens: 100,
+					isDefaultForLocation: {},
+				},
+			}],
+			provideLanguageModelChatStatus: async () => ({ message: 'Connect account', severity: Severity.Warning }),
+			sendChatRequest: async () => { throw new Error(); },
+			provideTokenCount: async () => { throw new Error(); },
+		}));
+
+		await languageModels.selectLanguageModels({ vendor });
+
+		assert.deepStrictEqual(languageModels.getLanguageModelGroups(vendor).map(group => ({
+			modelIdentifiers: group.modelIdentifiers,
+			status: group.status && { message: group.status.message, severity: group.status.severity },
+		})), [{
+			modelIdentifiers: [`${vendor}/projected-model`],
+			status: { message: 'Connect account', severity: Severity.Warning },
+		}]);
+	});
+
+	// A vendor may register what its agent can run while another vendor is the one
+	// that offers those rows (an agent host and the subscription provider the user
+	// added for it). The catalog has to hold both — the context-usage gauge and
+	// session restore resolve a running model by identifier — while the picker
+	// lists only what the user may pick. Not a copilot-only rule: it applies
+	// wherever `isUserSelectable` is false.
+	test('registers a model that is not user selectable but keeps it out of the group', async function () {
+		const vendor = 'partly-hidden-vendor';
+		function model(id: string, isUserSelectable?: boolean): ILanguageModelChatMetadataAndIdentifier {
+			return {
+				identifier: `${vendor}:${id}`,
+				metadata: {
+					extension: nullExtensionDescription.identifier,
+					name: id,
+					id,
+					vendor,
+					family: id,
+					version: '1.0',
+					maxInputTokens: 100,
+					maxOutputTokens: 100,
+					isDefaultForLocation: {},
+					...(isUserSelectable !== undefined && { isUserSelectable }),
+				},
+			};
+		}
+		languageModels.deltaLanguageModelChatProviderDescriptors([{
+			vendor,
+			displayName: 'Partly Hidden Vendor',
+			configuration: undefined,
+			managementCommand: undefined,
+			when: undefined,
+		}], []);
+		store.add(languageModels.registerLanguageModelProvider(vendor, {
+			onDidChange: Event.None,
+			provideLanguageModelChatInfo: async () => [model('hidden-model', false), model('offered-model')],
+			sendChatRequest: async () => { throw new Error(); },
+			provideTokenCount: async () => { throw new Error(); },
+		}));
+
+		await languageModels.selectLanguageModels({ vendor });
+
+		assert.deepStrictEqual({
+			groups: languageModels.getLanguageModelGroups(vendor).map(group => group.modelIdentifiers),
+			hiddenResolves: languageModels.lookupLanguageModel(`${vendor}:hidden-model`)?.id,
+			offeredResolves: languageModels.lookupLanguageModel(`${vendor}:offered-model`)?.id,
+		}, {
+			groups: [[`${vendor}:offered-model`]],
+			hiddenResolves: 'hidden-model',
+			offeredResolves: 'offered-model',
+		});
+	});
+
+	test('a vendor whose models are all hidden lists no group at all', async function () {
+		const vendor = 'fully-hidden-vendor';
+		languageModels.deltaLanguageModelChatProviderDescriptors([{
+			vendor,
+			displayName: 'Fully Hidden Vendor',
+			configuration: undefined,
+			managementCommand: undefined,
+			when: undefined,
+		}], []);
+		store.add(languageModels.registerLanguageModelProvider(vendor, {
+			onDidChange: Event.None,
+			provideLanguageModelChatInfo: async () => [{
+				identifier: `${vendor}:hidden-model`,
+				metadata: {
+					extension: nullExtensionDescription.identifier,
+					name: 'Hidden model',
+					id: 'hidden-model',
+					vendor,
+					family: 'hidden-model',
+					version: '1.0',
+					maxInputTokens: 100,
+					maxOutputTokens: 100,
+					isDefaultForLocation: {},
+					isUserSelectable: false,
+				},
+			}],
+			sendChatRequest: async () => { throw new Error(); },
+			provideTokenCount: async () => { throw new Error(); },
+		}));
+
+		await languageModels.selectLanguageModels({ vendor });
+
+		// An empty group would render as a provider row with nothing under it;
+		// hiding every model has to look like publishing none.
+		assert.deepStrictEqual({
+			groups: languageModels.getLanguageModelGroups(vendor),
+			stillResolves: languageModels.lookupLanguageModel(`${vendor}:hidden-model`)?.id,
+		}, {
+			groups: [],
+			stillResolves: 'hidden-model',
+		});
+	});
+
+	test('resolves configured models when their vendor registers after configuration loading', async function () {
+		const modelChanged = new DeferredPromise<string>();
+		configuredGroups.push({ vendor: 'late-vendor', name: 'Configured' });
+		store.add(languageModels.onDidChangeLanguageModels(vendor => modelChanged.complete(vendor)));
+		activateByEventHook = async name => {
+			if (name !== 'onLanguageModelChatProvider:late-vendor') {
+				return;
+			}
+			store.add(languageModels.registerLanguageModelProvider('late-vendor', {
+				onDidChange: Event.None,
+				provideLanguageModelChatInfo: async () => [{
+					metadata: {
+						extension: nullExtensionDescription.identifier,
+						name: 'Late Model',
+						vendor: 'late-vendor',
+						family: 'late-family',
+						version: '1.0',
+						id: 'late-model',
+						maxInputTokens: 100,
+						maxOutputTokens: 100,
+						isDefaultForLocation: {},
+					} satisfies ILanguageModelChatMetadata,
+					identifier: 'late-vendor/late-model',
+				}],
+				sendChatRequest: async () => { throw new Error(); },
+				provideTokenCount: async () => { throw new Error(); },
+			}));
+		};
+
+		languageModels.deltaLanguageModelChatProviderDescriptors([{
+			vendor: 'late-vendor',
+			displayName: 'Late Vendor',
+			configuration: undefined,
+			managementCommand: undefined,
+			when: undefined,
+		}], []);
+
+		assert.deepStrictEqual({
+			changedVendor: await modelChanged.p,
+			activationRequested: activationEvents.has('onLanguageModelChatProvider:late-vendor'),
+			models: languageModels.getLanguageModelIds().filter(id => id.startsWith('late-vendor/')),
+		}, {
+			changedVendor: 'late-vendor',
+			activationRequested: true,
+			models: ['late-vendor/late-model'],
+		});
+	});
+
+	test('resolves configured models when configuration loads after their vendor', async function () {
+		const modelChanged = new DeferredPromise<string>();
+		store.add(languageModels.onDidChangeLanguageModels(vendor => modelChanged.complete(vendor)));
+		activateByEventHook = async name => {
+			if (name !== 'onLanguageModelChatProvider:late-config-vendor') {
+				return;
+			}
+			store.add(languageModels.registerLanguageModelProvider('late-config-vendor', {
+				onDidChange: Event.None,
+				provideLanguageModelChatInfo: async () => [{
+					metadata: {
+						extension: nullExtensionDescription.identifier,
+						name: 'Late Config Model',
+						vendor: 'late-config-vendor',
+						family: 'late-config-family',
+						version: '1.0',
+						id: 'late-config-model',
+						maxInputTokens: 100,
+						maxOutputTokens: 100,
+						isDefaultForLocation: {},
+					} satisfies ILanguageModelChatMetadata,
+					identifier: 'late-config-vendor/late-config-model',
+				}],
+				sendChatRequest: async () => { throw new Error(); },
+				provideTokenCount: async () => { throw new Error(); },
+			}));
+		};
+
+		languageModels.deltaLanguageModelChatProviderDescriptors([{
+			vendor: 'late-config-vendor',
+			displayName: 'Late Config Vendor',
+			configuration: undefined,
+			managementCommand: undefined,
+			when: undefined,
+		}], []);
+		configuredGroups.push({ vendor: 'late-config-vendor', name: 'Configured' });
+		configurationReady.complete();
+		await languageModels.whenReady;
+
+		assert.deepStrictEqual({
+			changedVendor: await modelChanged.p,
+			activationRequested: activationEvents.has('onLanguageModelChatProvider:late-config-vendor'),
+			models: languageModels.getLanguageModelIds().filter(id => id.startsWith('late-config-vendor/')),
+		}, {
+			changedVendor: 'late-config-vendor',
+			activationRequested: true,
+			models: ['late-config-vendor/late-config-model'],
+		});
 	});
 
 	test('sendChatRequest returns a response-stream', async function () {

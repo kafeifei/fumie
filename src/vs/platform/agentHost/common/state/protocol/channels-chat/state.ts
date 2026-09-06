@@ -1424,6 +1424,8 @@ export const enum ToolResultContentType {
 	FileEdit = 'fileEdit',
 	Terminal = 'terminal',
 	Subagent = 'subagent',
+	// FUMIE extension (pending upstream PR): structured todo list.
+	TodoList = 'todoList',
 }
 
 /**
@@ -1546,14 +1548,49 @@ export interface ToolResultSubagentContent {
 }
 
 /**
+ * A single item in a todo list surfaced by a tool result.
+ *
+ * FUMIE extension (pending upstream PR). Mirrors the workbench's own todo-list
+ * content shape so any harness (Codex / Claude / DeepSeek / …) can publish a
+ * structured task list that the client renders as a checklist instead of an
+ * opaque text blob.
+ *
+ * @category Tool Result Content
+ */
+export interface ToolResultTodoItem {
+	/** Stable item identifier */
+	id: string;
+	/** Human-readable item title */
+	title: string;
+	/** Current item status */
+	status: 'not-started' | 'in-progress' | 'completed';
+}
+
+/**
+ * A structured todo list in a tool result.
+ *
+ * FUMIE extension (pending upstream PR). Carries the current task list a
+ * harness's todo tool produced, so the client can render it as an interactive
+ * checklist.
+ *
+ * @category Tool Result Content
+ */
+export interface ToolResultTodoListContent {
+	type: ToolResultContentType.TodoList;
+	/** Ordered todo items */
+	todos: ToolResultTodoItem[];
+}
+
+/**
  * Content block in a tool result.
  *
  * Mirrors the content blocks in MCP `CallToolResult.content`, plus
  * `ToolResultResourceContent` for lazy-loading large results,
  * `ToolResultFileEditContent` for file edit diffs,
  * `ToolResultTerminalContent` for live terminal output and
- * command completion metadata, and
- * `ToolResultSubagentContent` for tool-spawned worker chats (AHP extensions).
+ * command completion metadata,
+ * `ToolResultSubagentContent` for tool-spawned worker chats (AHP extensions),
+ * and `ToolResultTodoListContent` for structured task lists (FUMIE extension).
  *
  * @category Tool Result Content
  */
@@ -1563,4 +1600,5 @@ export type ToolResultContent =
 	| ToolResultResourceContent
 	| ToolResultFileEditContent
 	| ToolResultTerminalContent
-	| ToolResultSubagentContent;
+	| ToolResultSubagentContent
+	| ToolResultTodoListContent;

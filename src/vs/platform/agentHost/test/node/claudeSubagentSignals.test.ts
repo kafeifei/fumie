@@ -12,11 +12,13 @@ import { ActionType } from '../../common/state/sessionActions.js';
 import { ToolCallConfirmationReason, ToolCallContributorKind } from '../../common/state/sessionState.js';
 import { ClaudeMapperState, mapSDKMessageToAgentSignals } from '../../node/claude/claudeMapSessionEvents.js';
 import { SubagentRegistry } from '../../node/claude/claudeSubagentRegistry.js';
-import { buildTopLevelSubagentReadyAction, mapSubagentSystemMessage } from '../../node/claude/claudeSubagentSignals.js';
+import { buildTopLevelSubagentReadyAction, mapSubagentProcessRebuild, mapSubagentSystemMessage } from '../../node/claude/claudeSubagentSignals.js';
 import {
 	makeAssistantMessage,
 	makeContentBlockStartText,
 	makeContentBlockStartToolUse,
+	makeContentBlockStop,
+	makeMessageStart,
 	makeStreamEvent,
 	makeUserToolResultMessage,
 } from './claudeMapSessionEventsTestUtils.js';
@@ -359,7 +361,7 @@ suite('claudeSubagentSignals — Phase 12 emission', () => {
 		);
 
 		mapSDKMessageToAgentSignals(
-			{ type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: PARENT, description: 'bg' } as unknown as SDKMessage,
+			{ type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: PARENT, description: 'bg', is_backgrounded: true } as unknown as SDKMessage,
 			SESSION, TURN_ID, state, log, registry,
 		);
 
@@ -393,6 +395,287 @@ suite('claudeSubagentSignals — Phase 12 emission', () => {
 			completedToolCallId: PARENT,
 			afterNotificationAgainKinds: [],
 			spawnClearedAfterNotification: undefined,
+		});
+	});
+
+	test('foreground task_started stays on the tool_result completion path', () => {
+		const state = new ClaudeMapperState();
+		const log = new NullLogService();
+		const registry = r();
+		const PARENT = 'toolu_fg_task';
+
+		mapSDKMessageToAgentSignals(
+			makeStreamEvent(SESSION_ID, makeContentBlockStartToolUse(0, PARENT, 'Task')),
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const onStart = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_started', task_id: 't-fg', tool_use_id: PARENT, description: 'fg', is_backgrounded: false } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const isBackground = registry.getSpawn(PARENT)?.background;
+		const afterToolResult = mapSDKMessageToAgentSignals(
+			makeUserToolResultMessage(SESSION_ID, PARENT, 'done'),
+			SESSION, TURN_ID, state, log, registry,
+		);
+
+		assert.deepStrictEqual({
+			onStartKinds: onStart.map(s => s.kind),
+			isBackground,
+			afterToolResultKinds: afterToolResult.map(s => s.kind),
+			completedToolCallId: afterToolResult.find(s => s.kind === 'subagent_completed')?.toolCallId,
+			spawnCleared: registry.getSpawn(PARENT),
+		}, {
+			onStartKinds: [],
+			isBackground: false,
+			afterToolResultKinds: ['action', 'subagent_completed'],
+			completedToolCallId: PARENT,
+			spawnCleared: undefined,
+		});
+	});
+
+	test('legacy task_started without is_backgrounded keeps the historical background behavior', () => {
+		const state = new ClaudeMapperState();
+		const log = new NullLogService();
+		const registry = r();
+		const PARENT = 'toolu_legacy_bg_task';
+
+		mapSDKMessageToAgentSignals(
+			makeStreamEvent(SESSION_ID, makeContentBlockStartToolUse(0, PARENT, 'Task')),
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const onStart = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_started', task_id: 't-legacy-bg', tool_use_id: PARENT, description: 'legacy bg' } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+
+		assert.deepStrictEqual({
+			onStartKinds: onStart.map(s => s.kind),
+			isBackground: registry.getSpawn(PARENT)?.background,
+		}, {
+			onStartKinds: ['subagent_started'],
+			isBackground: true,
+		});
+	});
+
+	test('task_updated moves a foreground subagent to deferred background completion', () => {
+		const state = new ClaudeMapperState();
+		const log = new NullLogService();
+		const registry = r();
+		const PARENT = 'toolu_later_bg_task';
+
+		mapSDKMessageToAgentSignals(
+			makeStreamEvent(SESSION_ID, makeContentBlockStartToolUse(0, PARENT, 'Task')),
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const onStart = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_started', task_id: 't-later-bg', tool_use_id: PARENT, description: 'fg', is_backgrounded: false } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const onBackground = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_updated', task_id: 't-later-bg', patch: { is_backgrounded: true } } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const afterToolResult = mapSDKMessageToAgentSignals(
+			makeUserToolResultMessage(SESSION_ID, PARENT, 'now running in background'),
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const afterNotification = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_notification', task_id: 't-later-bg', tool_use_id: PARENT, status: 'completed' } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const updateAfterCompletion = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_updated', task_id: 't-later-bg', patch: { is_backgrounded: true } } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+
+		assert.deepStrictEqual({
+			onStartKinds: onStart.map(s => s.kind),
+			onBackgroundKinds: onBackground.map(s => s.kind),
+			backgroundToolCallId: onBackground.find(s => s.kind === 'subagent_started')?.toolCallId,
+			afterToolResultKinds: afterToolResult.map(s => s.kind),
+			afterNotificationKinds: afterNotification.map(s => s.kind),
+			updateAfterCompletionKinds: updateAfterCompletion.map(s => s.kind),
+		}, {
+			onStartKinds: [],
+			onBackgroundKinds: ['subagent_started'],
+			backgroundToolCallId: PARENT,
+			afterToolResultKinds: ['action'],
+			afterNotificationKinds: ['subagent_completed'],
+			updateAfterCompletionKinds: [],
+		});
+	});
+
+	test('background task_started announces subagent_started once with the spawn metadata; inner messages and repeat task_started do not duplicate it', () => {
+		// A background subagent's inner content never flows through the
+		// parent stream, so `task_started` is the only place its child
+		// session can be announced — without this the subagent is
+		// invisible in the UI for its entire lifetime.
+		const state = new ClaudeMapperState();
+		const log = new NullLogService();
+		const registry = r();
+		const PARENT = 'toolu_bg_announce';
+
+		mapSDKMessageToAgentSignals(
+			makeStreamEvent(SESSION_ID, makeContentBlockStartToolUse(0, PARENT, 'Task')),
+			SESSION, TURN_ID, state, log, registry,
+		);
+		mapSDKMessageToAgentSignals(
+			makeAssistantMessage(SESSION_ID, [{
+				type: 'tool_use',
+				id: PARENT,
+				name: 'Task',
+				input: { description: 'Trace composer race', subagent_type: 'Explore', prompt: 'Find the race...' },
+			}]),
+			SESSION, TURN_ID, state, log, registry,
+		);
+
+		const onStart = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: PARENT, description: 'bg', is_backgrounded: true } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const onStartAgain = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: PARENT, description: 'bg', is_backgrounded: true } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+		const unknownStart = mapSDKMessageToAgentSignals(
+			{ type: 'system', subtype: 'task_started', task_id: 't2', tool_use_id: 'toolu_never_spawned', description: 'bg' } as unknown as SDKMessage,
+			SESSION, TURN_ID, state, log, registry,
+		);
+
+		const innerText = makeStreamEvent(SESSION_ID, makeContentBlockStartText(0));
+		innerText.parent_tool_use_id = PARENT;
+		const inner = mapSDKMessageToAgentSignals(innerText, SESSION, TURN_ID, state, log, registry);
+
+		const started = onStart[0];
+		assert.ok(started?.kind === 'subagent_started', 'task_started announces the subagent');
+		assert.deepStrictEqual({
+			onStartKinds: onStart.map(s => s.kind),
+			toolCallId: started.toolCallId,
+			agentName: started.agentName,
+			agentDisplayName: started.agentDisplayName,
+			taskDescription: started.taskDescription,
+			taskPrompt: started.taskPrompt,
+			isBackground: registry.getSpawn(PARENT)?.background,
+			onStartAgainKinds: onStartAgain.map(s => s.kind),
+			unknownStartKinds: unknownStart.map(s => s.kind),
+			innerKinds: inner.map(s => s.kind),
+		}, {
+			onStartKinds: ['subagent_started'],
+			toolCallId: PARENT,
+			agentName: 'Explore',
+			agentDisplayName: 'Explore',
+			taskDescription: 'Trace composer race',
+			taskPrompt: 'Find the race...',
+			isBackground: true,
+			onStartAgainKinds: [],
+			unknownStartKinds: [],
+			innerKinds: ['action'],
+		});
+	});
+
+	test('a Task nested inside a subagent is recorded as its own spawn, so the nested child is announced with its metadata and its immediate parent', () => {
+		// E2: without a spawn record for the nested Task, `tagWithParent`
+		// finds nothing to announce for it, the host never creates the
+		// nested chat, and every signal the nested subagent produces is
+		// buffered against a subagent that never starts — the whole nested
+		// transcript is lost.
+		const state = new ClaudeMapperState();
+		const log = new NullLogService();
+		const registry = r();
+		const OUTER = 'toolu_outer_task';
+		const NESTED = 'toolu_nested_task';
+
+		mapSDKMessageToAgentSignals(
+			makeAssistantMessage(SESSION_ID, [{
+				type: 'tool_use', id: OUTER, name: 'Task',
+				input: { description: 'Audit', subagent_type: 'Explore', prompt: 'Audit the diff' },
+			}]),
+			SESSION, TURN_ID, state, log, registry,
+		);
+
+		const outerInner = makeAssistantMessage(SESSION_ID, [{
+			type: 'tool_use', id: NESTED, name: 'Task',
+			input: { description: 'Count files', subagent_type: 'Plan', prompt: 'Count the TS files' },
+		}]);
+		outerInner.parent_tool_use_id = OUTER;
+		mapSDKMessageToAgentSignals(outerInner, SESSION, TURN_ID, state, log, registry);
+
+		const nestedOutput = makeAssistantMessage(SESSION_ID, [{ type: 'text', text: 'found 12 files', citations: null }]);
+		nestedOutput.parent_tool_use_id = NESTED;
+		const out = mapSDKMessageToAgentSignals(nestedOutput, SESSION, TURN_ID, state, log, registry);
+		const started = out.find(s => s.kind === 'subagent_started');
+
+		assert.deepStrictEqual({
+			kinds: out.map(s => s.kind),
+			startedToolCallId: started?.kind === 'subagent_started' ? started.toolCallId : undefined,
+			// The one-hop reference the host resolves into the immediate
+			// parent chat, so the nested chat is rendered inside its
+			// spawning subagent rather than the top-level chat.
+			startedParentToolCallId: started?.kind === 'subagent_started' ? started.parentToolCallId : undefined,
+			startedAgentName: started?.kind === 'subagent_started' ? started.agentName : undefined,
+			startedTaskPrompt: started?.kind === 'subagent_started' ? started.taskPrompt : undefined,
+			outputParent: out.find(s => s.kind === 'action')?.parentToolCallId,
+		}, {
+			kinds: ['subagent_started', 'model_call_completed', 'action'],
+			startedToolCallId: NESTED,
+			startedParentToolCallId: OUTER,
+			startedAgentName: 'Plan',
+			startedTaskPrompt: 'Count the TS files',
+			outputParent: NESTED,
+		});
+	});
+
+	test('an inner tool block does not occupy the top-level content-block index namespace', () => {
+		// E7: inner content carries the SDK's per-message block index, but
+		// that index namespace belongs to the top-level partial stream. A
+		// background subagent reporting mid-stream would otherwise leave a
+		// residue the next top-level `content_block_stop` picks up: it
+		// re-finalizes the inner tool (dropping its seeded rich input) and
+		// emits a `ChatToolCallReady` for the inner tool on the top-level
+		// turn, where no matching `ChatToolCallStart` exists.
+		const state = new ClaudeMapperState();
+		const log = new NullLogService();
+		const registry = r();
+		const PARENT = 'toolu_bg_task';
+
+		mapSDKMessageToAgentSignals(
+			makeAssistantMessage(SESSION_ID, [{
+				type: 'tool_use', id: PARENT, name: 'Task',
+				input: { description: 'Audit', subagent_type: 'Explore', prompt: 'Audit the diff' },
+			}]),
+			SESSION, TURN_ID, state, log, registry,
+		);
+
+		// Top-level text block opens at index 0.
+		mapSDKMessageToAgentSignals(makeStreamEvent(SESSION_ID, makeMessageStart('msg_top')), SESSION, TURN_ID, state, log, registry);
+		mapSDKMessageToAgentSignals(makeStreamEvent(SESSION_ID, makeContentBlockStartText(0)), SESSION, TURN_ID, state, log, registry);
+
+		// The subagent reports while that block is still open; its own
+		// tool_use also sits at block index 0 of ITS message.
+		const innerAssistant = makeAssistantMessage(SESSION_ID, [
+			{ type: 'tool_use', id: 'toolu_inner_glob', name: 'Glob', input: { pattern: '**/*.ts' } },
+		]);
+		innerAssistant.parent_tool_use_id = PARENT;
+		mapSDKMessageToAgentSignals(innerAssistant, SESSION, TURN_ID, state, log, registry);
+
+		// The top-level text block closes.
+		const stop = mapSDKMessageToAgentSignals(makeStreamEvent(SESSION_ID, makeContentBlockStop(0)), SESSION, TURN_ID, state, log, registry);
+
+		const innerResult = makeUserToolResultMessage(SESSION_ID, 'toolu_inner_glob', 'a.ts\nb.ts');
+		innerResult.parent_tool_use_id = PARENT;
+		const complete = mapSDKMessageToAgentSignals(innerResult, SESSION, TURN_ID, state, log, registry)
+			.find(s => s.kind === 'action' && s.action.type === ActionType.ChatToolCallComplete);
+
+		assert.deepStrictEqual({
+			stopKinds: stop.map(s => s.kind),
+			stopToolCallIds: stop.map(s => s.kind === 'action' && s.action.type === ActionType.ChatToolCallReady ? s.action.toolCallId : undefined),
+			completePastTense: complete?.kind === 'action' && complete.action.type === ActionType.ChatToolCallComplete
+				? complete.action.result.pastTenseMessage
+				: undefined,
+		}, {
+			stopKinds: [],
+			stopToolCallIds: [],
+			completePastTense: { markdown: 'Find files matching `**/*.ts`' },
 		});
 	});
 
@@ -440,6 +723,49 @@ suite('claudeSubagentSignals — Phase 12 emission', () => {
 			inProgressKinds: [],
 			missingIdKinds: [],
 			unknownEntryKinds: [],
+		});
+	});
+
+	test('mapSubagentProcessRebuild completes every open spawn, foreground and background alike', () => {
+		// A rebind replaces the CLI subprocess. Both completion routes — the
+		// foreground `tool_result` and the background `task_notification` —
+		// were emissions of the process that just died, so every open spawn
+		// must be closed here or its chat keeps a live turn forever and the
+		// session summary stays pinned to InProgress.
+		const registry = r();
+		registry.recordSpawn('toolu_fg');
+		const bg = registry.recordSpawn('toolu_bg');
+		bg.background = true;
+
+		const signals = mapSubagentProcessRebuild(SESSION, registry);
+
+		assert.deepStrictEqual({
+			signals: signals.map(s => ({ kind: s.kind, toolCallId: (s as { toolCallId?: string }).toolCallId })).sort((a, b) => (a.toolCallId ?? '').localeCompare(b.toolCallId ?? '')),
+			registryDrained: [registry.getSpawn('toolu_fg'), registry.getSpawn('toolu_bg')],
+		}, {
+			signals: [
+				{ kind: 'subagent_completed', toolCallId: 'toolu_bg' },
+				{ kind: 'subagent_completed', toolCallId: 'toolu_fg' },
+			],
+			registryDrained: [undefined, undefined],
+		});
+	});
+
+	test('mapSubagentProcessRebuild does not re-complete a spawn a real completion route already closed, and is a no-op with nothing open', () => {
+		const registry = r();
+		const alreadyDone = registry.recordSpawn('toolu_done');
+		alreadyDone.markCompleted(); // the real `tool_result` / `task_notification` route got there first
+		registry.recordSpawn('toolu_open');
+
+		const first = mapSubagentProcessRebuild(SESSION, registry);
+		const second = mapSubagentProcessRebuild(SESSION, registry);
+
+		assert.deepStrictEqual({
+			firstIds: first.map(s => (s as { toolCallId?: string }).toolCallId),
+			secondIds: second.map(s => (s as { toolCallId?: string }).toolCallId),
+		}, {
+			firstIds: ['toolu_open'],
+			secondIds: [],
 		});
 	});
 

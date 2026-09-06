@@ -176,6 +176,12 @@ export interface IChatUsageModelTotal {
 export interface IChatUsage {
 	promptTokens: number;
 	completionTokens: number;
+	/**
+	 * Of {@link promptTokens}, how many were prompt-cache read hits on the
+	 * most recent model call, when the provider reports it. Lets the
+	 * context-usage popup show the cached share of the prompt.
+	 */
+	cachedPromptTokens?: number;
 	outputBuffer?: number;
 	promptTokenDetails?: readonly IChatUsagePromptTokenDetail[];
 	/**
@@ -204,6 +210,13 @@ export interface IChatUsage {
 	 * can look up the real model's metadata (context window size, etc.).
 	 */
 	actualModelId?: string;
+	/**
+	 * Context-window dimensions of the model that served the request, as
+	 * reported by the backend. The context-usage widget uses this as the
+	 * gauge denominator when the model's catalog metadata advertises no
+	 * window sizes (e.g. host-managed gateway models).
+	 */
+	modelContextWindow?: { readonly totalTokens: number; readonly maxOutputTokens?: number };
 	kind: 'usage';
 }
 
@@ -1873,6 +1886,14 @@ export interface IChatSendRequestOptions {
 	attachedContext?: IChatRequestVariableEntry[];
 	resolvedVariables?: IChatRequestVariableEntry[];
 	agentHostSessionConfig?: Record<string, unknown>;
+	/**
+	 * Initial agent-host session metadata (`_meta`) contributed by the sender.
+	 * Only meaningful for the first request of a session, where it is merged
+	 * into the `createSession` `_meta` bag. The Agents window uses this to hand
+	 * over metadata its client-local composer draft collected before the
+	 * backend session existed.
+	 */
+	agentHostSessionMetadata?: Record<string, unknown>;
 
 	/** The target agent ID can be specified with this property instead of using @ in 'message' */
 	agentId?: string;

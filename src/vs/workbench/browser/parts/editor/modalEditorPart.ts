@@ -10,6 +10,7 @@ import { StandardKeyboardEvent } from '../../../../base/browser/keyboardEvent.js
 import { ActionBar, prepareActions } from '../../../../base/browser/ui/actionbar/actionbar.js';
 import { Button } from '../../../../base/browser/ui/button/button.js';
 import { Action, Separator } from '../../../../base/common/actions.js';
+import { RunOnceScheduler } from '../../../../base/common/async.js';
 import { ThemeIcon } from '../../../../base/common/themables.js';
 import { Orientation, Sash, SashState } from '../../../../base/browser/ui/sash/sash.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
@@ -290,7 +291,14 @@ export class ModalEditorPart {
 			options,
 		));
 		disposables.add(this.editorPartsView.registerPart(editorPart));
-		editorPart.create(editorPartContainer);
+		const removeEmptyGroupsScheduler = disposables.add(new RunOnceScheduler(() => editorPart.removeEmptyGroups(), 250));
+		disposables.add(editorPart.onDidAddGroup(() => removeEmptyGroupsScheduler.schedule()));
+		// A modal editor is a transient surface. Its grid state is deliberately
+		// not saved (see ModalEditorPartImpl.saveState), so it must not restore a
+		// stale grid left by an older build either. Restoring here can resurrect
+		// empty split groups and squeeze the actual editor into a narrow column.
+		editorPart.create(editorPartContainer, { restorePreviousState: false });
+		editorPart.removeEmptyGroups();
 
 		disposables.add(Event.once(editorPart.onWillClose)(() => disposables.dispose()));
 		disposables.add(Event.runAndSubscribe(editorPart.onDidChangeNavigation, ((navigation: IModalEditorNavigation | undefined) => {
@@ -347,7 +355,10 @@ export class ModalEditorPart {
 			setVisibility(hasActions, editorActionsSeparator);
 		};
 		disposables.add(Event.runAndSubscribe(modalEditorService.onDidActiveEditorChange, () => updateEditorActions()));
-		disposables.add(modalEditorService.onDidEditorsChange(() => editorPart.enforceModalPartOptions()));
+		disposables.add(modalEditorService.onDidEditorsChange(() => {
+			editorPart.removeEmptyGroups();
+			editorPart.enforceModalPartOptions();
+		}));
 
 		// Create global toolbar
 		disposables.add(scopedInstantiationService.createInstance(MenuWorkbenchToolBar, actionBarContainer, MenuId.ModalEditorTitle, {
@@ -960,6 +971,21 @@ class ModalEditorPartImpl extends EditorPart implements IModalEditorPart {
 			wrapTabs: false,
 			allowDropIntoGroup: false
 		});
+	}
+
+	removeEmptyGroups(): void {
+		// Empty groups have no useful meaning in a transient modal. They can be
+		// left behind by older state or by an editor closing, and otherwise consume
+		// most of the dialog while squeezing the editor that does have content.
+		for (const group of [...this.groups]) {
+			if (this.count === 1) {
+				break;
+			}
+
+			if (group.isEmpty) {
+				super.removeGroup(group, true);
+			}
+		}
 	}
 
 	updateOptions(options?: IModalEditorPartOptions): void {

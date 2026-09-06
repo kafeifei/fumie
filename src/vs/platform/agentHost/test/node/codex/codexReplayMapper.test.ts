@@ -684,6 +684,91 @@ suite('codexReplayMapper', () => {
 		]);
 	});
 
+	test('a steered follow-up user message splits into its own turn instead of overwriting the opener', () => {
+		const turns = replayThreadToTurns({
+			id: 'thr',
+			turns: [{
+				id: 'turn_a',
+				items: [
+					{ type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'first prompt', text_elements: [] }] },
+					{ type: 'agentMessage', id: 'a1', text: 'working on it', phase: null, memoryCitation: null },
+					{ type: 'userMessage', id: 'u2', content: [{ type: 'text', text: 'follow-up while busy', text_elements: [] }] },
+					{ type: 'agentMessage', id: 'a2', text: 'answering the follow-up', phase: null, memoryCitation: null },
+				],
+				itemsView: { type: 'full' } as never,
+				status: 'completed' as never,
+				error: null,
+				startedAt: 1785060000, completedAt: null, durationMs: 4200,
+			}],
+		} as never);
+
+		assert.deepStrictEqual(turns.map(turn => ({
+			id: turn.id,
+			text: turn.message.text,
+			parts: turn.responseParts.map(part => part.kind === ResponsePartKind.Markdown ? part.content : part.kind),
+			state: turn.state,
+		})), [{
+			id: 'turn_a#0',
+			text: 'first prompt',
+			parts: ['working on it'],
+			state: TurnState.Complete,
+		}, {
+			// The codex turn id lands on the last segment so truncate/fork keep
+			// their "keep through this codex turn" contract.
+			id: 'turn_a',
+			text: 'follow-up while busy',
+			parts: ['answering the follow-up'],
+			state: TurnState.Complete,
+		}]);
+		assert.strictEqual(turns[0].startedAt, '2026-07-26T10:00:00.000Z');
+		assert.strictEqual(turns[1].startedAt, undefined);
+	});
+
+	test('a failed codex turn with a steered follow-up puts the error only on the last segment', () => {
+		const turns = replayThreadToTurns({
+			id: 'thr',
+			turns: [{
+				id: 'turn_a',
+				items: [
+					{ type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'first', text_elements: [] }] },
+					{ type: 'userMessage', id: 'u2', content: [{ type: 'text', text: 'second', text_elements: [] }] },
+				],
+				itemsView: { type: 'full' } as never,
+				status: 'failed' as never,
+				error: { message: 'oops' } as never,
+				startedAt: null, completedAt: null, durationMs: null,
+			}],
+		} as never);
+
+		assert.deepStrictEqual(turns.map(turn => ({ text: turn.message.text, state: turn.state, error: turn.error })), [
+			{ text: 'first', state: TurnState.Complete, error: undefined },
+			{ text: 'second', state: TurnState.Error, error: { errorType: 'CodexError', message: 'oops' } },
+		]);
+	});
+
+	test('split segments each carry the turn model on request and usage', () => {
+		const model: ModelSelection = { id: 'codex-model:openai:gpt-5.6-sol' };
+		const turns = replayThreadToTurns({
+			id: 'thr',
+			turns: [{
+				id: 'turn_a',
+				items: [
+					{ type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'first', text_elements: [] }] },
+					{ type: 'userMessage', id: 'u2', content: [{ type: 'text', text: 'second', text_elements: [] }] },
+				],
+				itemsView: { type: 'full' } as never,
+				status: 'completed' as never,
+				error: null,
+				startedAt: null, completedAt: null, durationMs: null,
+			}],
+		} as never, new Map([['turn_a', model]]));
+
+		assert.deepStrictEqual(turns.map(turn => ({ model: turn.message.model, usage: turn.usage })), [
+			{ model, usage: { model: model.id } },
+			{ model, usage: { model: model.id } },
+		]);
+	});
+
 	test('commandExecution coalesces a sandbox pre-flight with its re-run into one box', () => {
 		const turns = replayThreadToTurns({
 			id: 'thr',

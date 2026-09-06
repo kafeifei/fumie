@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { DeferredPromise } from '../../../../../../base/common/async.js';
 import { VSBuffer } from '../../../../../../base/common/buffer.js';
 import { CancellationToken } from '../../../../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../../../../base/common/event.js';
@@ -18,7 +19,7 @@ import { IContextKey, IContextKeyService } from '../../../../../../platform/cont
 import { ChatEntitlementContextKeys, IChatEntitlementService } from '../../../../../services/chat/common/chatEntitlementService.js';
 import { AgentHostByokLmHandler } from '../../../browser/agentSessions/agentHost/agentHostByokLmHandler.js';
 import { SessionType } from '../../../common/chatSessionsService.js';
-import { ChatMessageRole, IChatMessage, IChatResponsePart, ILanguageModelChatMetadata, ILanguageModelChatRequestOptions, ILanguageModelChatResponse, ILanguageModelsService } from '../../../common/languageModels.js';
+import { ChatMessageRole, IChatMessage, IChatResponsePart, ILanguageModelChatMetadata, ILanguageModelChatRequestOptions, ILanguageModelChatResponse, ILanguageModelsGroup, ILanguageModelsService, IResolvedLanguageModelsProviderGroup } from '../../../common/languageModels.js';
 
 interface ICapturedRequest {
 	modelId: string;
@@ -35,18 +36,23 @@ interface ICapturedRequest {
 class TestLanguageModelsService extends mock<ILanguageModelsService>() {
 
 	captured: ICapturedRequest | undefined;
+	groups: ILanguageModelsGroup[] = [];
 
 	override readonly onDidChangeLanguageModels = Event.None;
 	override readonly onDidChangeModelVisibility: Event<void>;
+	override readonly whenReady: Promise<void>;
 
 	constructor(
 		private readonly _models: ReadonlyMap<string, ILanguageModelChatMetadata>,
 		private readonly _respond: (request: ICapturedRequest) => ILanguageModelChatResponse,
 		onDidChangeModelVisibility = Event.None,
 		private readonly _isModelHidden: (identifier: string) => boolean = () => false,
+		private readonly _resolvedGroup: IResolvedLanguageModelsProviderGroup | undefined = undefined,
+		whenReady: Promise<void> = Promise.resolve(),
 	) {
 		super();
 		this.onDidChangeModelVisibility = onDidChangeModelVisibility;
+		this.whenReady = whenReady;
 	}
 
 	override getLanguageModelIds(): string[] {
@@ -57,8 +63,16 @@ class TestLanguageModelsService extends mock<ILanguageModelsService>() {
 		return this._models.get(modelId);
 	}
 
+	override getLanguageModelGroups(): ILanguageModelsGroup[] {
+		return this.groups;
+	}
+
 	override isModelHidden(identifier: string): boolean {
 		return this._isModelHidden(identifier);
+	}
+
+	override async resolveLanguageModelProviderGroup(): Promise<IResolvedLanguageModelsProviderGroup | undefined> {
+		return this._resolvedGroup;
 	}
 
 	override async sendChatRequest(modelId: string, _from: ExtensionIdentifier | undefined, messages: IChatMessage[], options: ILanguageModelChatRequestOptions, _token: CancellationToken): Promise<ILanguageModelChatResponse> {
@@ -151,16 +165,66 @@ suite('AgentHostByokLmHandler', () => {
 			disabledModels: [],
 			disabledResult: { output: [], error: 'BYOK models are disabled by policy.' },
 			enabledModels: [
-				{ vendor: 'acme', id: 'claude', name: 'acme claude', modelIdentifier: 'id-acme', maxContextWindowTokens: 2000, supportsVision: false },
+				{ vendor: 'acme', id: 'claude', name: 'acme claude', modelIdentifier: 'id-acme', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: false, supportedHarnesses: [] },
 			],
 			requestSent: false,
 		});
+	});
+
+	test('pushes the first renderer model change to the agent host without debounce delay', () => {
+		const modelChanges = store.add(new Emitter<string>());
+		const service = new class extends TestLanguageModelsService {
+			override readonly onDidChangeLanguageModels = modelChanges.event;
+		}(
+			new Map([['id-acme', byokModel('acme', 'claude')]]),
+			() => responseOf([]),
+		);
+		const handler = createHandler(service);
+		let modelChangeCount = 0;
+		store.add(handler.onDidChangeModels(() => modelChangeCount++));
+
+		modelChanges.fire('customendpoint');
+
+		assert.strictEqual(modelChangeCount, 1);
+	});
+
+	test('does not publish the initial model snapshot before the renderer catalog is ready', async () => {
+		const ready = new DeferredPromise<void>();
+		const models = new Map<string, ILanguageModelChatMetadata>();
+		const service = new TestLanguageModelsService(
+			models,
+			() => responseOf([]),
+			Event.None,
+			() => false,
+			undefined,
+			ready.p,
+		);
+		const result = createHandler(service).listModels(CancellationToken.None);
+		let settled = false;
+		void result.then(() => { settled = true; });
+		await Promise.resolve();
+		assert.strictEqual(settled, false);
+
+		models.set('customendpoint/Custom/kimi-k2.5', byokModel('customendpoint', 'kimi-k2.5'));
+		ready.complete();
+
+		assert.deepStrictEqual(await result, [{
+			vendor: 'customendpoint',
+			id: 'kimi-k2.5',
+			name: 'customendpoint kimi-k2.5',
+			modelIdentifier: 'customendpoint/Custom/kimi-k2.5',
+			maxContextWindowTokens: 2000,
+			maxOutputTokens: 1000,
+			supportsVision: false,
+			supportedHarnesses: ['pi'],
+		}]);
 	});
 
 	test('listModels enumerates renderer BYOK models and excludes agent-host copies', async () => {
 		const service = new TestLanguageModelsService(
 			new Map<string, ILanguageModelChatMetadata>([
 				['id-acme', byokModel('acme', 'claude', { vision: true })],
+				['ollama/Ollama/gemma4:31b-mlx', byokModel('ollama', 'gemma4:31b-mlx')],
 				['id-copy', { ...byokModel('acme', 'claude'), targetChatSessionType: 'copilotcli' }],
 				['id-capi', { ...byokModel('copilot', 'gpt-4'), isBYOK: false }],
 			]),
@@ -171,7 +235,40 @@ suite('AgentHostByokLmHandler', () => {
 		const models = await handler.listModels(CancellationToken.None);
 
 		assert.deepStrictEqual(models, [
-			{ vendor: 'acme', id: 'claude', name: 'acme claude', modelIdentifier: 'id-acme', maxContextWindowTokens: 2000, supportsVision: true },
+			{ vendor: 'acme', id: 'claude', name: 'acme claude', modelIdentifier: 'id-acme', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: true, supportedHarnesses: [] },
+			{ vendor: 'ollama', id: 'gemma4:31b-mlx', name: 'ollama gemma4:31b-mlx', modelIdentifier: 'ollama/Ollama/gemma4:31b-mlx', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: false, supportedHarnesses: ['pi'] },
+		]);
+	});
+
+	test('listModels routes generic native models to Pi while preserving explicit Agent metadata', async () => {
+		const genericId = 'customendpoint/Generic/qwen3-coder';
+		const officialId = 'customendpoint/Generic/gpt-5';
+		const service = new TestLanguageModelsService(
+			new Map<string, ILanguageModelChatMetadata>([
+				[genericId, byokModel('customendpoint', 'qwen3-coder')],
+				[officialId, byokModel('customendpoint', 'gpt-5')],
+			]),
+			() => responseOf([]),
+		);
+		service.groups = [{
+			modelIdentifiers: [genericId, officialId],
+			group: {
+				name: 'Generic',
+				vendor: 'customendpoint',
+				apiKey: 'secret',
+				apiType: 'responses',
+				url: 'https://models.example/v1',
+				models: [
+					{ id: 'qwen3-coder' },
+					{ id: 'gpt-5', fumieHarnesses: ['codex'] },
+				],
+			},
+		}];
+		const models = await createHandler(service).listModels(CancellationToken.None);
+
+		assert.deepStrictEqual(models.map(model => ({ id: model.id, harnesses: model.supportedHarnesses })), [
+			{ id: 'qwen3-coder', harnesses: ['pi'] },
+			{ id: 'gpt-5', harnesses: ['codex'] },
 		]);
 	});
 
@@ -192,12 +289,12 @@ suite('AgentHostByokLmHandler', () => {
 		const models = await handler.listModels(CancellationToken.None);
 
 		assert.deepStrictEqual(models, [
-			{ vendor: 'openrouter', id: 'ai21/jamba-large-1.7', name: 'openrouter ai21/jamba-large-1.7', modelIdentifier: groupedId, maxContextWindowTokens: 2000, supportsVision: false },
-			{ vendor: 'openrouter', id: 'gpt-4', name: 'openrouter gpt-4', modelIdentifier: 'openrouter/gpt-4', maxContextWindowTokens: 2000, supportsVision: false },
+			{ vendor: 'openrouter', id: 'ai21/jamba-large-1.7', name: 'openrouter ai21/jamba-large-1.7', modelIdentifier: groupedId, maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: false, supportedHarnesses: [] },
+			{ vendor: 'openrouter', id: 'gpt-4', name: 'openrouter gpt-4', modelIdentifier: 'openrouter/gpt-4', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: false, supportedHarnesses: [] },
 		]);
 	});
 
-	test('listModels excludes hidden BYOK sources and Agent Host copies', async () => {
+	test('listModels reports hidden BYOK sources and Agent Host copies rather than dropping them', async () => {
 		const sourceIdentifier = 'openrouter/OpenRouter 2/ai21/jamba-large-1.7';
 		const agentHostIdentifier = `${SessionType.AgentHostCopilot}:openrouter/OpenRouter 2/ai21/jamba-large-1.7`;
 		const hidden = new Set<string>();
@@ -224,6 +321,19 @@ suite('AgentHostByokLmHandler', () => {
 		visibilityChanges.fire();
 		const restoredModels = await handler.listModels(CancellationToken.None);
 
+		// The row stays in the catalogue either way — a client that reaches the
+		// catalogue only through this window has no other way to learn it exists,
+		// and cannot un-hide a row it was never told about. Only the flag moves.
+		const row = {
+			vendor: 'openrouter',
+			id: 'ai21/jamba-large-1.7',
+			name: 'openrouter ai21/jamba-large-1.7',
+			modelIdentifier: sourceIdentifier,
+			maxContextWindowTokens: 2000,
+			maxOutputTokens: 1000,
+			supportsVision: false,
+			supportedHarnesses: [],
+		};
 		assert.deepStrictEqual({
 			modelChangeCount,
 			visibleModels,
@@ -232,24 +342,10 @@ suite('AgentHostByokLmHandler', () => {
 			restoredModels,
 		}, {
 			modelChangeCount: 3,
-			visibleModels: [{
-				vendor: 'openrouter',
-				id: 'ai21/jamba-large-1.7',
-				name: 'openrouter ai21/jamba-large-1.7',
-				modelIdentifier: sourceIdentifier,
-				maxContextWindowTokens: 2000,
-				supportsVision: false,
-			}],
-			sourceHiddenModels: [],
-			copyHiddenModels: [],
-			restoredModels: [{
-				vendor: 'openrouter',
-				id: 'ai21/jamba-large-1.7',
-				name: 'openrouter ai21/jamba-large-1.7',
-				modelIdentifier: sourceIdentifier,
-				maxContextWindowTokens: 2000,
-				supportsVision: false,
-			}],
+			visibleModels: [row],
+			sourceHiddenModels: [{ ...row, hidden: true }],
+			copyHiddenModels: [{ ...row, hidden: true }],
+			restoredModels: [row],
 		});
 	});
 
@@ -295,12 +391,14 @@ suite('AgentHostByokLmHandler', () => {
 				name: 'acme reasoning',
 				modelIdentifier: 'id-reasoning',
 				maxContextWindowTokens: 2000,
+				maxOutputTokens: 1000,
 				supportsVision: false,
+				supportedHarnesses: [],
 				supportedReasoningEfforts: ['minimal', 'low', 'high'],
 				defaultReasoningEffort: 'high',
 			},
-			{ vendor: 'acme', id: 'malformed', name: 'acme malformed', modelIdentifier: 'id-malformed', maxContextWindowTokens: 2000, supportsVision: false },
-			{ vendor: 'acme', id: 'plain', name: 'acme plain', modelIdentifier: 'id-plain', maxContextWindowTokens: 2000, supportsVision: false },
+			{ vendor: 'acme', id: 'malformed', name: 'acme malformed', modelIdentifier: 'id-malformed', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: false, supportedHarnesses: [] },
+			{ vendor: 'acme', id: 'plain', name: 'acme plain', modelIdentifier: 'id-plain', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: false, supportedHarnesses: [] },
 		]);
 	});
 
@@ -503,6 +601,26 @@ suite('AgentHostByokLmHandler', () => {
 					{ name: 'apply_patch', description: '', inputSchema: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] } },
 				],
 			},
+		});
+	});
+
+	test('resolves the provider group and its secret configuration for native routing', async () => {
+		const identifier = 'customendpoint/Example/claude-opus-4-6';
+		const service = new TestLanguageModelsService(
+			new Map([[identifier, byokModel('customendpoint', 'claude-opus-4-6')]]),
+			() => responseOf([]),
+			Event.None,
+			() => false,
+			{ name: 'Example', vendor: 'customendpoint', configuration: { apiKey: 'resolved-secret', apiType: 'responses' } },
+		);
+		const handler = createHandler(service);
+
+		assert.deepStrictEqual(await handler.resolveProviderConfiguration(identifier, CancellationToken.None), {
+			modelIdentifier: identifier,
+			vendor: 'customendpoint',
+			groupName: 'Example',
+			modelId: 'claude-opus-4-6',
+			configuration: { apiKey: 'resolved-secret', apiType: 'responses' },
 		});
 	});
 

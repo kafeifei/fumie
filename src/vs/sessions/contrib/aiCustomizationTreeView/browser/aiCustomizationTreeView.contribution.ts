@@ -21,9 +21,11 @@ import { IPromptsService, PromptsStorage } from '../../../../workbench/contrib/c
 import { IViewsService } from '../../../../workbench/services/views/common/viewsService.js';
 import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
 import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
-import { SessionsView, SessionsViewId } from '../../sessions/browser/views/sessionsView.js';
 import { IsSessionsWindowContext } from '../../../../workbench/common/contextkeys.js';
 import { TerminalContextKeys } from '../../../../workbench/contrib/terminal/common/terminalContextKey.js';
+import { ICustomizationHarnessService } from '../../../../workbench/contrib/chat/common/customizationHarnessService.js';
+import { ISessionsService } from '../../../services/sessions/browser/sessionsService.js';
+import { openCustomizationOverviewPage } from '../../sessions/browser/customizationsToolbar.contribution.js';
 
 //#region Utilities
 
@@ -304,9 +306,11 @@ registerAction2(class extends Action2 {
 		});
 	}
 	async run(accessor: ServicesAccessor): Promise<void> {
-		const viewsService = accessor.get(IViewsService);
-		const sessionsView = await viewsService.openView<SessionsView>(SessionsViewId, false);
-		sessionsView?.focusCustomizations();
+		await openCustomizationOverviewPage(
+			accessor.get(IEditorService),
+			accessor.get(ICustomizationHarnessService),
+			accessor.get(ISessionsService),
+		);
 	}
 });
 

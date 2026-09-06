@@ -36,10 +36,10 @@ import { isEqual } from '../../../../../../base/common/resources.js';
 import { ScrollbarVisibility } from '../../../../../../base/common/scrollable.js';
 import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { URI } from '../../../../../../base/common/uri.js';
-import { IEditorConstructionOptions } from '../../../../../../editor/browser/config/editorConfiguration.js';
-import { EditorExtensionsRegistry } from '../../../../../../editor/browser/editorExtensions.js';
+import { ChatInputEditor } from './chatInputEditor.js';
+import { ChatInputDictationContext, createChatInputExecuteToolbar, hasChatInputSendableContent } from './chatInputExecuteToolbar.js';
 import { CodeEditorWidget } from '../../../../../../editor/browser/widget/codeEditor/codeEditorWidget.js';
-import { EditorOptions, IEditorOptions, IEditorScrollbarOptions } from '../../../../../../editor/common/config/editorOptions.js';
+import { IEditorOptions, IEditorScrollbarOptions } from '../../../../../../editor/common/config/editorOptions.js';
 import { EDITOR_FONT_DEFAULTS } from '../../../../../../editor/common/config/fontInfo.js';
 import { IDimension } from '../../../../../../editor/common/core/2d/dimension.js';
 import { IPosition } from '../../../../../../editor/common/core/position.js';
@@ -48,23 +48,15 @@ import { isLocation } from '../../../../../../editor/common/languages.js';
 import { ITextModel } from '../../../../../../editor/common/model.js';
 import { IModelService } from '../../../../../../editor/common/services/model.js';
 import { ITextModelService } from '../../../../../../editor/common/services/resolverService.js';
-import { CopyPasteController } from '../../../../../../editor/contrib/dropOrPasteInto/browser/copyPasteController.js';
-import { DropIntoEditorController } from '../../../../../../editor/contrib/dropOrPasteInto/browser/dropIntoEditorController.js';
-import { ContentHoverController } from '../../../../../../editor/contrib/hover/browser/contentHoverController.js';
-import { GlyphHoverController } from '../../../../../../editor/contrib/hover/browser/glyphHoverController.js';
-import { LinkDetector } from '../../../../../../editor/contrib/links/browser/links.js';
-import { SuggestController } from '../../../../../../editor/contrib/suggest/browser/suggestController.js';
 import { localize } from '../../../../../../nls.js';
 import { IAccessibilityService } from '../../../../../../platform/accessibility/common/accessibility.js';
 import { MenuWorkbenchButtonBar } from '../../../../../../platform/actions/browser/buttonbar.js';
-import { MenuEntryActionViewItem } from '../../../../../../platform/actions/browser/menuEntryActionViewItem.js';
 import { HiddenItemStrategy, MenuWorkbenchToolBar } from '../../../../../../platform/actions/browser/toolbar.js';
 import { MenuId, MenuItemAction } from '../../../../../../platform/actions/common/actions.js';
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { ContextKeyExpr, IContextKey, IContextKeyService, RawContextKey } from '../../../../../../platform/contextkey/common/contextkey.js';
 import { IDialogService } from '../../../../../../platform/dialogs/common/dialogs.js';
 import { IFileService } from '../../../../../../platform/files/common/files.js';
-import { registerAndCreateHistoryNavigationContext } from '../../../../../../platform/history/browser/contextScopedHistoryWidget.js';
 import { IInstantiationService } from '../../../../../../platform/instantiation/common/instantiation.js';
 import { ServiceCollection } from '../../../../../../platform/instantiation/common/serviceCollection.js';
 import { IKeybindingService } from '../../../../../../platform/keybinding/common/keybinding.js';
@@ -87,10 +79,10 @@ import { ACTIVE_GROUP, IEditorService, SIDE_GROUP } from '../../../../../service
 import { IWorkbenchEnvironmentService } from '../../../../../services/environment/common/environmentService.js';
 import { AccessibilityVerbositySettingId } from '../../../../accessibility/browser/accessibilityConfiguration.js';
 import { AccessibilityCommandId } from '../../../../accessibility/common/accessibilityCommands.js';
-import { getSimpleCodeEditorWidgetOptions, getSimpleEditorOptions, setupSimpleEditorSelectionStyling } from '../../../../codeEditor/browser/simpleEditorOptions.js';
+import { setupSimpleEditorSelectionStyling } from '../../../../codeEditor/browser/simpleEditorOptions.js';
 import { IChatViewTitleActionContext } from '../../../common/actions/chatActions.js';
 import { ChatContextKeys } from '../../../common/actions/chatContextKeys.js';
-import { ChatRequestVariableSet, getImageAttachmentLimit, IChatRequestVariableEntry, isPastedTextArtifact, isAgentHostCompletionVariableEntry, isBrowserViewVariableEntry, isElementVariableEntry, isExplicitFileOrImageVariableEntry, isImageVariableEntry, isNotebookOutputVariableEntry, isPasteVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry, isSCMHistoryItemChangeRangeVariableEntry, isSCMHistoryItemChangeVariableEntry, isSCMHistoryItemVariableEntry, isStringVariableEntry, OmittedState } from '../../../common/attachments/chatVariableEntries.js';
+import { ChatRequestVariableSet, getImageAttachmentLimit, IChatRequestVariableEntry, isPastedTextArtifact, isAgentHostCompletionVariableEntry, isBrowserViewVariableEntry, isElementVariableEntry, isImageVariableEntry, isNotebookOutputVariableEntry, isPasteVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry, isSCMHistoryItemChangeRangeVariableEntry, isSCMHistoryItemChangeVariableEntry, isSCMHistoryItemVariableEntry, isStringVariableEntry, OmittedState } from '../../../common/attachments/chatVariableEntries.js';
 import { ChatMode, getModeNameForTelemetry, IChatMode, IChatModes, IChatModeService } from '../../../common/chatModes.js';
 import { IChatFollowup, IChatPlanReview, IChatQuestionCarousel, IChatService, IChatToolInvocation } from '../../../common/chatService/chatService.js';
 import { IChatSessionProviderOptionGroup, IChatSessionProviderOptionItem, IChatSessionsService, isAgentHostTarget, isIChatSessionFileChange2, localChatSessionType, SessionType } from '../../../common/chatSessionsService.js';
@@ -111,15 +103,9 @@ import { IChatResponseViewModel, isResponseVM } from '../../../common/model/chat
 import { IChatAgentService } from '../../../common/participants/chatAgents.js';
 import { ILanguageModelToolsService } from '../../../common/tools/languageModelToolsService.js';
 import { ChatHistoryNavigator } from '../../../common/widget/chatWidgetHistoryService.js';
-import { ChatEditingSessionSubmitAction, ChatSessionPrimaryPickerAction, ChatSubmitAction, IChatExecuteActionContext, OpenDelegationPickerAction, OpenModelPickerAction, OpenModePickerAction, OpenPermissionPickerAction, OpenSessionTargetPickerAction, OpenWorkspacePickerAction } from '../../actions/chatExecuteActions.js';
-import { ChatVoiceInputModeAction, VoiceInputModeActionViewItem } from '../../voiceInputMode/voiceInputModeActionViewItem.js';
-import { ChatSpeechToTextConnectingAction, ChatSpeechToTextPreparingAction, ToggleChatSpeechToTextAction } from '../../actions/chatSpeechToTextActions.js';
-import { DictationActionViewItem } from '../../speechToText/dictationActionViewItem.js';
-import { DictationDownloadActionViewItem } from '../../speechToText/dictationDownloadActionViewItem.js';
-import { ChatSpeechToTextState, IChatSpeechToTextService } from '../../speechToText/chatSpeechToTextService.js';
+import { ChatSessionPrimaryPickerAction, ChatSubmitAction, IChatExecuteActionContext, OpenDelegationPickerAction, OpenModelPickerAction, OpenModePickerAction, OpenPermissionPickerAction, OpenSessionTargetPickerAction, OpenWorkspacePickerAction } from '../../actions/chatExecuteActions.js';
 import { IDictationOnboardingService } from '../../speechToText/dictationOnboarding.js';
-import { isDictationActiveForEditor, notifyDictationSubmitted, onDidChangeDictationEditor } from '../../speechToText/dictationSession.js';
-import { VoiceModeActionViewItem } from '../../voiceClient/voiceModeActionViewItem.js';
+import { notifyDictationSubmitted } from '../../speechToText/dictationSession.js';
 import { IVoiceSessionController } from '../../voiceClient/voiceSessionController.js';
 import { AgentSessionProviders, AgentSessionTarget, getAgentSessionProvider } from '../../agentSessions/agentSessions.js';
 import { getAgentSessionPullRequestContextValue } from '../../agentSessions/agentSessionsModel.js';
@@ -165,7 +151,7 @@ import { ChatSelectedTools } from './chatSelectedTools.js';
 import { ChatPetAchievementIds, didExplicitlySwitchChatPetModel } from '../../chatPetAchievements.js';
 import { IChatPetService } from '../../chatPetService.js';
 import { DelegationSessionPickerActionItem } from './delegationSessionPickerActionItem.js';
-import { ModelPickerActionItem, IModelPickerDelegate, IModelPickerPresentationOptions } from './modelPicker/modelPickerActionItem.js';
+import { ModelPickerActionItem, IModelPickerDelegate, IModelPickerDelegateAdapter, IModelPickerPresentationOptions } from './modelPicker/modelPickerActionItem.js';
 import { IModePickerDelegate, isModeConsideredBuiltIn, ModePickerActionItem } from './modePickerActionItem.js';
 import { IPermissionPickerDelegate, PermissionPickerActionItem } from './permissionPickerActionItem.js';
 import { SessionTypePickerActionItem } from './sessionTargetPickerActionItem.js';
@@ -173,8 +159,6 @@ import { WorkspacePickerActionItem } from './workspacePickerActionItem.js';
 import { ChatContextUsageWidget } from '../../widgetHosts/viewPane/chatContextUsageWidget.js';
 import { Target } from '../../../common/promptSyntax/promptTypes.js';
 import { ConfigureToolsAction } from '../../actions/chatToolActions.js';
-import { InlineCompletionsController } from '../../../../../../editor/contrib/inlineCompletions/browser/controller/inlineCompletionsController.js';
-import { PlaceholderTextContribution } from '../../../../../../editor/contrib/placeholderText/browser/placeholderTextContribution.js';
 
 const $ = dom.$;
 
@@ -229,6 +213,8 @@ export interface IChatInputPartOptions {
 	 * for their chat request. This is useful for empty window contexts.
 	 */
 	workspacePickerDelegate?: IWorkspacePickerDelegate;
+	/** Optional presentation adapter applied to this input's native model-picker delegate. */
+	modelPickerDelegateAdapter?: IModelPickerDelegateAdapter;
 	/**
 	 * Optional action view item provider for host-owned secondary toolbar
 	 * chips registered on {@link MenuId.ChatInputSecondary}. Used by the
@@ -263,7 +249,7 @@ export interface IChatInputPartOptions {
 	suppressModelPersistence?: boolean;
 	/**
 	 * Whether we are running in the sessions window.
-	 * When true, the secondary toolbar (permissions picker) is hidden.
+	 * When true, the host supplies its own permission picker contributions.
 	 */
 	isSessionsWindow?: boolean;
 	/**
@@ -850,7 +836,6 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		@IChatSessionsService private readonly chatSessionsService: IChatSessionsService,
 		@IChatContextService private readonly chatContextService: IChatContextService,
 		@IAgentSessionsService private readonly agentSessionsService: IAgentSessionsService,
-		@IChatSpeechToTextService private readonly speechToTextService: IChatSpeechToTextService,
 		@IDictationOnboardingService private readonly dictationOnboardingService: IDictationOnboardingService,
 		@IChatInputNoticeHubService private readonly chatInputNoticeHubService: IChatInputNoticeHubService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
@@ -1314,7 +1299,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	}
 
 	private _createModelPickerDelegate(): IModelPickerDelegate {
-		return {
+		const delegate: IModelPickerDelegate = {
 			currentModel: this._currentLanguageModel,
 			setModel: (model: ILanguageModelChatMetadataAndIdentifier) => {
 				const previousModelIdentifier = this._currentLanguageModel.get()?.identifier;
@@ -1329,13 +1314,14 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			getPresentationOptions: () => this._getModelPickerPresentationOptions(),
 			modelConfiguration: this._modelConfigStore,
 		};
+		return this.options.modelPickerDelegateAdapter?.(delegate) ?? delegate;
 	}
 
 	private _getModelPickerPresentationOptions(): IModelPickerPresentationOptions {
 		const sessionType = this.getCurrentSessionType();
 		const useRichPicker = !sessionType || sessionType === localChatSessionType || isAgentHostTarget(sessionType);
 		return {
-			useGroupedModelPicker: useRichPicker,
+			useGroupedModelPicker: useRichPicker && !this.options.isSessionsWindow,
 			showManageModelsAction: useRichPicker,
 			showUnavailableFeatured: useRichPicker,
 			showFeatured: useRichPicker,
@@ -1872,7 +1858,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	 * that bridge startup races when live models haven't loaded yet.
 	 */
 	private getAllMergedModels(): ILanguageModelChatMetadataAndIdentifier[] {
-		const cachedModels = this.storageService.getObject<ILanguageModelChatMetadataAndIdentifier[]>(CachedLanguageModelsKey, StorageScope.APPLICATION, []);
+		// A cached entry without a model id cannot be selected or sent with; older
+		// writes left such entries behind and they surface as a nameless picker row.
+		const cachedModels = this.storageService.getObject<ILanguageModelChatMetadataAndIdentifier[]>(CachedLanguageModelsKey, StorageScope.APPLICATION, [])
+			.filter(model => !!model.metadata?.id?.trim());
 		const liveModels = this.languageModelsService.getLanguageModelIds()
 			.map(modelId => ({ identifier: modelId, metadata: this.languageModelsService.lookupLanguageModel(modelId)! }));
 
@@ -2380,7 +2369,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private _updateInputContentContextKeys(): void {
 		const inputHasText = !!this._inputEditor?.getModel()?.getValue().trim();
 		this.inputEditorHasText.set(inputHasText);
-		const hasSendableContent = inputHasText || this._attachmentModel.attachments.some(isExplicitFileOrImageVariableEntry);
+		const hasSendableContent = hasChatInputSendableContent(this._inputEditor?.getModel()?.getValue() ?? '', this._attachmentModel.attachments);
 		// Block sending when the session type has no usable model (and can't
 		// fall back to Auto): there is nothing to send the request with.
 		this.inputEditorHasSendableContent.set(hasSendableContent && !this.hasNoAvailableModel() && !this.hasPendingProgrammaticModelSelection);
@@ -3170,6 +3159,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 		// Context usage widget — will be positioned in the toolbar after toolbars are created
 		this.contextUsageWidget = this._register(this.instantiationService.createInstance(ChatContextUsageWidget));
+		// Agents-window sessions keep the gauge visible from the start (ring-only
+		// placeholder, percentage in the popup); other chat surfaces keep the
+		// appear-on-data, hover-percentage behavior.
+		this.contextUsageWidget.setSessionsWindowMode(!!this.options.isSessionsWindow);
 		this.contextUsageWidget.setChatWidget(widget);
 		this.contextUsageWidget.setSelectedModel(this._currentLanguageModel.get()?.identifier);
 		this.contextUsageWidget.setModelConfigurationResolver(
@@ -3206,75 +3199,24 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 		this.dnd.addOverlay(this.options.dndContainer ?? container, this.options.dndContainer ?? container);
 
-		const inputScopedContextKeyService = this._register(this.contextKeyService.createScoped(inputContainer));
-		ChatContextKeys.inChatInput.bindTo(inputScopedContextKeyService).set(true);
+		this._inputEditorElement = dom.append(editorContainer, $(chatInputEditorContainerSelector));
+		const input = this._register(this.instantiationService.createInstance(ChatInputEditor, inputContainer, this._inputEditorElement, this, {
+			ariaLabel: this._getAriaLabel(),
+			fontFamily: DEFAULT_FONT_FAMILY,
+			padding: this.options.renderStyle === 'compact' ? INPUT_EDITOR_PADDING.compact : INPUT_EDITOR_PADDING.default,
+			compact: this.options.renderStyle === 'compact',
+			overflowWidgetsDomNode: this.options.editorOverflowWidgetsDomNode,
+		}));
+		const inputScopedContextKeyService = input.contextKeyService;
 		this.currentlyEditingInputKey = ChatContextKeys.currentlyEditingInput.bindTo(inputScopedContextKeyService);
 		this.editingSentRequestKey = ChatContextKeys.editingRequestType.bindTo(this.contextKeyService);
-		const scopedInstantiationService = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, inputScopedContextKeyService])));
-
-		const { historyNavigationBackwardsEnablement, historyNavigationForwardsEnablement } = this._register(registerAndCreateHistoryNavigationContext(inputScopedContextKeyService, this));
-		this.historyNavigationBackwardsEnablement = historyNavigationBackwardsEnablement;
-		this.historyNavigationForewardsEnablement = historyNavigationForwardsEnablement;
-
-		const options: IEditorConstructionOptions = getSimpleEditorOptions(this.configurationService);
-		options.overflowWidgetsDomNode = this.options.editorOverflowWidgetsDomNode;
-		options.pasteAs = EditorOptions.pasteAs.defaultValue;
-		options.readOnly = false;
-		options.ariaLabel = this._getAriaLabel();
-		options.fontFamily = DEFAULT_FONT_FAMILY;
-		options.fontSize = 13;
-		options.lineHeight = INPUT_EDITOR_LINE_HEIGHT;
-		options.padding = this.options.renderStyle === 'compact' ? INPUT_EDITOR_PADDING.compact : INPUT_EDITOR_PADDING.default;
-		options.cursorWidth = 1;
-		options.wrappingStrategy = 'advanced';
-		options.bracketPairColorization = { enabled: false };
-		// Respect user's editor settings for auto-closing and auto-surrounding behavior
-		options.autoClosingBrackets = this.configurationService.getValue('editor.autoClosingBrackets');
-		options.autoClosingQuotes = this.configurationService.getValue('editor.autoClosingQuotes');
-		options.autoSurround = this.configurationService.getValue('editor.autoSurround');
-		options.quickSuggestions = false;
-		options.suggest = {
-			showIcons: true,
-			showSnippets: false,
-			showWords: true,
-			showStatusBar: false,
-			insertMode: 'insert',
-			fitWidthToDetails: true,
-		};
-		options.scrollbar = this.options.renderStyle === 'compact'
-			? { ...(options.scrollbar ?? {}), vertical: 'hidden' }
-			: {
-				...(options.scrollbar ?? {}),
-				vertical: 'auto',
-				verticalScrollbarSize: 7,
-			};
-		options.stickyScroll = { enabled: false };
-
-		this._inputEditorElement = dom.append(editorContainer, $(chatInputEditorContainerSelector));
-		const editorOptions = getSimpleCodeEditorWidgetOptions();
-		editorOptions.contributions?.push(...EditorExtensionsRegistry.getSomeEditorContributions([ContentHoverController.ID, GlyphHoverController.ID, DropIntoEditorController.ID, CopyPasteController.ID, LinkDetector.ID, InlineCompletionsController.ID, PlaceholderTextContribution.ID]));
-		this._inputEditor = this._register(scopedInstantiationService.createInstance(CodeEditorWidget, this._inputEditorElement, options, editorOptions));
+		this.historyNavigationBackwardsEnablement = input.historyNavigation.historyNavigationBackwardsEnablement;
+		this.historyNavigationForewardsEnablement = input.historyNavigation.historyNavigationForwardsEnablement;
+		this._inputEditor = input.editor;
 		this.updateInputEditorFontFamily();
 		this._register(addDisposableListener(this._inputEditorElement, dom.EventType.PASTE, e => this.handleTerminalCommandPaste(e), true));
 
-		const dictationRecording = ChatContextKeys.speechToTextRecording.bindTo(this.contextKeyService);
-		const dictationPreparing = ChatContextKeys.speechToTextPreparing.bindTo(this.contextKeyService);
-		const isDictationInputActive = observableFromEvent(
-			this,
-			Event.any(this.speechToTextService.onDidChangeState, this.speechToTextService.onDidChangePreparingModel, onDidChangeDictationEditor),
-			() => isDictationActiveForEditor(this._inputEditor),
-		);
-		const updateDictationContextKeys = () => {
-			const active = isDictationActiveForEditor(this._inputEditor);
-			dictationRecording.set(active && this.speechToTextService.state === ChatSpeechToTextState.Recording);
-			dictationPreparing.set(active && this.speechToTextService.isPreparingModel);
-		};
-		this._register(Event.any(this.speechToTextService.onDidChangeState, this.speechToTextService.onDidChangePreparingModel, onDidChangeDictationEditor)(updateDictationContextKeys));
-		updateDictationContextKeys();
-
-		SuggestController.get(this._inputEditor)?.forceRenderingAbove();
-		options.overflowWidgetsDomNode?.classList.add('hideSuggestTextIcons');
-		this._inputEditorElement.classList.add('hideSuggestTextIcons');
+		const isDictationInputActive = this._register(this.instantiationService.createInstance(ChatInputDictationContext, this._inputEditor)).isActive;
 
 		// Prevent Enter key from creating new lines - but respect user's custom keybindings
 		// Only prevent default behavior if ChatSubmitAction is bound to Enter AND its precondition is met
@@ -3333,10 +3275,6 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			setChatInputStackInputFocused(inputContainer, false);
 
 			this._onDidBlur.fire();
-		}));
-		this._register(this._inputEditor.onDidBlurEditorWidget(() => {
-			CopyPasteController.get(this._inputEditor)?.clearWidgets();
-			DropIntoEditorController.get(this._inputEditor)?.clearWidgets();
 		}));
 
 		const hoverDelegate = this._register(createInstantHoverDelegate());
@@ -3400,6 +3338,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 						if (!this._currentLanguageModel.get()) {
 							this.setCurrentLanguageModelToDefault();
 						}
+						if (!this.options.supportsChangingModes) {
+							const itemDelegate: IModelPickerDelegate = this._createModelPickerDelegate();
+							return this.modelWidget = this.instantiationService.createInstance(ModelPickerActionItem, action, itemDelegate, pickerOptions);
+						}
 						const modelDelegate = this._createModelPickerDelegate();
 						const modeDelegate = this._createModePickerDelegate();
 						return this.instantiationService.createInstance(MobileChatInputCombinedPickerActionItem, action, modeDelegate, modelDelegate);
@@ -3417,6 +3359,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					const itemDelegate: IModelPickerDelegate = this._createModelPickerDelegate();
 					return this.modelWidget = this.instantiationService.createInstance(ModelPickerActionItem, action, itemDelegate, pickerOptions);
 				} else if (action.id === OpenModePickerAction.ID && action instanceof MenuItemAction) {
+					if (!this.options.supportsChangingModes) {
+						return new HiddenActionViewItem(action);
+					}
 					const delegate: IModePickerDelegate = this._createModePickerDelegate();
 					return this.modeWidget = this.instantiationService.createInstance(ModePickerActionItem, action, delegate, pickerOptions);
 				} else if ((action.id === OpenSessionTargetPickerAction.ID || action.id === OpenDelegationPickerAction.ID) && action instanceof MenuItemAction) {
@@ -3484,46 +3429,14 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 				this.inputActionsToolbar.refresh();
 			}
 		}));
-		this.executeToolbar = this._register(this.instantiationService.createInstance(MenuWorkbenchToolBar, toolbarsContainer, this.options.menus.executeToolbar, {
+		this.executeToolbar = this._register(createChatInputExecuteToolbar(this.instantiationService, toolbarsContainer, this.options.menus.executeToolbar, {
+			isActive: isVoiceInputActive,
+			isDictationActive: isDictationInputActive,
+			isVoiceActive: isVoiceSessionActive,
+		}, {
 			telemetrySource: this.options.menus.telemetrySource,
-			menuOptions: {
-				shouldForwardArgs: true
-			},
 			hoverDelegate,
-			hiddenItemStrategy: HiddenItemStrategy.NoHide,
-			actionViewItemProvider: (action, options) => {
-				if (action.id === ChatVoiceInputModeAction.ID) {
-					return this.instantiationService.createInstance(VoiceInputModeActionViewItem, action, {
-						isActive: isVoiceInputActive,
-						isDictationActive: isDictationInputActive,
-						isVoiceActive: isVoiceSessionActive,
-					});
-				}
-				if ((action.id === ChatSubmitAction.ID || action.id === ChatEditingSessionSubmitAction.ID) && action instanceof MenuItemAction) {
-					return this.instantiationService.createInstance(class extends MenuEntryActionViewItem {
-						override render(container: HTMLElement): void {
-							super.render(container);
-							container.classList.add('chat-submit-button');
-						}
-					}, action, options);
-				}
-				if ((action.id === ChatSpeechToTextPreparingAction.ID || action.id === ChatSpeechToTextConnectingAction.ID) && action instanceof MenuItemAction) {
-					return this.instantiationService.createInstance(DictationDownloadActionViewItem, action, options);
-				}
-				if (action.id === ToggleChatSpeechToTextAction.ID && action instanceof MenuItemAction) {
-					return this.instantiationService.createInstance(DictationActionViewItem, action, options, isDictationInputActive);
-				}
-				// Voice Mode mic button: add a right-click context menu (Select
-				// Microphone / Disable Voice Mode) mirroring dictation. While
-				// listening the toolbar swaps the start action for the
-				// push-to-talk stop action, so cover both so the menu stays put.
-				if ((action.id === 'agentsVoice.startVoiceInChat' || action.id === 'agentsVoice.pttStopInChat') && action instanceof MenuItemAction) {
-					return this.instantiationService.createInstance(VoiceModeActionViewItem, action, options);
-				}
-				return undefined;
-			},
 		}));
-		this.executeToolbar.getElement().classList.add('chat-execute-toolbar');
 		this.executeToolbar.context = { widget } satisfies IChatExecuteActionContext;
 		// The lone dictation / Voice Mode control drops its circular border and
 		// only regains it when both share the row (see the matching rules in

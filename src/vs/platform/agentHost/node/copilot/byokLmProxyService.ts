@@ -6,8 +6,9 @@
 import type * as http from 'http';
 import { createDecorator } from '../../../instantiation/common/instantiation.js';
 import { ILogService } from '../../../log/common/log.js';
+import { IByokLmChatRequest, IByokLmChatResult, visibleByokLmModels } from '../../common/agentHostByokLm.js';
 import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
-import { parseProxyBearer } from '../claude/claudeProxyAuth.js';
+import { parseProxyBearer, ProxyBearerAuth } from '../claude/claudeProxyAuth.js';
 import {
 	ILoopbackProxyHandle,
 	ILoopbackProxyRuntime,
@@ -21,10 +22,17 @@ import {
 	IResponsesRequest,
 	responsesErrorBody,
 	responsesRequestToBridge,
-	ResponsesTranslationError,
 } from './byokResponsesTranslation.js';
+import { ByokWireErrorType, ByokWireTranslationError, modelsListBody } from './byokWireCommon.js';
 
 // #region Public types
+
+/**
+ * The three request wires the proxy serves, one per agent runtime family:
+ * OpenAI Responses (Copilot / Codex runtimes), Anthropic Messages (the Claude
+ * Code CLI) and OpenAI Chat Completions (the Kimi and DeepSeek SDKs).
+ */
+export type ByokLmWireProtocol = 'responses';
 
 /**
  * Handle returned by {@link IByokLmProxyService.start}. Refcounts the shared
@@ -44,11 +52,10 @@ export interface IByokLmProxyHandle extends ILoopbackProxyHandle {
 	/** 256-bit hex string. Combine with a session id as `Bearer <nonce>.<sessionId>`. */
 	readonly nonce: string;
 	/**
-	 * Build the provider `baseUrl` for a given BYOK vendor. The vendor is
-	 * encoded into the path so a single proxy can serve every vendor; the
-	 * runtime appends `/responses` to this URL.
+	 * Build the vendor-scoped base URL; the Copilot runtime appends
+	 * `/responses`.
 	 */
-	providerBaseUrl(vendor: string): string;
+	providerBaseUrl(vendor: string, wire?: ByokLmWireProtocol): string;
 }
 
 export const IByokLmProxyService = createDecorator<IByokLmProxyService>('byokLmProxyService');
@@ -70,7 +77,113 @@ export interface IByokLmProxyService {
 
 const PROXY_USER_FACING_NAME = 'ByokLmProxyService';
 const VENDOR_PATH_PREFIX = '/v/';
-const RESPONSES_SUFFIX = '/responses';
+
+/** Endpoints served under `/v/<vendor>/`, on top of the three request wires. */
+type ByokLmEndpoint = ByokLmWireProtocol | 'models';
+
+/**
+ * Path suffixes accepted after `/v/<vendor>`, with a leading `/v1` stripped
+ * first.
+ */
+const ENDPOINT_BY_SUFFIX = new Map<string, ByokLmEndpoint>([
+	['/responses', 'responses'],
+	['/models', 'models'],
+]);
+
+/** A parsed inbound route: which vendor, which endpoint. */
+interface IByokLmRoute {
+	readonly vendor: string;
+	readonly endpoint: ByokLmEndpoint;
+}
+
+/**
+ * Responses request/response projection around the renderer bridge.
+ */
+interface IByokLmWire {
+	readonly parse: (vendor: string, raw: string) => { readonly request: IByokLmChatRequest; readonly stream: boolean };
+	readonly body: (result: IByokLmChatResult, modelId: string) => string;
+	readonly frames: (result: IByokLmChatResult, modelId: string) => string[];
+	readonly error: (message: string, type: ByokWireErrorType) => string;
+}
+
+function parseJsonBody<T>(raw: string): T {
+	try {
+		return JSON.parse(raw) as T;
+	} catch (err) {
+		throw new ByokWireTranslationError(`Invalid request body: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+const WIRES: Record<ByokLmWireProtocol, IByokLmWire> = {
+	'responses': {
+		parse: (vendor, raw) => {
+			const body = parseJsonBody<IResponsesRequest>(raw);
+			return { request: responsesRequestToBridge(vendor, body), stream: body.stream === true };
+		},
+		body: bridgeResultToResponsesBody,
+		frames: bridgeResultToResponsesSseFrames,
+		error: responsesErrorBody,
+	},
+};
+
+/**
+ * The envelope an endpoint's errors are rendered in. `models` is probed by both
+ * client families and answers with a body that satisfies both, so its errors
+ * use the OpenAI envelope; `count-tokens` is Anthropic-only.
+ */
+function errorWire(endpoint: ByokLmEndpoint): IByokLmWire {
+	return WIRES.responses;
+}
+
+/**
+ * Extract the vendor and endpoint from a `/v/<vendor>[/v1]/<suffix>` path.
+ */
+export function parseByokLmProxyPath(pathname: string): IByokLmRoute | undefined {
+	if (!pathname.startsWith(VENDOR_PATH_PREFIX)) {
+		return undefined;
+	}
+	const rest = pathname.slice(VENDOR_PATH_PREFIX.length);
+	const separator = rest.indexOf('/');
+	if (separator <= 0) {
+		return undefined;
+	}
+	let vendor: string;
+	try {
+		vendor = decodeURIComponent(rest.slice(0, separator));
+	} catch {
+		return undefined;
+	}
+	// Re-check for a path separator *after* decoding: a `%2F` survives the
+	// pre-decode segment split but would decode into a second path segment,
+	// breaking the single-segment `vendor/id` selection-id convention.
+	if (!vendor || vendor.includes('/')) {
+		return undefined;
+	}
+	let suffix = rest.slice(separator);
+	if (suffix.startsWith('/v1/')) {
+		suffix = suffix.slice('/v1'.length);
+	}
+	const endpoint = ENDPOINT_BY_SUFFIX.get(suffix);
+	return endpoint ? { vendor, endpoint } : undefined;
+}
+
+/**
+ * Authenticate an inbound request. Every client is handed
+ * `<nonce>.<sessionId>`; Anthropic clients configured with an API key put it in
+ * `x-api-key` instead of `Authorization`, so both headers are accepted — the
+ * token still has to match this bind's nonce, so a stray `ANTHROPIC_API_KEY`
+ * from the user's environment cannot authenticate.
+ */
+function parseByokLmProxyAuth(headers: http.IncomingHttpHeaders, expectedNonce: string): ProxyBearerAuth {
+	const bearer = parseProxyBearer(headers, expectedNonce);
+	if (bearer.valid) {
+		return bearer;
+	}
+	const apiKey = headers['x-api-key'];
+	return typeof apiKey === 'string'
+		? parseProxyBearer({ authorization: `Bearer ${apiKey}` }, expectedNonce)
+		: bearer;
+}
 
 /**
  * The BYOK proxy keeps no per-bind mutable state: the active renderer bridge is
@@ -80,13 +193,17 @@ const RESPONSES_SUFFIX = '/responses';
 type ByokLmProxyState = undefined;
 
 /**
- * Local OpenAI-compatible HTTP proxy that lets the Copilot SDK runtime run
- * BYOK models provided by VS Code extensions. The runtime is configured with a
- * `type: 'openai'`, `wireApi: 'responses'` provider whose `baseUrl` points
- * here; inbound `POST /v/<vendor>/responses` requests are authenticated,
- * translated, and forwarded to the renderer LM API via
- * {@link IByokLmBridgeRegistry}, and the buffered completion is streamed back
- * as OpenAI Responses SSE.
+ * Upstream local HTTP proxy for Copilot CLI BYOK Responses requests. Native
+ * Fumie harnesses use `NativeModelProviderProxyService` instead.
+ *
+ * | route                                     | wire                   | client                     |
+ * |-------------------------------------------|------------------------|----------------------------|
+ * | `POST /v/<vendor>[/v1]/responses`         | OpenAI Responses       | Copilot CLI                |
+ * | `GET  /v/<vendor>[/v1]/models`            | model list             | catalogue probes           |
+ *
+ * The bridge answers with a buffered completion, so a `stream: true` request is
+ * served by replaying that completion as the wire's SSE event sequence once it
+ * arrives.
  *
  * The server lifecycle — lazy bind on `127.0.0.1`, nonce minting, refcounted
  * handles, in-flight tracking, and teardown — is inherited from
@@ -115,7 +232,10 @@ export class ByokLmProxyService extends LoopbackProxyServer<ByokLmProxyState> im
 		return {
 			baseUrl: runtime.baseUrl,
 			nonce: runtime.nonce,
-			providerBaseUrl: (vendor: string) => `${runtime.baseUrl}${VENDOR_PATH_PREFIX}${encodeURIComponent(vendor)}`,
+			providerBaseUrl: (vendor: string, _wire: ByokLmWireProtocol = 'responses') => {
+				const base = `${runtime.baseUrl}${VENDOR_PATH_PREFIX}${encodeURIComponent(vendor)}`;
+				return base;
+			},
 			dispose: () => {
 				if (disposed) {
 					return;
@@ -128,7 +248,7 @@ export class ByokLmProxyService extends LoopbackProxyServer<ByokLmProxyState> im
 
 	/** Emit the base's fallback failure using the OpenAI error envelope. */
 	protected override writeInternalError(res: http.ServerResponse): void {
-		this._writeJsonError(res, 500, 'Internal proxy error');
+		this._writeError(res, WIRES.responses, 500, 'Internal proxy error', 'api_error');
 	}
 
 	protected override async handleRequest(req: http.IncomingMessage, res: http.ServerResponse, runtime: ILoopbackProxyRuntime<ByokLmProxyState>): Promise<void> {
@@ -142,71 +262,45 @@ export class ByokLmProxyService extends LoopbackProxyServer<ByokLmProxyState> im
 			return;
 		}
 
-		// Inbound requests carry `Bearer <nonce>.<sessionId>`; the runtime is
-		// handed `<nonce>.<sessionId>` at session launch.
-		const auth = parseProxyBearer(req.headers, runtime.nonce);
+		const route = parseByokLmProxyPath(pathname);
+		const expectedMethod = route?.endpoint === 'models' ? 'GET' : 'POST';
+		if (!route || method !== expectedMethod) {
+			this._writeError(res, WIRES.responses, 404, `No route for ${method} ${pathname}`, 'not_found_error');
+			return;
+		}
+		const wire = errorWire(route.endpoint);
+
+		// Inbound requests carry `<nonce>.<sessionId>`; the runtime is handed
+		// that token at session launch.
+		const auth = parseByokLmProxyAuth(req.headers, runtime.nonce);
 		if (!auth.valid || !auth.sessionId) {
-			this._writeJsonError(res, 401, 'Invalid authentication', 'authentication_error');
+			this._writeError(res, wire, 401, 'Invalid authentication', 'authentication_error');
 			return;
 		}
 
-		const vendor = this._parseVendorFromResponsesPath(pathname);
-		if (method === 'POST' && vendor !== undefined) {
-			await this._handleResponses(req, res, runtime, vendor);
-			return;
+		switch (route.endpoint) {
+			case 'models':
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(modelsListBody(visibleByokLmModels(this._bridgeRegistry.getModels()), route.vendor));
+				return;
+			default:
+				await this._handleChat(req, res, runtime, route.vendor, WIRES[route.endpoint]);
 		}
-
-		this._writeJsonError(res, 404, `No route for ${method} ${pathname}`, 'not_found_error');
 	}
 
-	/**
-	 * Extract the vendor from a `/v/<vendor>/responses` path.
-	 */
-	private _parseVendorFromResponsesPath(pathname: string): string | undefined {
-		if (!pathname.startsWith(VENDOR_PATH_PREFIX) || !pathname.endsWith(RESPONSES_SUFFIX)) {
-			return undefined;
-		}
-		const vendorSegment = pathname.slice(VENDOR_PATH_PREFIX.length, pathname.length - RESPONSES_SUFFIX.length);
-		if (!vendorSegment) {
-			return undefined;
-		}
-		let vendor: string;
+	private async _handleChat(req: http.IncomingMessage, res: http.ServerResponse, runtime: ILoopbackProxyRuntime<ByokLmProxyState>, vendor: string, wire: IByokLmWire): Promise<void> {
+		let bridgeRequest: IByokLmChatRequest;
+		let stream: boolean;
 		try {
-			vendor = decodeURIComponent(vendorSegment);
-		} catch {
-			return undefined;
-		}
-		// Re-check for a path separator *after* decoding: a `%2F` survives the
-		// pre-decode prefix/suffix checks but would decode into a second path
-		// segment, breaking the single-segment `vendor/id` selection-id convention.
-		if (!vendor || vendor.includes('/')) {
-			return undefined;
-		}
-		return vendor;
-	}
-
-	private async _handleResponses(req: http.IncomingMessage, res: http.ServerResponse, runtime: ILoopbackProxyRuntime<ByokLmProxyState>, vendor: string): Promise<void> {
-		let body: IResponsesRequest;
-		try {
-			const raw = await readProxyRequestBody(req);
-			body = JSON.parse(raw) as IResponsesRequest;
+			({ request: bridgeRequest, stream } = wire.parse(vendor, await readProxyRequestBody(req)));
 		} catch (err) {
-			this._writeJsonError(res, 400, `Invalid request body: ${err instanceof Error ? err.message : String(err)}`, 'invalid_request_error');
-			return;
-		}
-
-		let bridgeRequest;
-		try {
-			bridgeRequest = responsesRequestToBridge(vendor, body);
-		} catch (err) {
-			const message = err instanceof ResponsesTranslationError ? err.message : String(err);
-			this._writeJsonError(res, 400, message, 'invalid_request_error');
+			this._writeError(res, wire, 400, err instanceof Error ? err.message : String(err), 'invalid_request_error');
 			return;
 		}
 
 		const connection = this._bridgeRegistry.getServingConnection();
 		if (!connection) {
-			this._writeJsonError(res, 503, 'No renderer connection available to service BYOK models', 'api_error');
+			this._writeError(res, wire, 503, 'No renderer connection available to service BYOK models', 'api_error');
 			return;
 		}
 
@@ -228,22 +322,22 @@ export class ByokLmProxyService extends LoopbackProxyServer<ByokLmProxyState> im
 				return;
 			}
 			if (result.error) {
-				this._writeJsonError(res, 502, result.error, 'api_error');
+				this._writeError(res, wire, 502, result.error, 'api_error');
 				return;
 			}
-			if (body.stream === true) {
+			if (stream) {
 				res.writeHead(200, {
 					'Content-Type': 'text/event-stream',
 					'Cache-Control': 'no-cache',
 					'Connection': 'keep-alive',
 				});
-				for (const frame of bridgeResultToResponsesSseFrames(result, bridgeRequest.modelId)) {
+				for (const frame of wire.frames(result, bridgeRequest.modelId)) {
 					res.write(frame);
 				}
 				res.end();
 			} else {
 				res.writeHead(200, { 'Content-Type': 'application/json' });
-				res.end(bridgeResultToResponsesBody(result, bridgeRequest.modelId));
+				res.end(wire.body(result, bridgeRequest.modelId));
 			}
 		} catch (err) {
 			if (entry.ac.signal.aborted || res.writableEnded) {
@@ -251,7 +345,7 @@ export class ByokLmProxyService extends LoopbackProxyServer<ByokLmProxyState> im
 			}
 			const message = err instanceof Error ? err.message : String(err);
 			if (!res.headersSent) {
-				this._writeJsonError(res, 502, message, 'api_error');
+				this._writeError(res, wire, 502, message, 'api_error');
 			} else {
 				try { res.end(); } catch { /* ignore */ }
 			}
@@ -261,12 +355,12 @@ export class ByokLmProxyService extends LoopbackProxyServer<ByokLmProxyState> im
 		}
 	}
 
-	private _writeJsonError(res: http.ServerResponse, status: number, message: string, type = 'api_error'): void {
+	private _writeError(res: http.ServerResponse, wire: IByokLmWire, status: number, message: string, type: ByokWireErrorType): void {
 		if (res.headersSent || res.writableEnded) {
 			return;
 		}
 		res.writeHead(status, { 'Content-Type': 'application/json' });
-		res.end(responsesErrorBody(message, type));
+		res.end(wire.error(message, type));
 	}
 }
 

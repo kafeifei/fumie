@@ -101,6 +101,42 @@ suite('SinglePane layout strategies', () => {
 		return harness.instaService.createInstance(SinglePaneVisibilityProfileStore);
 	}
 
+	test('Existing Session defaults to detail-only so chat remains the primary surface', () => {
+		setup();
+
+		assert.deepStrictEqual(createVisibilityStore().get(SessionVisibilityProfile.Existing), {
+			editorVisible: false,
+			auxiliaryBarVisible: true,
+		});
+	});
+
+	test('Existing Session collapses a redundant Empty Files editor into details', () => {
+		const ctx = setup();
+		const session = makeSession(URI.parse('session:/existing'));
+		const emptyFiles = store.add(harness.instaService.createInstance(EmptyFileEditorInput, session.workspace.get()));
+		harness.activeGroupEditors.push(emptyFiles);
+		harness.activeEditorInput = emptyFiles;
+		harness.partVisibility.set(Parts.EDITOR_PART, true);
+		harness.partVisibility.set(Parts.AUXILIARYBAR_PART, false);
+		store.add(harness.instaService.createInstance(
+			SinglePaneExistingSessionStrategy,
+			ctx,
+			createVisibilityStore(),
+			createDetailPanel()
+		));
+		harness.setPartHiddenCalls.length = 0;
+
+		activate(session);
+
+		assert.deepStrictEqual({
+			editorVisible: harness.partVisibility.get(Parts.EDITOR_PART),
+			auxiliaryBarVisible: harness.partVisibility.get(Parts.AUXILIARYBAR_PART),
+		}, {
+			editorVisible: false,
+			auxiliaryBarVisible: true,
+		});
+	});
+
 	test('Existing Session toggles only the detail panel', () => {
 		const ctx = setup();
 		harness.partVisibility.set(Parts.AUXILIARYBAR_PART, false);

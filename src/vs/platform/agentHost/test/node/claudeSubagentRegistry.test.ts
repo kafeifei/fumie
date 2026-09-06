@@ -108,13 +108,15 @@ suite('SubagentRegistry', () => {
 		});
 	});
 
-	test('removeSpawn deletes the spawn AND evicts inner-tool edges that pointed at it; other parents’ edges are untouched', () => {
+	test('removeSpawn deletes the spawn AND evicts task/inner-tool edges that pointed at it; other parents’ edges are untouched', () => {
 		const registry = r();
 		registry.recordSpawn('toolu_parent_a');
 		registry.recordSpawn('toolu_parent_b');
 		registry.noteInnerTool('toolu_inner_a1', 'toolu_parent_a');
 		registry.noteInnerTool('toolu_inner_a2', 'toolu_parent_a');
 		registry.noteInnerTool('toolu_inner_b1', 'toolu_parent_b');
+		registry.noteTask('task-a', 'toolu_parent_a');
+		registry.noteTask('task-b', 'toolu_parent_b');
 
 		registry.removeSpawn('toolu_parent_a');
 
@@ -124,16 +126,20 @@ suite('SubagentRegistry', () => {
 			innerA1Parent: registry.getParentSpawn('toolu_inner_a1'),
 			innerA2Parent: registry.getParentSpawn('toolu_inner_a2'),
 			innerB1Parent: registry.getParentSpawn('toolu_inner_b1')?.toolUseId,
+			taskAParent: registry.getSpawnForTask('task-a'),
+			taskBParent: registry.getSpawnForTask('task-b')?.toolUseId,
 		}, {
 			parentA: undefined,
 			parentB: 'toolu_parent_b',
 			innerA1Parent: undefined,
 			innerA2Parent: undefined,
 			innerB1Parent: 'toolu_parent_b',
+			taskAParent: undefined,
+			taskBParent: 'toolu_parent_b',
 		});
 	});
 
-	test('drainForegroundSpawns: returns and removes only foreground spawns; background spawns survive; inner-edge entries pointing at drained spawns are evicted', () => {
+	test('drainForegroundSpawns: returns and removes only foreground spawns; background spawns and their indexes survive', () => {
 		const registry = r();
 		registry.recordSpawn('toolu_fg_1');
 		const bg = registry.recordSpawn('toolu_bg');
@@ -141,6 +147,8 @@ suite('SubagentRegistry', () => {
 		registry.recordSpawn('toolu_fg_2');
 		registry.noteInnerTool('toolu_inner_fg1', 'toolu_fg_1');
 		registry.noteInnerTool('toolu_inner_bg', 'toolu_bg');
+		registry.noteTask('task-fg1', 'toolu_fg_1');
+		registry.noteTask('task-bg', 'toolu_bg');
 
 		const drained = registry.drainForegroundSpawns();
 
@@ -151,6 +159,8 @@ suite('SubagentRegistry', () => {
 			survivedBg: registry.getSpawn('toolu_bg')?.toolUseId,
 			fgInnerEvicted: registry.getParentSpawn('toolu_inner_fg1'),
 			bgInnerSurvived: registry.getParentSpawn('toolu_inner_bg')?.toolUseId,
+			fgTaskEvicted: registry.getSpawnForTask('task-fg1'),
+			bgTaskSurvived: registry.getSpawnForTask('task-bg')?.toolUseId,
 		}, {
 			drainedIds: ['toolu_fg_1', 'toolu_fg_2'],
 			survivedFg1: undefined,
@@ -158,6 +168,86 @@ suite('SubagentRegistry', () => {
 			survivedBg: 'toolu_bg',
 			fgInnerEvicted: undefined,
 			bgInnerSurvived: 'toolu_bg',
+			fgTaskEvicted: undefined,
+			bgTaskSurvived: 'toolu_bg',
+		});
+	});
+
+	test('drainAllSpawns: returns and removes every open spawn, background included, and clears both indexes', () => {
+		// The counterpart to `drainForegroundSpawns`: at a subprocess rebind the
+		// deferred `task_notification` that would have completed a background
+		// spawn belongs to the dead process, so background spawns are orphaned
+		// too and must be drained rather than preserved.
+		const registry = r();
+		registry.recordSpawn('toolu_fg');
+		const bg = registry.recordSpawn('toolu_bg');
+		bg.background = true;
+		registry.noteInnerTool('toolu_inner_fg', 'toolu_fg');
+		registry.noteInnerTool('toolu_inner_bg', 'toolu_bg');
+		registry.noteTask('task-fg', 'toolu_fg');
+		registry.noteTask('task-bg', 'toolu_bg');
+
+		const drained = registry.drainAllSpawns();
+		const secondDrain = registry.drainAllSpawns();
+
+		assert.deepStrictEqual({
+			drainedIds: drained.map(s => s.toolUseId).sort(),
+			secondDrainIds: secondDrain.map(s => s.toolUseId),
+			fgGone: registry.getSpawn('toolu_fg'),
+			bgGone: registry.getSpawn('toolu_bg'),
+			fgInnerEvicted: registry.getParentSpawn('toolu_inner_fg'),
+			bgInnerEvicted: registry.getParentSpawn('toolu_inner_bg'),
+			fgTaskEvicted: registry.getSpawnForTask('task-fg'),
+			bgTaskEvicted: registry.getSpawnForTask('task-bg'),
+		}, {
+			drainedIds: ['toolu_bg', 'toolu_fg'],
+			secondDrainIds: [],
+			fgGone: undefined,
+			bgGone: undefined,
+			fgInnerEvicted: undefined,
+			bgInnerEvicted: undefined,
+			fgTaskEvicted: undefined,
+			bgTaskEvicted: undefined,
+		});
+	});
+
+	test('hasOpenBackgroundSpawns is true only while an unfinished background spawn is present; foreground spawns never keep it alive', () => {
+		// The liveness signal that stops idle eviction from killing the CLI
+		// subprocess that hosts an in-process background subagent.
+		const registry = r();
+		const empty = registry.hasOpenBackgroundSpawns();
+
+		registry.recordSpawn('toolu_fg');
+		const foregroundOnly = registry.hasOpenBackgroundSpawns();
+
+		const bg = registry.recordSpawn('toolu_bg');
+		bg.background = true;
+		const withBackground = registry.hasOpenBackgroundSpawns();
+
+		// Turn end drains foreground spawns; the background one must still count.
+		registry.drainForegroundSpawns();
+		const afterTurnEnd = registry.hasOpenBackgroundSpawns();
+
+		// The real completion route: `task_notification` marks then removes.
+		bg.markCompleted();
+		const afterMarkCompleted = registry.hasOpenBackgroundSpawns();
+		registry.removeSpawn('toolu_bg');
+		const afterRemove = registry.hasOpenBackgroundSpawns();
+
+		assert.deepStrictEqual({
+			empty,
+			foregroundOnly,
+			withBackground,
+			afterTurnEnd,
+			afterMarkCompleted,
+			afterRemove,
+		}, {
+			empty: false,
+			foregroundOnly: false,
+			withBackground: true,
+			afterTurnEnd: true,
+			afterMarkCompleted: false,
+			afterRemove: false,
 		});
 	});
 
@@ -186,19 +276,22 @@ suite('SubagentRegistry', () => {
 		});
 	});
 
-	test('dispose clears spawns + inner-edge maps so a stray reference cannot resurrect stale state', () => {
+	test('dispose clears spawns + task/inner-edge maps so a stray reference cannot resurrect stale state', () => {
 		const registry = new SubagentRegistry();
 		registry.recordSpawn('toolu_x', { agentId: 'agent-x' });
 		registry.noteInnerTool('toolu_inner', 'toolu_x');
+		registry.noteTask('task-x', 'toolu_x');
 
 		registry.dispose();
 
 		assert.deepStrictEqual({
 			spawn: registry.getSpawn('toolu_x'),
 			innerParent: registry.getParentSpawn('toolu_inner'),
+			taskParent: registry.getSpawnForTask('task-x'),
 		}, {
 			spawn: undefined,
 			innerParent: undefined,
+			taskParent: undefined,
 		});
 	});
 });

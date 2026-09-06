@@ -102,10 +102,14 @@ forced Changes view never shrinks the editor permanently.
 A running session can produce new file changes at any time.
 
 #### D6 — New changes never open the side pane
-When a chat turn produces new file changes, the side pane is **not** opened automatically and the
-active view is not switched automatically — it stays as you left it. Only a new session opens it
-(D3b). The first change does make **Changes** the default view (D3d), but that only applies the next
-time the side pane is opened.
+When a chat turn produces new file changes, the side pane is **not** opened automatically. A pane
+the user already hid stays hidden.
+
+#### D6b — Visible Files jumps to Changes on first dirty
+If the side pane is already visible and showing **Files**, the first time the session becomes dirty
+it switches to **Changes** (Cursor-like). The user's next Files click is captured immediately and
+is sticky: later edits do not yank the pane back to Changes. D3d still uses Changes as the default
+the next time a pane with no remembered tab is opened.
 
 ### Scenario: the side pane has nothing to show
 Some sessions gate off every auxiliary-bar view container — e.g. a workspace-less **quick chat**,
@@ -178,8 +182,9 @@ and hands control back once the user reopens the sessions sidebar manually.
   and `sessions.web.main.ts` (web) and also registers the experimental
   `sessions.layout.autoCollapseSessionsSidebar` setting. The web phone layout
   uses the [mobile controller](./mobileSessionLayoutController.md) instead.
-- **Capture [D1]** — `_captureViewState(previousSession)` records `auxiliaryBarVisible` and
-  `auxiliaryBarActiveViewContainerId`; also used by the base save-time hook (B4) via
+- **Capture [D1]** — leaving a created session records `_captureViewState(previousSession)`
+  (`auxiliaryBarVisible` + `auxiliaryBarActiveViewContainerId`); leaving an uncreated draft
+  writes the shared `_newSessionViewState` instead. Also used by the base save-time hook (B4) via
   `_captureActiveSessionViewState`.
 - **Live tracking [D2]** — `onDidChangePartVisibility` listener for `AUXILIARYBAR_PART`, skipped while
   multiple sessions are visible, the editor is maximized, `_togglingSidePane` is set (the side-pane
@@ -189,7 +194,10 @@ and hands control back once the user reopens the sessions sidebar manually.
   container is restored before capture (`_restoreSavedAuxiliaryBarContainerOnReveal`).
 - **Restore [D3]** — `_syncAuxiliaryBarVisibility(resource, hasWorkspace, isCreated)`.
   Uncreated sessions (D3b) share `_newSessionViewState`, persisted under
-  `sessions.newSessionViewState`. `_defaultAuxiliaryBarContainerId` /
+  `sessions.newSessionViewState`. Fumie's `sessionsMinimalShell` restore
+  (`_restoreRememberedAuxiliaryBarContainer`) still honors that pin (and a hidden
+  new-session pane) before falling back to the D3d default, so a later sync cannot
+  yank Files back to Changes. `_defaultAuxiliaryBarContainerId` /
   `_openDefaultAuxiliaryBarContainer` / `_isAuxiliaryBarContainerPinned` implement D3c/D3d; the default
   container comes from `sessionHasChanges(activeSession)`, read untracked so it is evaluated only when
   the side pane is opened.
@@ -204,8 +212,12 @@ and hands control back once the user reopens the sessions sidebar manually.
   sessions workbench (`setEditorMaximized` in `browser/workbench.ts`) snapshots the editor part size +
   surrounding part visibility on maximize and restores them on un-maximize, so the editor returns to
   its previous width.
-- **No auto-reveal [D6]** — the sync logic never opens the side pane or switches the active container
-  in response to file changes; only D3b opens it, and D4 switches it to Changes.
+- **No auto-reveal [D6]** — the sync logic never opens a hidden side pane in response to file
+  changes; only D3b opens it.
+- **Dirty jump [D6b]** — `_registerDirtyChangesJump` watches `sessionHasChanges` on a rising edge
+  (same session, 0→N). If the aux bar is visible on Files, it opens Changes and records that tab
+  (new-session state or `_captureViewState`). `_registerAuxiliaryBarContainerCapture` records a
+  user Files/Changes click immediately so a later D3 sync cannot override it.
 - **Empty aux bar [D10]** — `_registerAuxiliaryBarPartVisibility` re-checks `_hasActiveAuxViewContainers()`
   (base; `IViewDescriptorService.getViewContainersByLocation(AuxiliaryBar)` filtered by
   `IViewsService.isViewContainerActive`) on container add/remove

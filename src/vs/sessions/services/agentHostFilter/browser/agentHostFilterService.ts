@@ -12,9 +12,15 @@ import { InstantiationType, registerSingleton } from '../../../../platform/insta
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { isAgentHostProvider, IAgentHostSessionsProvider } from '../../../common/agentHostSessionsProvider.js';
 import { ISessionsProvidersService } from '../../sessions/browser/sessionsProvidersService.js';
-import { AgentHostFilterConnectionStatus, IAgentHostFilterEntry, IAgentHostFilterService } from '../common/agentHostFilter.js';
+import { AgentHostFilterConnectionStatus, AgentHostFilterScope, agentHostFilterScopeEquals, IAgentHostFilterEntry, IAgentHostFilterService } from '../common/agentHostFilter.js';
 
+/**
+ * Legacy single-host selection key, predating {@link SCOPE_STORAGE_KEY}. Read
+ * for migration and mirrored on `host`-scope writes so a rollback to a build
+ * that only knows this key still restores the last scoped host.
+ */
 const STORAGE_KEY = 'sessions.agentHostFilter.selectedProviderId';
+const SCOPE_STORAGE_KEY = 'sessions.agentHostFilter.scope';
 
 function mapStatus(s: RemoteAgentHostConnectionStatus): AgentHostFilterConnectionStatus {
 	switch (s.kind) {
@@ -49,8 +55,25 @@ export class AgentHostFilterService extends Disposable implements IAgentHostFilt
 	private readonly _onDidChangeDiscovering = this._register(new Emitter<void>());
 	readonly onDidChangeDiscovering: Event<void> = this._onDidChangeDiscovering.event;
 
-	private _selectedProviderId: string | undefined;
+	private _scope: AgentHostFilterScope;
 	private _hosts: readonly IAgentHostFilterEntry[] = [];
+
+	/**
+	 * Whether the currently scoped host has been observed in {@link _hosts}
+	 * at some point. Guards the desktop fallback-to-`all`: a persisted host
+	 * scope must survive the startup window where remote providers have not
+	 * registered yet, but must reset once a host it *did* see goes away.
+	 */
+	private _scopedHostSeen = false;
+
+	/**
+	 * Whether {@link _scope} is a user choice (picked in a menu or restored
+	 * from storage) rather than a platform default or a normalization
+	 * fallback. Web tells the two apart: an explicitly picked `all` is the
+	 * union of every host and stays, while the default `all` still resolves
+	 * to the first known host.
+	 */
+	private _scopeIsExplicit = false;
 
 	/**
 	 * Discovery handlers contributed by host providers (e.g. dev tunnels).
@@ -79,14 +102,18 @@ export class AgentHostFilterService extends Disposable implements IAgentHostFilt
 	) {
 		super();
 
-		this._selectedProviderId = this._storageService.get(STORAGE_KEY, StorageScope.PROFILE, undefined);
+		this._scope = this._loadScope();
 
 		this._rewatchProviders();
 		this._register(this._sessionsProvidersService.onDidChangeProviders(() => this._rewatchProviders()));
 	}
 
+	get scope(): AgentHostFilterScope {
+		return this._scope;
+	}
+
 	get selectedProviderId(): string | undefined {
-		return this._selectedProviderId;
+		return this._scope.kind === 'host' ? this._scope.providerId : undefined;
 	}
 
 	get hosts(): readonly IAgentHostFilterEntry[] {
@@ -122,16 +149,22 @@ export class AgentHostFilterService extends Disposable implements IAgentHostFilt
 		return toDisposable(() => this._discoveryHandlers.delete(handler));
 	}
 
-	setSelectedProviderId(providerId: string): void {
-		if (!this._hosts.some(h => h.providerId === providerId)) {
+	setScope(scope: AgentHostFilterScope): void {
+		if (scope.kind === 'host' && !this._hosts.some(h => h.providerId === scope.providerId)) {
 			return;
 		}
-		if (providerId === this._selectedProviderId) {
+		if (agentHostFilterScopeEquals(scope, this._scope)) {
 			return;
 		}
-		this._selectedProviderId = providerId;
+		this._scope = scope;
+		this._scopedHostSeen = scope.kind === 'host';
+		this._scopeIsExplicit = true;
 		this._persist();
 		this._onDidChange.fire();
+	}
+
+	setSelectedProviderId(providerId: string): void {
+		this.setScope({ kind: 'host', providerId });
 	}
 
 	reconnect(providerId: string): void {
@@ -154,11 +187,95 @@ export class AgentHostFilterService extends Disposable implements IAgentHostFilt
 		}
 	}
 
-	private _validate(providerId: string | undefined): string | undefined {
-		if (providerId !== undefined && this._hosts.some(h => h.providerId === providerId)) {
-			return providerId;
+	forget(providerId: string): void {
+		const provider = this._sessionsProvidersService.getProvider(providerId);
+		if (provider && isAgentHostProvider(provider) && provider.forget) {
+			provider.forget().catch(() => { /* errors are surfaced by the provider */ });
+			return;
 		}
-		return this._hosts.length > 0 ? this._hosts[0].providerId : undefined;
+		const host = this._hosts.find(h => h.providerId === providerId);
+		if (!host) {
+			return;
+		}
+		this._remoteAgentHostService.removeRemoteAgentHost(host.address)
+			.catch(() => { /* errors are surfaced by the host service */ });
+	}
+
+	/**
+	 * Reads the persisted scope, marking it as an explicit choice (see
+	 * {@link _scopeIsExplicit}) when one was stored.
+	 */
+	private _loadScope(): AgentHostFilterScope {
+		const raw = this._storageService.get(SCOPE_STORAGE_KEY, StorageScope.PROFILE);
+		if (raw) {
+			try {
+				const parsed = JSON.parse(raw) as { readonly kind?: unknown; readonly providerId?: unknown } | null;
+				if (parsed && typeof parsed === 'object') {
+					if (parsed.kind === 'all' || parsed.kind === 'local') {
+						this._scopeIsExplicit = true;
+						return { kind: parsed.kind };
+					}
+					if (parsed.kind === 'host' && typeof parsed.providerId === 'string') {
+						this._scopeIsExplicit = true;
+						return { kind: 'host', providerId: parsed.providerId };
+					}
+				}
+			} catch {
+				// Unreadable value — fall through to the legacy key / default.
+			}
+		}
+		const legacy = this._storageService.get(STORAGE_KEY, StorageScope.PROFILE);
+		if (legacy) {
+			this._scopeIsExplicit = true;
+			return { kind: 'host', providerId: legacy };
+		}
+		return { kind: 'all' };
+	}
+
+	/**
+	 * Normalize the scope against the current host list.
+	 *
+	 * Web has no local agent host, so `local` is normalized away and the
+	 * implicit scope is a concrete host: the default and the fallback for a
+	 * host that disappeared are both the first known host. An `all` scope the
+	 * user actually picked is kept — there it means the union of every remote
+	 * host — while the `all` a fresh profile starts from is not (it also
+	 * stands in for the old "no hosts known" `undefined`).
+	 *
+	 * Desktop keeps `all`/`local` as-is and only resets a `host` scope to
+	 * `all` when a host this service had seen disappears (forget/remove).
+	 * A host scope whose provider is merely absent right now is left alone:
+	 * at startup providers register in no guaranteed order, so "the host
+	 * list is non-empty without it" is not evidence the host is gone.
+	 */
+	private _validateScope(scope: AgentHostFilterScope): AgentHostFilterScope {
+		if (isWeb) {
+			if (scope.kind === 'host' && this._hosts.some(h => h.providerId === scope.providerId)) {
+				return scope;
+			}
+			if (scope.kind === 'all' && this._scopeIsExplicit) {
+				return scope;
+			}
+			if (this._hosts.length > 0) {
+				return { kind: 'host', providerId: this._hosts[0].providerId };
+			}
+			// Nothing to scope to yet. The resulting `all` is a placeholder,
+			// not a pick, so a host registering later still wins.
+			this._scopeIsExplicit = false;
+			return { kind: 'all' };
+		}
+		if (scope.kind !== 'host') {
+			return scope;
+		}
+		if (this._hosts.some(h => h.providerId === scope.providerId)) {
+			this._scopedHostSeen = true;
+			return scope;
+		}
+		if (this._scopedHostSeen) {
+			this._scopedHostSeen = false;
+			return { kind: 'all' };
+		}
+		return scope;
 	}
 
 	/**
@@ -178,6 +295,7 @@ export class AgentHostFilterService extends Disposable implements IAgentHostFilt
 				label: provider.label,
 				address: provider.remoteAddress,
 				status: mapStatus(provider.connectionStatus!.read(reader)),
+				hasLiveConnection: provider.hasLiveConnection?.read(reader) ?? false,
 			})).sort((a, b) => a.label.localeCompare(b.label));
 
 			this._applyHosts(hosts);
@@ -189,27 +307,33 @@ export class AgentHostFilterService extends Disposable implements IAgentHostFilt
 			|| hosts.some((h, i) => h.providerId !== this._hosts[i].providerId
 				|| h.label !== this._hosts[i].label
 				|| h.address !== this._hosts[i].address
-				|| h.status !== this._hosts[i].status);
+				|| h.status !== this._hosts[i].status
+				|| h.hasLiveConnection !== this._hosts[i].hasLiveConnection);
 
 		this._hosts = hosts;
 
-		const validated = isWeb ? this._validate(this._selectedProviderId) : undefined;
-		const selectionChanged = validated !== this._selectedProviderId;
-		if (selectionChanged) {
-			this._selectedProviderId = validated;
-			this._persist();
+		const validated = this._validateScope(this._scope);
+		const scopeChanged = !agentHostFilterScopeEquals(validated, this._scope);
+		if (scopeChanged) {
+			this._scope = validated;
+			if (this._scopeIsExplicit) {
+				// A normalization of the platform default is not worth
+				// recording: persisting it would make the next launch read it
+				// back as a choice the user never made.
+				this._persist();
+			}
 		}
 
-		if (changed || selectionChanged) {
+		if (changed || scopeChanged) {
 			this._onDidChange.fire();
 		}
 	}
 
 	private _persist(): void {
-		if (this._selectedProviderId === undefined) {
-			this._storageService.remove(STORAGE_KEY, StorageScope.PROFILE);
-		} else {
-			this._storageService.store(STORAGE_KEY, this._selectedProviderId, StorageScope.PROFILE, StorageTarget.USER);
+		this._storageService.store(SCOPE_STORAGE_KEY, JSON.stringify(this._scope), StorageScope.PROFILE, StorageTarget.USER);
+		if (this._scope.kind === 'host') {
+			// Rollback mirror — see the comment on STORAGE_KEY.
+			this._storageService.store(STORAGE_KEY, this._scope.providerId, StorageScope.PROFILE, StorageTarget.USER);
 		}
 	}
 }

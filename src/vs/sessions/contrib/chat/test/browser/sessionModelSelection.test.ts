@@ -14,14 +14,16 @@ import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { InMemoryStorageService, StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
 import { getSelectedModelStorageKey, storeSelectedModel } from '../../../../../workbench/contrib/chat/common/chatSelectedModel.js';
 import { ChatAgentLocation, ChatConfiguration } from '../../../../../workbench/contrib/chat/common/constants.js';
-import { ILanguageModelChatMetadataAndIdentifier } from '../../../../../workbench/contrib/chat/common/languageModels.js';
+import { ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService } from '../../../../../workbench/contrib/chat/common/languageModels.js';
 import { isInConversationModelChoice, resolveModelIdentifier } from '../../../../../workbench/contrib/chat/common/modelSelection.js';
+import { IChatSessionsService } from '../../../../../workbench/contrib/chat/common/chatSessionsService.js';
 import { conformanceInputs, IModelSelectionConformanceScenario, ModelSelectionConformanceModel, modelSelectionConformanceScenarios } from '../../../../../workbench/contrib/chat/test/browser/widget/input/modelSelectionConformance.js';
 import { ISessionsProvidersService } from '../../../../services/sessions/browser/sessionsProvidersService.js';
 import { ISessionsProvider, ISessionModelPickerOptions } from '../../../../services/sessions/common/sessionsProvider.js';
 import { ChatModelSource, IChat, SessionStatus } from '../../../../services/sessions/common/session.js';
-import { IActiveSession } from '../../../../services/sessions/common/sessionsManagement.js';
+import { IActiveSession, IProviderSessionType, ISessionsManagementService } from '../../../../services/sessions/common/sessionsManagement.js';
 import { restoreReasonForSource, SessionModelSelection } from '../../browser/sessionModelSelection.js';
+import { STORAGE_KEY_LAST_SESSION_TYPE } from '../../browser/sessionTypePicker.js';
 
 function model(identifier: string): ILanguageModelChatMetadataAndIdentifier {
 	return {
@@ -84,7 +86,14 @@ interface ITestSession {
  * A session whose model is scoped to its active chat, matching `ActiveSession`: peer chats each
  * keep their own model, and the session merely reports the active one's.
  */
-function createSession(providerId: string, status: SessionStatus, selectedModelId?: string, sessionId = `${providerId}:session`, sessionType = 'type'): ITestSession {
+function createSession(
+	providerId: string,
+	status: SessionStatus,
+	selectedModelId?: string,
+	sessionId = `${providerId}:session`,
+	sessionType = 'type',
+	workspaceRoot?: URI,
+): ITestSession {
 	const activeChat = observableValue<IChat>(`${providerId}.activeChat`, createChat(`chat:/${providerId}/one`, selectedModelId, ChatModelSource.Chosen, status));
 	const modelId = {
 		get: () => activeChat.get().modelId.get(),
@@ -106,6 +115,7 @@ function createSession(providerId: string, status: SessionStatus, selectedModelI
 			sessionType,
 			sessionId,
 			resource: URI.parse(`session:/${providerId}`),
+			workspace: observableValue(`${providerId}.workspace`, workspaceRoot ? { folders: [{ root: workspaceRoot }] } : undefined),
 			modelId: derived(reader => activeChat.read(reader).modelId.read(reader)),
 			status: observableValue(`${providerId}.status`, status),
 			activeChat,
@@ -182,6 +192,55 @@ function createConfigurationService(defaultModel?: string): IConfigurationServic
 	} as IConfigurationService;
 }
 
+interface ITestLanguageModelsService extends ILanguageModelsService {
+	setModelHidden(identifier: string, hidden: boolean): void;
+	dispose(): void;
+}
+
+function createLanguageModelsService(
+	models: readonly ILanguageModelChatMetadataAndIdentifier[],
+	hiddenModelIds: readonly string[] = [],
+): ITestLanguageModelsService {
+	const byIdentifier = new Map(models.map(candidate => [candidate.identifier, candidate.metadata]));
+	const hidden = new Set(hiddenModelIds);
+	const visibilityChanges = new Emitter<void>();
+	return {
+		getLanguageModelIds: () => [...byIdentifier.keys()],
+		lookupLanguageModel: identifier => byIdentifier.get(identifier),
+		isModelHidden: identifier => hidden.has(identifier),
+		onDidChangeModelVisibility: visibilityChanges.event,
+		onDidChangeLanguageModels: Event.None,
+		setModelHidden(identifier, value) {
+			const changed = value ? !hidden.has(identifier) : hidden.has(identifier);
+			if (!changed) {
+				return;
+			}
+			if (value) {
+				hidden.add(identifier);
+			} else {
+				hidden.delete(identifier);
+			}
+			visibilityChanges.fire();
+		},
+		dispose: () => visibilityChanges.dispose(),
+	} as ITestLanguageModelsService;
+}
+
+function createSessionsManagementService(types: readonly IProviderSessionType[]): ISessionsManagementService {
+	return {
+		onDidChangeSessionTypes: Event.None,
+		getAllProviderSessionTypes: () => [...types],
+		getSessionTypesForFolder: () => [...types],
+		getQuickChatSessionTypes: () => [...types],
+	} as unknown as ISessionsManagementService;
+}
+
+function createChatSessionsService(supportsAutoModel = true): IChatSessionsService {
+	return {
+		supportsAutoModelForSessionType: () => supportsAutoModel,
+	} as unknown as IChatSessionsService;
+}
+
 function runConformanceScenario(
 	scenario: IModelSelectionConformanceScenario,
 	register: <T extends { dispose(): void }>(disposable: T) => T,
@@ -251,6 +310,170 @@ suite('SessionModelSelection', () => {
 				assert.deepStrictEqual(runConformanceScenario(scenario, disposable => disposables.add(disposable)), scenario.expected);
 			});
 		}
+	});
+
+	test('mixes and presents compatible official subscription models in the harness picker', () => {
+		const custom = {
+			...model('agent-host-codex:@provider=custom:internal-gpt'),
+			metadata: {
+				...model('agent-host-codex:@provider=custom:internal-gpt').metadata,
+				id: '@provider=custom:internal-gpt',
+				family: 'gpt',
+				modelGroup: { id: 'custom' },
+			},
+		};
+		const official = {
+			...model('agent-host-codex:@provider=openai:gpt-test'),
+			metadata: {
+				...model('agent-host-codex:@provider=openai:gpt-test').metadata,
+				id: '@provider=openai:gpt-test',
+				family: 'gpt-test',
+				vendor: 'openai',
+				targetChatSessionType: 'agent-host-codex',
+				modelGroup: { id: 'openai', sourceId: 'chatgptSubscription' },
+			},
+		};
+		const testSession = createSession('provider', SessionStatus.Untitled, custom.identifier, 'codex-draft', 'codex');
+		const provider = disposables.add(createProvider('provider'));
+		provider.models = [custom];
+		provider.modelTarget = 'agent-host-codex';
+		const languageModelsService = disposables.add(createLanguageModelsService([official]));
+		const selection = disposables.add(new SessionModelSelection(
+			observableValue<IActiveSession | undefined>('session', testSession.session),
+			createProvidersService([provider]),
+			disposables.add(new InMemoryStorageService()),
+			createConfigurationService(),
+			disposables.add(new NullLogService()),
+			languageModelsService,
+		));
+
+		assert.deepStrictEqual(
+			selection.state.get().models.map(candidate => ({ identifier: candidate.identifier, icon: candidate.metadata.statusIcon?.id })),
+			[
+				{ identifier: custom.identifier, icon: 'chat-model-provider-openai' },
+				{ identifier: official.identifier, icon: 'openai' },
+			],
+		);
+	});
+
+	test('filters hidden mixed subscription rows without hiding the harness catalog', () => {
+		const custom = {
+			...model('agent-host-claude:customendpoint/custom/claude-opus'),
+			metadata: {
+				...model('agent-host-claude:customendpoint/custom/claude-opus').metadata,
+				id: 'customendpoint/custom/claude-opus',
+				family: 'claude-opus',
+				byokModelIdentifier: 'customendpoint/custom/claude-opus',
+				modelGroup: { id: 'customendpoint' },
+			},
+		};
+		const copilot = {
+			...model('agent-host-claude:@provider=copilot:claude-sonnet'),
+			metadata: {
+				...model('agent-host-claude:@provider=copilot:claude-sonnet').metadata,
+				id: '@provider=copilot:claude-sonnet',
+				family: 'claude-sonnet',
+				modelGroup: { id: 'copilot' },
+			},
+		};
+		const anthropic = {
+			...model('agent-host-claude:@provider=anthropic:opus'),
+			metadata: {
+				...model('agent-host-claude:@provider=anthropic:opus').metadata,
+				id: '@provider=anthropic:opus',
+				family: 'claude-opus',
+				modelGroup: { id: 'anthropic' },
+			},
+		};
+		const testSession = createSession('provider', SessionStatus.Completed, custom.identifier, 'claude-session', 'claude');
+		const provider = disposables.add(createProvider('provider'));
+		provider.models = [custom, anthropic];
+		provider.modelTarget = 'agent-host-claude';
+		const languageModelsService = disposables.add(createLanguageModelsService(
+			[copilot, anthropic],
+			[copilot.identifier, anthropic.identifier],
+		));
+		const selection = disposables.add(new SessionModelSelection(
+			observableValue<IActiveSession | undefined>('session', testSession.session),
+			createProvidersService([provider]),
+			disposables.add(new InMemoryStorageService()),
+			createConfigurationService(),
+			disposables.add(new NullLogService()),
+			languageModelsService,
+		));
+
+		assert.deepStrictEqual(selection.state.get().models.map(candidate => candidate.identifier), [custom.identifier, anthropic.identifier]);
+
+		languageModelsService.setModelHidden(copilot.identifier, false);
+		assert.deepStrictEqual(selection.state.get().models.map(candidate => candidate.identifier), [custom.identifier, anthropic.identifier, copilot.identifier]);
+	});
+
+	test('requests a typed harness switch and applies the pending model on the replacement draft', () => {
+		const workspace = URI.file('/workspace');
+		const catalogKimi = {
+			...model('agent-host-codex:@provider=custom:moonshotai%2Fkimi-example'),
+			metadata: {
+				...model('agent-host-codex:@provider=custom:moonshotai%2Fkimi-example').metadata,
+				id: '@provider=custom:moonshotai/kimi-example',
+				family: 'kimi',
+				modelGroup: { id: 'custom' },
+			},
+		};
+		const nativeKimi = {
+			...model('agent-host-kimi:moonshot/kimi-example'),
+			metadata: {
+				...model('agent-host-kimi:moonshot/kimi-example').metadata,
+				id: 'moonshot/kimi-example',
+				family: 'kimi',
+			},
+		};
+		const codex = createSession('codex-provider', SessionStatus.Untitled, catalogKimi.identifier, 'codex-draft', 'codex', workspace);
+		const kimi = createSession('kimi-provider', SessionStatus.Untitled, undefined, 'kimi-draft', 'kimi', workspace);
+		const codexProvider = disposables.add(createProvider('codex-provider'));
+		codexProvider.models = [catalogKimi];
+		codexProvider.modelTarget = 'agent-host-codex';
+		const appliedSources: ChatModelSource[] = [];
+		const kimiProvider = disposables.add(createProvider('kimi-provider', (identifier, source) => {
+			appliedSources.push(source);
+			kimi.modelId.set(identifier, undefined, source);
+		}));
+		kimiProvider.models = [nativeKimi];
+		kimiProvider.modelTarget = 'agent-host-kimi';
+		const offeredTypes = [
+			{ providerId: 'codex-provider', sessionType: { id: 'codex', label: 'Codex', chatSessionType: 'agent-host-codex' } },
+			{ providerId: 'kimi-provider', sessionType: { id: 'kimi', label: 'Kimi', chatSessionType: 'agent-host-kimi' } },
+		] as IProviderSessionType[];
+		const session = observableValue<IActiveSession | undefined>('session', codex.session);
+		const storage = disposables.add(new InMemoryStorageService());
+		const selection = disposables.add(new SessionModelSelection(
+			session,
+			createProvidersService([codexProvider, kimiProvider]),
+			storage,
+			createConfigurationService(),
+			disposables.add(new NullLogService()),
+			undefined,
+			createSessionsManagementService(offeredTypes),
+		));
+		const requestedTypes: Array<{ providerId: string; sessionTypeId: string }> = [];
+		disposables.add(selection.onDidRequestSessionType(pick => {
+			requestedTypes.push(pick);
+			session.set(kimi.session, undefined);
+		}));
+
+		assert.strictEqual(selection.selectModel(catalogKimi.identifier), true);
+		assert.deepStrictEqual({
+			requestedTypes,
+			current: selection.state.get().currentModel?.identifier,
+			writes: kimiProvider.writes,
+			sources: appliedSources,
+			stored: storage.get(getSelectedModelStorageKey(ChatAgentLocation.Chat, 'agent-host-kimi'), StorageScope.PROFILE),
+		}, {
+			requestedTypes: [{ providerId: 'kimi-provider', sessionTypeId: 'kimi' }],
+			current: nativeKimi.identifier,
+			writes: [nativeKimi.identifier],
+			sources: [ChatModelSource.Chosen],
+			stored: nativeKimi.identifier,
+		});
 	});
 
 	test('new Codex sessions use the most recently selected provider model', () => {
@@ -1495,6 +1718,125 @@ suite('SessionModelSelection', () => {
 		}, {
 			selected: second.identifier,
 			providerModel: first.identifier,
+		});
+	});
+
+	suite('before a session exists', () => {
+
+		const mockTarget = 'agent-host-mock';
+		const otherTarget = 'agent-host-other';
+
+		function targetedModel(identifier: string, target: string): ILanguageModelChatMetadataAndIdentifier {
+			const base = model(identifier);
+			return { ...base, metadata: { ...base.metadata, targetChatSessionType: target } };
+		}
+
+		const mockModel = targetedModel('agent-host-mock:mock-model', mockTarget);
+		const otherModel = targetedModel('agent-host-other:other-model', otherTarget);
+
+		// A non-agent-host type is listed first, as the Copilot provider is in a real window: only an
+		// agent host advertises the `chatSessionType` its models are registered against.
+		const advertised = [
+			{ providerId: 'default-copilot', sessionType: { id: 'copilotcli', label: 'Copilot CLI' } },
+			{ providerId: 'local-agent-host', sessionType: { id: 'mock', label: 'Mock Agent', chatSessionType: mockTarget } },
+			{ providerId: 'agenthost-remote', sessionType: { id: 'other', label: 'Other Agent', chatSessionType: otherTarget } },
+		] as IProviderSessionType[];
+
+		function createLandingSelection(options?: {
+			readonly storage?: InMemoryStorageService;
+			readonly types?: readonly IProviderSessionType[];
+			readonly models?: readonly ILanguageModelChatMetadataAndIdentifier[];
+			readonly supportsAutoModel?: boolean;
+		}): SessionModelSelection {
+			return disposables.add(new SessionModelSelection(
+				observableValue<IActiveSession | undefined>('session', undefined),
+				createProvidersService([]),
+				options?.storage ?? disposables.add(new InMemoryStorageService()),
+				createConfigurationService(),
+				disposables.add(new NullLogService()),
+				disposables.add(createLanguageModelsService(options?.models ?? [mockModel, otherModel])),
+				createSessionsManagementService(options?.types ?? advertised),
+				createChatSessionsService(options?.supportsAutoModel ?? true),
+			));
+		}
+
+		test('names the first agent host\'s model when there is no session to scope a pool by', () => {
+			const state = createLandingSelection().state.get();
+
+			assert.deepStrictEqual({
+				poolResolved: state.poolResolved,
+				models: state.models.map(candidate => candidate.identifier),
+				current: state.currentModel?.identifier,
+			}, {
+				poolResolved: true,
+				models: [mockModel.identifier],
+				current: mockModel.identifier,
+			});
+		});
+
+		test('follows the remembered agent rather than the first advertised one', () => {
+			const storage = disposables.add(new InMemoryStorageService());
+			storage.store(STORAGE_KEY_LAST_SESSION_TYPE, JSON.stringify({ providerId: 'agenthost-remote', sessionTypeId: 'other' }), StorageScope.PROFILE, StorageTarget.MACHINE);
+
+			const state = createLandingSelection({ storage }).state.get();
+
+			assert.deepStrictEqual({
+				models: state.models.map(candidate => candidate.identifier),
+				current: state.currentModel?.identifier,
+			}, {
+				models: [otherModel.identifier],
+				current: otherModel.identifier,
+			});
+		});
+
+		test('shows the model remembered for that agent', () => {
+			const storage = disposables.add(new InMemoryStorageService());
+			const second = targetedModel('agent-host-mock:second', mockTarget);
+			storeSelectedModel(storage, ChatAgentLocation.Chat, mockTarget, second.identifier);
+
+			const state = createLandingSelection({ storage, models: [mockModel, second] }).state.get();
+
+			assert.strictEqual(state.currentModel?.identifier, second.identifier);
+		});
+
+		test('remembers a pick made before the session exists', () => {
+			const storage = disposables.add(new InMemoryStorageService());
+			const second = targetedModel('agent-host-mock:second', mockTarget);
+			const selection = createLandingSelection({ storage, models: [mockModel, second] });
+
+			const applied = selection.selectModel(second.identifier);
+
+			assert.deepStrictEqual({
+				applied,
+				current: selection.state.get().currentModel?.identifier,
+				remembered: storage.get(getSelectedModelStorageKey(ChatAgentLocation.Chat, mockTarget), StorageScope.PROFILE),
+			}, {
+				applied: true,
+				current: second.identifier,
+				remembered: second.identifier,
+			});
+		});
+
+		test('leaves the pool unresolved when the default agent publishes nothing', () => {
+			const state = createLandingSelection({ models: [otherModel], types: [advertised[0], advertised[1]] }).state.get();
+
+			assert.deepStrictEqual({
+				poolResolved: state.poolResolved,
+				models: state.models,
+				hasSelectableModel: state.hasSelectableModel,
+			}, {
+				// Nothing is known about the pool, so the picker must not read the empty list as a
+				// verdict on Copilot entitlement.
+				poolResolved: false,
+				models: [],
+				hasSelectableModel: false,
+			});
+		});
+
+		test('does not offer Auto on an agent that requires an explicit model', () => {
+			const state = createLandingSelection({ supportsAutoModel: false }).state.get();
+
+			assert.strictEqual(state.options.showAutoModel, false);
 		});
 	});
 });

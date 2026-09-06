@@ -11,6 +11,7 @@ import { Disposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { INativeEnvironmentService } from '../../../environment/common/environment.js';
+import { AgentHostFumieHomeEnvVar } from '../../common/agentHostProductEnv.js';
 import { ILogService } from '../../../log/common/log.js';
 import { startLocalOtlpHttpReceiver, type ILocalOtlpHttpReceiver } from '../../../otel/node/otlp/localOtlpReceiver.js';
 import {
@@ -242,7 +243,7 @@ export class AgentHostOTelService extends Disposable implements IAgentHostOTelSe
 		super();
 		this._filteredSpanLogScheduler = this._register(new RunOnceScheduler(() => this._logFilteredCodexAuthSpans(), 60_000));
 		this._config = readAgentHostOTelEnv(process.env);
-		this._spansDbPath = join(environmentService.userDataPath, SPANS_DB_SUBPATH);
+		this._spansDbPath = join(process.env[AgentHostFumieHomeEnvVar] ?? environmentService.userDataPath, SPANS_DB_SUBPATH);
 	}
 
 	async getSdkTelemetryConfig(): Promise<TelemetryConfig | undefined> {

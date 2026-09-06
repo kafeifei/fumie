@@ -8,7 +8,7 @@ import type { URI } from '../../../../base/common/uri.js';
 import { LogLevel, type ILogService } from '../../../log/common/log.js';
 import type { AgentSignal } from '../../common/agent.js';
 import { ActionType } from '../../common/state/sessionActions.js';
-import { ResponsePartKind, ToolResultContentType, type ToolResultContent, type ToolResultFileEditContent } from '../../common/state/sessionState.js';
+import { ResponsePartKind, ToolResultContentType, type ITurnTokenTotal, type ToolResultContent, type ToolResultFileEditContent } from '../../common/state/sessionState.js';
 import { extractForwardedErrorInfo } from '../shared/proxyChatError.js';
 import { buildTopLevelSubagentReadyAction, emitInnerAssistantSignals, mapSubagentSystemMessage, SUBAGENT_SPAWNING_TOOL_NAMES, tagWithParent } from './claudeSubagentSignals.js';
 import type { SubagentRegistry } from './claudeSubagentRegistry.js';
@@ -46,6 +46,14 @@ import { ToolCallConfirmationReason, ToolCallContributorKind, type StringOrMarkd
  * are not part of the public surface — Phase 6.1's lesson — and the
  * lifecycle invariants live behind named methods.
  */
+/** One main-loop API call's usage, normalized from the SDK's `BetaUsage`. */
+export interface IMainLoopCallUsage {
+	readonly inputTokens: number;
+	readonly cacheReadTokens: number;
+	readonly cacheCreationTokens: number;
+	readonly outputTokens: number;
+}
+
 export class ClaudeMapperState {
 	private readonly _activeToolBlocks = new Map<number, { toolUseId: string; toolName: string; isClientTool: boolean }>();
 	/**
@@ -167,6 +175,28 @@ export class ClaudeMapperState {
 	}
 
 	/**
+	 * Usage block of the most recent top-level (main-loop) assistant
+	 * message. An Anthropic usage block describes exactly one API call, so
+	 * its prompt-side fields (`input_tokens` + cache read/creation) are the
+	 * full prompt of that call — i.e. the session's current context-window
+	 * occupancy. The turn's `result` envelope cannot provide this: its
+	 * `usage`/`modelUsage` sum across every call of the turn, so the cached
+	 * prefix is counted once per tool round. Deliberately NOT cleared at
+	 * turn boundaries — occupancy only changes when another call is made,
+	 * and a turn that errors before its first assistant message should
+	 * report the previous occupancy rather than nothing.
+	 */
+	private _lastMainLoopUsage: IMainLoopCallUsage | undefined;
+
+	recordMainLoopUsage(usage: IMainLoopCallUsage): void {
+		this._lastMainLoopUsage = usage;
+	}
+
+	getLastMainLoopUsage(): IMainLoopCallUsage | undefined {
+		return this._lastMainLoopUsage;
+	}
+
+	/**
 	 * Drop any cross-message tracking that is still pending at the end
 	 * of a turn. A `tool_use` whose `tool_result` never arrives — model
 	 * misbehavior, transport drop, future cancellation — would otherwise
@@ -180,6 +210,22 @@ export class ClaudeMapperState {
 	 */
 	clearPendingToolCalls(logService: ILogService): void {
 		this.toolCalls.clearPending(logService);
+	}
+}
+
+/**
+ * Clear cross-message mapper state at the end of a protocol turn.
+ *
+ * Driven by {@link mapResult} on a terminal `result`, which is the only
+ * boundary that owns it. A steering preemption's intermediate result is NOT
+ * such a boundary: the SDK session continues, so the tools the interrupted
+ * request had in flight still report under the ids tracked here, and their
+ * spawned subagents still close on those results.
+ */
+function finalizeClaudeMapperTurn(state: ClaudeMapperState, logService: ILogService, registry: SubagentRegistry): void {
+	state.clearPendingToolCalls(logService);
+	for (const orphan of registry.drainForegroundSpawns()) {
+		logService.warn(`[claudeMapSessionEvents] turn ended with pending subagent-spawning tool_use ${orphan.toolUseId} (agentId=${orphan.agentId ?? '<unresolved>'}); dropping cross-message state`);
 	}
 }
 
@@ -315,6 +361,18 @@ function mapAssistantCanonical(
 	};
 	const completedSignals = message.aborted ? [] : [completedSignal];
 	if (parentToolUseId === null) {
+		// Subagent calls (parent_tool_use_id !== null) run in their own
+		// context window, so only main-loop calls describe this session's
+		// occupancy.
+		const usage = message.message.usage;
+		if (usage && typeof usage.input_tokens === 'number') {
+			state.recordMainLoopUsage({
+				inputTokens: usage.input_tokens,
+				cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+				cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+				outputTokens: usage.output_tokens ?? 0,
+			});
+		}
 		const top: AgentSignal[] = [...completedSignals];
 		for (const block of message.message.content) {
 			if (block.type !== 'tool_use' || !SUBAGENT_SPAWNING_TOOL_NAMES.has(block.name)) {
@@ -457,10 +515,49 @@ function mapResult(
 ): AgentSignal[] {
 	const signals: AgentSignal[] = [];
 	if (message.subtype === 'success') {
-		// `modelUsage` is keyed by model name; pick the first key as the
-		// reported model. Phase 6 turns are single-model; multi-model
-		// attribution is a Phase 7+ concern.
-		const modelKey = Object.keys(message.modelUsage)[0];
+		// `modelUsage` is keyed by model name and regularly holds several
+		// entries per turn: the conversation model plus the small background
+		// utility calls the CLI makes (e.g. Haiku). Attribute the turn to the
+		// entry with the most output tokens — the conversation model — and
+		// carry every entry as whole-turn totals so the footer's token
+		// breakdown lists them all.
+		const modelEntries = Object.entries(message.modelUsage);
+		const modelKey = modelEntries
+			.slice()
+			.sort((a, b) => b[1].outputTokens - a[1].outputTokens)[0]?.[0];
+		const turnTokenTotals: ITurnTokenTotal[] = modelEntries.map(([model, usage]) => ({
+			model,
+			inputTokens: usage.inputTokens,
+			cachedTokens: usage.cacheReadInputTokens,
+			outputTokens: usage.outputTokens,
+		}));
+		// `UsageInfo`'s token fields describe the most recent model call
+		// (whole-turn sums live in `turnTokenTotals`). The result envelope's own
+		// `usage` sums across every call of the turn, so the per-call numbers
+		// come from the last main-loop assistant message instead. Each of the
+		// SDK's three input-side counters is transcribed into the protocol
+		// counter that means the same thing — cache creation into
+		// `_meta.cacheCreationTokens`, which is where it lives because the
+		// generated `UsageInfo` has no field for it — and the client folds them
+		// into occupancy.
+		const lastCall = state.getLastMainLoopUsage();
+		// The window of the model that served the turn, as the SDK reports it
+		// per call. Authoritative where the model catalog has no window
+		// metadata (e.g. host-managed gateway models), which would otherwise
+		// leave the context-usage gauge without a denominator.
+		const mainModelUsage = modelKey ? message.modelUsage[modelKey] : undefined;
+		const modelContextWindow = mainModelUsage && mainModelUsage.contextWindow > 0
+			? {
+				totalTokens: mainModelUsage.contextWindow,
+				...(mainModelUsage.maxOutputTokens > 0 ? { maxOutputTokens: mainModelUsage.maxOutputTokens } : {}),
+			}
+			: undefined;
+		const cacheCreationTokens = lastCall ? lastCall.cacheCreationTokens : message.usage.cache_creation_input_tokens;
+		const meta = {
+			...(turnTokenTotals.length > 0 ? { turnTokenTotals } : {}),
+			...(modelContextWindow ? { modelContextWindow } : {}),
+			...(typeof cacheCreationTokens === 'number' ? { cacheCreationTokens } : {}),
+		};
 		// Per-turn credits are deliberately NOT derived from
 		// `total_cost_usd`: that is the SDK's Anthropic-list-price USD
 		// estimate, not what CAPI actually bills. Real Copilot credits come
@@ -474,10 +571,11 @@ function mapResult(
 				type: ActionType.ChatUsage,
 				turnId,
 				usage: {
-					inputTokens: message.usage.input_tokens,
-					outputTokens: message.usage.output_tokens,
-					cacheReadTokens: message.usage.cache_read_input_tokens,
+					inputTokens: lastCall ? lastCall.inputTokens : message.usage.input_tokens,
+					outputTokens: lastCall ? lastCall.outputTokens : message.usage.output_tokens,
+					cacheReadTokens: lastCall ? lastCall.cacheReadTokens : message.usage.cache_read_input_tokens,
 					...(modelKey ? { model: modelKey } : {}),
+					...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
 				},
 			},
 		});
@@ -505,18 +603,10 @@ function mapResult(
 			},
 		});
 	}
-	// `ChatTurnComplete` is emitted by the session via
-	// `ClaudeSdkPipeline.onTurnComplete`, NOT here. The pipeline knows
-	// when the protocol Turn is truly done (queue fully drained vs an
-	// intermediate result during a steering preempt — CONTEXT.md M10);
-	// the mapper does not have that state.
-	state.clearPendingToolCalls(logService);
-	// Phase 12 — drain orphaned subagent-spawning entries (foreground
-	// only; background entries survive across turns by design). The
-	// registry owns this state; the mapper drives the drain at turn end.
-	for (const orphan of registry.drainForegroundSpawns()) {
-		logService.warn(`[claudeMapSessionEvents] turn ended with pending subagent-spawning tool_use ${orphan.toolUseId} (agentId=${orphan.agentId ?? '<unresolved>'}); dropping cross-message state`);
-	}
+	// `ChatTurnComplete` is emitted by `ClaudeSdkPipeline`, NOT here. The
+	// pipeline knows whether a result closes the final queued entry or the
+	// request interrupted by steering (CONTEXT.md M10); the mapper does not.
+	finalizeClaudeMapperTurn(state, logService, registry);
 	return signals;
 }
 

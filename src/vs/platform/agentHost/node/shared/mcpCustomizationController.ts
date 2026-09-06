@@ -286,13 +286,26 @@ export class McpCustomizationController extends Disposable {
 		const previous = this._live.get().get(server.name);
 		const state = this._stateForUpdate(previous?.state, server.state);
 		const enabled = server.enabled ?? previous?.enabled ?? true;
-		// Once promoted to a top-level entry, stay top-level for the
-		// session — flipping back to a child mid-stream would orphan the
-		// previously-published top-level id.
+		const published = this._findPublishedMcpCustomization(server.name);
+		const childId = published?.childId;
+		const temporaryTopLevelId = previous?.topLevelId
+			?? (published?.topLevelId === this._mintTopLevelId(server.name) ? published.topLevelId : undefined);
+		if (childId !== undefined && temporaryTopLevelId !== undefined) {
+			this._setLiveEntry(server.name, { serverName: server.name, state, enabled, topLevelId: undefined }, tx);
+			this._options.emit({
+				type: ActionType.SessionCustomizationRemoved,
+				id: temporaryTopLevelId,
+			});
+			this._options.emit({
+				type: ActionType.SessionMcpServerStateChanged,
+				id: childId,
+				state,
+				channel: this._buildChannel(server.name, state),
+			});
+			return;
+		}
 		let topLevelId = previous?.topLevelId;
 		if (topLevelId === undefined) {
-			const published = this._findPublishedMcpCustomization(server.name);
-			const childId = published?.childId;
 			if (childId !== undefined) {
 				this._setLiveEntry(server.name, { serverName: server.name, state, enabled, topLevelId: undefined }, tx);
 				this._options.emit({
@@ -390,11 +403,24 @@ export class McpCustomizationController extends Disposable {
 	private _findPublishedMcpCustomization(serverName: string): { readonly topLevelId?: string; readonly childId?: string } | undefined {
 		const customizations = this._stateManager.getSessionState(this._sessionUri.toString())?.customizations ?? [];
 		const topLevel = customizations.find(customization => customization.type === CustomizationType.McpServer && customization.name === serverName);
-		if (topLevel?.type === CustomizationType.McpServer) {
-			return { topLevelId: topLevel.id };
+		let childId: string | undefined;
+		for (const customization of customizations) {
+			if (customization.type === CustomizationType.McpServer) {
+				continue;
+			}
+			const child = customization.children?.find(candidate => candidate.type === CustomizationType.McpServer && candidate.name === serverName);
+			if (child?.type === CustomizationType.McpServer) {
+				childId = child.id;
+				break;
+			}
 		}
-		const childId = findMcpChildId(customizations, serverName);
-		return childId === undefined ? undefined : { childId };
+		if (topLevel?.type !== CustomizationType.McpServer && childId === undefined) {
+			return undefined;
+		}
+		return {
+			topLevelId: topLevel?.type === CustomizationType.McpServer ? topLevel.id : undefined,
+			childId,
+		};
 	}
 
 	private _buildChannel(serverName: string, state: McpServerState): string | undefined {

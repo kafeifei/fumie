@@ -11,6 +11,8 @@ interface IGitBlobUriQuery {
 	readonly sessionUri: string;
 	readonly sha: string;
 	readonly repoRelativePath: string;
+	/** Set only when {@link sha} was resolved to an immutable object ID. */
+	readonly immutable?: true;
 }
 
 /**
@@ -30,11 +32,11 @@ interface IGitBlobUriQuery {
  * @param repoRelativePath Repository-relative path passed to `git show`.
  * @param absolutePath Absolute working-tree path used as the display path.
  */
-export function buildGitBlobUri(sessionUri: string, sha: string, repoRelativePath: string, absolutePath: string): string {
+export function buildGitBlobUri(sessionUri: string, sha: string, repoRelativePath: string, absolutePath: string, immutable = false): string {
 	return URI.from({
 		scheme: GIT_BLOB_SCHEME,
 		path: absolutePath,
-		query: JSON.stringify({ sessionUri, sha, repoRelativePath } satisfies IGitBlobUriQuery),
+		query: JSON.stringify({ sessionUri, sha, repoRelativePath, ...(immutable ? { immutable: true as const } : {}) } satisfies IGitBlobUriQuery),
 	}).toString();
 }
 

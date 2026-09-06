@@ -32,6 +32,15 @@ export function byokKnownModelToAPIInfoWithEffort(providerName: string, id: stri
 }
 
 /**
+ * A statically configured entry without an id cannot address a model. Such
+ * entries have been written to the models configuration in the past and show
+ * up as a nameless row in the model picker, so the static lists drop them.
+ */
+export function hasConfiguredModelId(model: { readonly id?: string }): boolean {
+	return !!model.id?.trim();
+}
+
+/**
  * Like {@link byokKnownModelToAPIInfoWithEffort} but for a map of known models.
  */
 export function byokKnownModelsToAPIInfoWithEffort(providerName: string, knownModels: BYOKKnownModels | undefined): LanguageModelChatInformation[] {

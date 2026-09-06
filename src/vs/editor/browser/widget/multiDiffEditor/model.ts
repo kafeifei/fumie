@@ -11,6 +11,11 @@ import { ContextKeyValue } from '../../../../platform/contextkey/common/contextk
 
 export interface IMultiDiffEditorModel {
 	readonly documents: IValueWithChangeEvent<readonly RefCounted<IDocumentDiffItem>[] | 'loading'>;
+	/**
+	 * Whether an incrementally populated document list has reached its final
+	 * shape. Models that do not provide this value are treated as complete.
+	 */
+	readonly isComplete?: IValueWithChangeEvent<boolean>;
 	readonly contextKeys?: Record<string, ContextKeyValue>;
 }
 

@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { parseClaudeModelId, toSdkModelId, tryParseClaudeModelId } from '../../node/claude/claudeModelId.js';
+import { claudeModelLimitsFallback, parseClaudeModelId, toSdkModelId, tryParseClaudeModelId } from '../../node/claude/claudeModelId.js';
 
 suite('parseClaudeModelId', () => {
 
@@ -264,6 +264,54 @@ suite('parseClaudeModelId', () => {
 			assert.deepStrictEqual(
 				['claude-haiku-4.5', 'claude-opus-4.5', 'claude-haiku-4-5', 'claude-sonnet-4', 'gpt-4o'].map(toSdkModelId),
 				['claude-haiku-4-5', 'claude-opus-4-5', 'claude-haiku-4-5', 'claude-sonnet-4', 'gpt-4o'],
+			);
+		});
+	});
+
+	suite('claudeModelLimitsFallback', () => {
+		test('long-context generations report a 1M window in both id formats and with a date suffix', () => {
+			assert.deepStrictEqual(
+				['claude-opus-4-6-20251101', 'claude-opus-4.7', 'claude-opus-5', 'claude-sonnet-4-6', 'claude-sonnet-5', 'claude-fable-5', 'claude-mythos-5']
+					.map(id => claudeModelLimitsFallback(id)?.maxContextWindow),
+				[1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000],
+			);
+		});
+
+		test('pre-4.6 first-party generations report the standard 200K window and assert no output cap', () => {
+			assert.deepStrictEqual(
+				['claude-haiku-4-5', 'claude-opus-4-5-20251101', 'claude-sonnet-4-5', 'claude-sonnet-4', 'claude-3-5-sonnet-20241022']
+					.map(id => claudeModelLimitsFallback(id)),
+				[
+					{ maxContextWindow: 200_000 },
+					{ maxContextWindow: 200_000 },
+					{ maxContextWindow: 200_000 },
+					{ maxContextWindow: 200_000 },
+					{ maxContextWindow: 200_000 },
+				],
+			);
+		});
+
+		test('an explicit -1m variant is long-context whatever its generation', () => {
+			assert.deepStrictEqual(
+				claudeModelLimitsFallback('claude-opus-4-1m'),
+				{ maxContextWindow: 1_000_000, maxOutputTokens: 128_000 },
+			);
+		});
+
+		test('carries the 128K output cap only for the long-context generations', () => {
+			assert.deepStrictEqual(
+				['claude-opus-5', 'claude-haiku-4-5'].map(id => claudeModelLimitsFallback(id)?.maxOutputTokens),
+				[128_000, undefined],
+			);
+		});
+
+		test('returns undefined rather than a guess for unparseable, non-Claude, or unaccounted-for models', () => {
+			// A wrong denominator renders a confidently wrong gauge; the caller
+			// logs the miss instead. `claude-haiku-5` is the interesting case —
+			// a plausible future model this table cannot positively place.
+			assert.deepStrictEqual(
+				['gpt-4o', 'not-a-model', 'claude', 'claude-haiku-5'].map(id => claudeModelLimitsFallback(id)),
+				[undefined, undefined, undefined, undefined],
 			);
 		});
 	});

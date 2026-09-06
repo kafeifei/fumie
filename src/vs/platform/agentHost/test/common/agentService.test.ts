@@ -8,7 +8,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { IConfigurationService } from '../../../configuration/common/configuration.js';
 import { AgentSession, GITHUB_COPILOT_PROTECTED_RESOURCE, GITHUB_REPO_PROTECTED_RESOURCE, protectedResourcesRequireGitHubCopilotSignIn } from '../../common/agent.js';
-import { AgentHostCodexAgentEnabledSettingId, AgentHostOTelEnvVars, buildAgentHostOTelEnv, CodexPreferAgentHostEditorSettingId, isAgentEnabled, readAgentHostOTelPolicySettings, sanitizeAgentHostOTelPolicySettings, shouldSurfaceLocalAgentHostProvider } from '../../common/agentService.js';
+import { AgentHostCodexAgentEnabledSettingId, AgentHostDeepSeekAgentEnabledEnvVar, AgentHostKimiAgentEnabledEnvVar, AgentHostOTelEnvVars, AgentHostPiAgentEnabledEnvVar, buildAgentHostOTelEnv, buildAgentSdkEnv, CodexPreferAgentHostEditorSettingId, isAgentEnabled, readAgentHostOTelPolicySettings, sanitizeAgentHostOTelPolicySettings, shouldSurfaceLocalAgentHostProvider } from '../../common/agentService.js';
 import type { ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
 import { buildChatUri, buildDefaultChatUri, resolveChatUri } from '../../common/state/sessionState.js';
 import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
@@ -300,6 +300,29 @@ suite('resolveChatUri', () => {
 	test('peer chat is addressed by its own URI', () => {
 		const peer = URI.parse(buildChatUri(session, 'peer-42'));
 		assert.strictEqual(resolveChatUri(session, peer).toString(), peer.toString());
+	});
+});
+
+suite('buildAgentSdkEnv (provider gate forwarding)', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('forwards the Kimi enable setting without overriding an inherited value', () => {
+		assert.strictEqual(buildAgentSdkEnv({ kimiAgentEnabled: true }, {})[AgentHostKimiAgentEnabledEnvVar], 'true');
+		assert.strictEqual(buildAgentSdkEnv({ kimiAgentEnabled: false }, {})[AgentHostKimiAgentEnabledEnvVar], 'false');
+		assert.strictEqual(buildAgentSdkEnv({ kimiAgentEnabled: true }, { [AgentHostKimiAgentEnabledEnvVar]: 'false' })[AgentHostKimiAgentEnabledEnvVar], undefined);
+	});
+
+	test('forwards the DeepSeek enable setting without overriding an inherited value', () => {
+		assert.strictEqual(buildAgentSdkEnv({ deepSeekAgentEnabled: true }, {})[AgentHostDeepSeekAgentEnabledEnvVar], 'true');
+		assert.strictEqual(buildAgentSdkEnv({ deepSeekAgentEnabled: false }, {})[AgentHostDeepSeekAgentEnabledEnvVar], 'false');
+		assert.strictEqual(buildAgentSdkEnv({ deepSeekAgentEnabled: true }, { [AgentHostDeepSeekAgentEnabledEnvVar]: 'false' })[AgentHostDeepSeekAgentEnabledEnvVar], undefined);
+	});
+
+	test('forwards the Pi enable setting without overriding an inherited value', () => {
+		assert.strictEqual(buildAgentSdkEnv({ piAgentEnabled: true }, {})[AgentHostPiAgentEnabledEnvVar], 'true');
+		assert.strictEqual(buildAgentSdkEnv({ piAgentEnabled: false }, {})[AgentHostPiAgentEnabledEnvVar], 'false');
+		assert.strictEqual(buildAgentSdkEnv({ piAgentEnabled: true }, { [AgentHostPiAgentEnabledEnvVar]: 'false' })[AgentHostPiAgentEnabledEnvVar], undefined);
 	});
 });
 

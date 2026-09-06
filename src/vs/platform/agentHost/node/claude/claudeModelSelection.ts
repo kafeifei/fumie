@@ -4,9 +4,11 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { IAgentModelInfo } from '../../common/agent.js';
+import { parseByokLmAgentModelId } from '../../common/agentHostByokLm.js';
 import { createAgentModelGroupMeta } from '../../common/agentModelSource.js';
 import { CLAUDE_PROVIDER_ANTHROPIC, CLAUDE_PROVIDER_COPILOT } from '../../common/claudeProviders.js';
 import type { ModelSelection } from '../../common/state/protocol/state.js';
+import type { ClaudeTransport } from './claudeProxyService.js';
 import { toSdkModelId } from './claudeModelId.js';
 import type { ClaudeTransportMode } from './claudeTransportMode.js';
 
@@ -66,16 +68,35 @@ export function parseClaudeModelSelection(selection: ModelSelection): { readonly
 }
 
 /**
- * Resolves the SDK-canonical model id for a selection, peeling off any provider
- * qualification first. Under the per-session provider feature a selection id is
- * provider-qualified (`@provider=anthropic:claude-sonnet-4-5`); neither the
- * Claude Agent SDK nor CAPI understands that wrapper, so it must be stripped
- * back to the bare model id before {@link toSdkModelId} normalizes the version
- * separators — otherwise the SDK receives `@provider=…` verbatim (it is
+ * The BYOK model a selection addresses — vendor (the proxy route) plus the
+ * provider-local model id the request body carries — or `undefined` when the
+ * selection is a subscription-catalog model.
+ *
+ * A BYOK row reaches the picker as `<vendor>/<selection id>` (see
+ * `getByokLmAgentModelId`), never `@provider=`-qualified, so the check is
+ * "unqualified id carrying a `/`".
+ */
+export function parseClaudeByokSelection(model: ModelSelection | undefined): { readonly vendor: string; readonly modelId: string } | undefined {
+	if (!model || parseClaudeModelSelection(model).explicitProvider) {
+		return undefined;
+	}
+	return parseByokLmAgentModelId(model.id);
+}
+
+/**
+ * Resolves the model id to hand the Claude CLI for a selection, peeling off any
+ * provider qualification first. Under the per-session provider feature a
+ * selection id is provider-qualified (`@provider=anthropic:claude-sonnet-4-5`);
+ * neither the Claude Agent SDK nor CAPI understands that wrapper, so it must be
+ * stripped back to the bare model id before {@link toSdkModelId} normalizes the
+ * version separators — otherwise the SDK receives `@provider=…` verbatim (it is
  * unparseable, so {@link toSdkModelId} passes it through untouched) and the
  * model 400s. A bare / legacy id (the flag-off path) has no wrapper and
  * round-trips exactly as it did before this feature existed. `undefined` passes
  * through so callers can convert an optional selection in one step.
+ *
+ * A BYOK selection resolves to its provider-local id *unnormalized*: that slug
+ * is the renderer provider's routing id and the native proxy resolves it.
  */
 export function toClaudeSdkModelId(model: ModelSelection): string;
 export function toClaudeSdkModelId(model: ModelSelection | undefined): string | undefined;
@@ -83,37 +104,45 @@ export function toClaudeSdkModelId(model: ModelSelection | undefined): string | 
 	if (!model) {
 		return undefined;
 	}
+	const byok = parseClaudeByokSelection(model);
+	if (byok) {
+		return model.id;
+	}
 	return toSdkModelId(parseClaudeModelSelection(model).modelId);
 }
 
 /**
- * Maps a provider token to the transport it routes through. The relationship is
- * fixed and total: only {@link CLAUDE_PROVIDER_ANTHROPIC} is native; every other
- * token — Copilot, or anything unrecognized — is proxy. Defaulting the unknown
- * case to `proxy` keeps an unexpected token on the safe, GitHub-gated path
- * rather than silently attempting a native run without a credential.
+ * Maps a provider token to the transport it routes through. Native is
+ * {@link CLAUDE_PROVIDER_ANTHROPIC} (BYO Anthropic). Every other token —
+ * Copilot, or anything unrecognized — is proxy. Defaulting the unknown case to
+ * `proxy` keeps an unexpected token on the safe, GitHub-gated path rather than
+ * silently attempting a native run without a credential.
  */
 export function claudeTransportForProvider(provider: string): ClaudeTransportMode {
 	return provider === CLAUDE_PROVIDER_ANTHROPIC ? 'native' : 'proxy';
 }
 
 /**
- * Decides the transport a single session should run on. This is the per-session
- * counterpart to the host-global {@link resolveClaudeTransportMode}: when the
- * session has no explicit model yet, it inherits the host default (`defaultMode`);
- * when a model with an explicit provider is selected, its provider decides (via
- * {@link claudeTransportForProvider}), letting two concurrent sessions run on
- * different transports. A bare/legacy id (no explicit provider) also inherits
- * `defaultMode`, so a session persisted before provider qualification existed is
- * never rerouted onto a different transport.
+ * Decides which transport a single session should run on. This is the
+ * per-session counterpart to the host-global {@link resolveClaudeTransportMode}:
+ * when the session has no explicit model yet, it inherits the host default
+ * (`defaultMode`); a BYOK model routes through the BYOK loopback proxy; a model
+ * with an explicit provider routes on that provider (via
+ * {@link claudeTransportForProvider}), letting concurrent sessions run on
+ * different transports. A bare/legacy id (no explicit provider, no BYOK vendor)
+ * also inherits `defaultMode`, so a session persisted before provider
+ * qualification existed is never rerouted onto a different transport.
  */
 export function resolveClaudeSessionTransport(inputs: {
 	readonly model: ModelSelection | undefined;
 	readonly defaultMode: ClaudeTransportMode;
-}): ClaudeTransportMode {
+}): ClaudeTransport['kind'] {
 	const { model, defaultMode } = inputs;
 	if (!model) {
 		return defaultMode;
+	}
+	if (parseClaudeByokSelection(model)) {
+		return 'byok';
 	}
 	const parsed = parseClaudeModelSelection(model);
 	if (!parsed.explicitProvider) {
@@ -168,11 +197,17 @@ export function mergeClaudeModelCatalogs(proxy: readonly IAgentModelInfo[], nati
  * Re-id each model with its provider-qualified selection id and stamp the
  * transport/group vendor token into `_meta`, leaving {@link IAgentModelInfo.provider}
  * (the routing owner) and every other field intact.
+ *
+ * The id it replaces is kept as {@link IAgentModelInfo.underlyingModelId}: the
+ * qualification is ours, and the Claude SDK keeps naming the bare model in
+ * transcripts and usage, so without it a client has nothing to match a reported
+ * model against this catalog with.
  */
 function withQualifiedProvider(models: readonly IAgentModelInfo[], provider: string): IAgentModelInfo[] {
 	return models.map(model => ({
 		...model,
 		id: toClaudeModelSelectionId(provider, model.id),
+		underlyingModelId: model.id,
 		_meta: { ...model._meta, ...createAgentModelGroupMeta(provider) },
 	}));
 }

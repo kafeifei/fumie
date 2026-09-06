@@ -13,6 +13,8 @@ import { IConfigurationService } from '../../../configuration/common/configurati
 import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
 import { IEnvironmentService } from '../../../environment/common/environment.js';
 import { IInstantiationService } from '../../../instantiation/common/instantiation.js';
+import { SyncDescriptor } from '../../../instantiation/common/descriptors.js';
+import { ServiceCollection } from '../../../instantiation/common/serviceCollection.js';
 import { TestInstantiationService } from '../../../instantiation/test/common/instantiationServiceMock.js';
 import { ILogService, NullLogService } from '../../../log/common/log.js';
 import { INotificationService } from '../../../notification/common/notification.js';
@@ -27,6 +29,8 @@ import { AgentHostClientType, editorWindowAgentHostClientInfo } from '../../comm
 import { AgentHostStartupTelemetry } from '../../common/agentHostStartupTelemetry.js';
 import { AgentHostClientConnectionKind } from '../../common/agentHostTelemetry.js';
 import { ProtocolError } from '../../common/state/sessionProtocol.js';
+import { IAgentHostService, IMcpNotification } from '../../common/agentService.js';
+import { ActionEnvelope, ActionType, INotification } from '../../common/state/sessionActions.js';
 import { LocalAgentHostManagementConnection, LocalAgentHostServiceClient, registerAgentHostClientChannels } from '../../electron-browser/localAgentHostService.js';
 
 class CapturingNotificationService extends TestNotificationService {
@@ -119,6 +123,9 @@ suite('registerAgentHostClientChannels', () => {
 		const onDidChangeConnectionState = disposables.add(new Emitter<AgentHostClientState>());
 		const onDidFatalClose = disposables.add(new Emitter<ProtocolError>());
 		const protocolClient = {
+			onDidAction: Event.None,
+			onDidNotification: Event.None,
+			onMcpNotification: Event.None,
 			clientId: 'test-client',
 			connect: () => Promise.resolve(),
 			onDidChangeConnectionState: onDidChangeConnectionState.event,
@@ -156,6 +163,76 @@ suite('registerAgentHostClientChannels', () => {
 		assert.deepStrictEqual(notifications.errors, [
 			'The Agent Host failed to start. Restart the application to try again. See the logs for details.',
 		]);
+	});
+
+	test('delayed local service forwards events subscribed before protocol startup and after reconnect', () => {
+		const actions = disposables.add(new Emitter<ActionEnvelope>());
+		const notifications = disposables.add(new Emitter<INotification>());
+		const mcpNotifications = disposables.add(new Emitter<IMcpNotification>());
+		const connectionState = disposables.add(new Emitter<AgentHostClientState>());
+		const services = new ServiceCollection();
+		const instantiationService = disposables.add(new TestInstantiationService(services, false, undefined, true));
+		// Delayed services receive an internal production instantiation service;
+		// retain our protocol/telemetry stubs while exercising the real proxy.
+		class DelayedLocalService extends LocalAgentHostServiceClient {
+			constructor(
+				@ILogService log: ILogService,
+				@IConfigurationService configuration: IConfigurationService,
+				@IEnvironmentService environment: IEnvironmentService,
+				@INotificationService notification: INotificationService,
+			) {
+				super(editorWindowAgentHostClientInfo, log, configuration, environment, instantiationService, notification);
+			}
+		}
+		services.set(IAgentHostService, new SyncDescriptor(DelayedLocalService, [], true));
+		instantiationService.stub(ILogService, new NullLogService());
+		instantiationService.stub(IConfigurationService, new TestConfigurationService());
+		instantiationService.stub(IEnvironmentService, { logsHome: URI.file('/logs') });
+		instantiationService.stub(INotificationService, new TestNotificationService());
+		instantiationService.stubInstance(AgentHostProtocolClient, {
+			clientId: 'delayed-client',
+			connect: () => Promise.resolve(),
+			onDidAction: actions.event,
+			onDidNotification: notifications.event,
+			onMcpNotification: mcpNotifications.event,
+			onDidChangeConnectionState: connectionState.event,
+			onDidFatalClose: Event.None,
+			dispose: () => { },
+		});
+		instantiationService.stubInstance(AgentHostStartupTelemetry, {
+			protocolConnected: () => { },
+			connectionFailed: () => { },
+			dispose: () => { },
+		});
+		instantiationService.set(IInstantiationService, instantiationService);
+		const service = instantiationService.get(IAgentHostService);
+		// Resolve the delayed service without starting its protocol client, as a
+		// consumer reading rootState does. The proxy caches function properties.
+		assert.strictEqual(service.rootState.value, undefined);
+		const receivedActions: ActionEnvelope[] = [];
+		const receivedNotifications: INotification[] = [];
+		const receivedMcp: IMcpNotification[] = [];
+		disposables.add(service.onDidAction(e => receivedActions.push(e)));
+		disposables.add(service.onDidNotification(e => receivedNotifications.push(e)));
+		disposables.add(service.onMcpNotification(e => receivedMcp.push(e)));
+		service.startAgentHost();
+		const action: ActionEnvelope = { channel: 'ahp-chat://default/test', serverSeq: 1, origin: undefined, action: { type: ActionType.ChatActivityChanged, activity: 'Working' } };
+		const notification: INotification = { type: 'root/sessionSummaryChanged', channel: 'ahp-root://', session: 'opencode:/test', changes: { status: 1, activity: null } };
+		const mcp: IMcpNotification = { channel: 'mcp://test', method: 'notifications/tools/list_changed' };
+		actions.fire(action);
+		notifications.fire(notification);
+		mcpNotifications.fire(mcp);
+		const lateNotifications: INotification[] = [];
+		disposables.add(service.onDidNotification(e => lateNotifications.push(e)));
+		connectionState.fire(AgentHostClientState.Reconnecting);
+		connectionState.fire(AgentHostClientState.Connected);
+		actions.fire(action);
+		notifications.fire(notification);
+		mcpNotifications.fire(mcp);
+		assert.deepStrictEqual(receivedActions, [action, action]);
+		assert.deepStrictEqual(receivedNotifications, [notification, notification]);
+		assert.deepStrictEqual(receivedMcp, [mcp, mcp]);
+		assert.deepStrictEqual(lateNotifications, [notification]);
 	});
 
 	suite('LocalAgentHostManagementConnection', () => {

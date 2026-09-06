@@ -20,11 +20,11 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import semver from 'semver';
 
 /**
- * @type {{ build: boolean; run: string; runGlob: string; coverage: boolean; help: boolean; coverageFormats: string | string[]; coveragePath: string; }}
+ * @type {{ build: boolean; run: string; runGlob: string; grep?: string; coverage: boolean; help: boolean; coverageFormats: string | string[]; coveragePath: string; }}
  */
 const args = minimist(process.argv.slice(2), {
 	boolean: ['build', 'coverage', 'help'],
-	string: ['run', 'coveragePath', 'coverageFormats'],
+	string: ['run', 'grep', 'coveragePath', 'coverageFormats'],
 	alias: {
 		h: 'help'
 	},
@@ -36,6 +36,7 @@ const args = minimist(process.argv.slice(2), {
 	description: {
 		build: 'Run from out-build',
 		run: 'Run a single file',
+		grep: 'Run tests whose full title matches a regular expression',
 		coverage: 'Generate a coverage report',
 		coveragePath: 'Path to coverage report to generate',
 		coverageFormats: 'Coverage formats to generate',
@@ -49,6 +50,7 @@ if (args.help) {
 Options:
 --build          Run from out-build
 --run <file>     Run a single file
+--grep <pattern> Run tests whose full title matches a regular expression
 --coverage       Generate a coverage report
 --help           Show help`);
 	process.exit(0);
@@ -150,6 +152,9 @@ function main() {
 	const runner = new Mocha({
 		ui: 'tdd'
 	});
+	if (args.grep !== undefined) {
+		runner.grep(args.grep);
+	}
 
 	/**
 	 * @param modules

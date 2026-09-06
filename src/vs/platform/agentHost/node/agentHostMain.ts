@@ -12,11 +12,14 @@ import { Emitter, type Event } from '../../../base/common/event.js';
 import { DisposableStore, IDisposable, MutableDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { isWindows } from '../../../base/common/platform.js';
 import { URI } from '../../../base/common/uri.js';
+import { joinPath } from '../../../base/common/resources.js';
 import { generateUuid } from '../../../base/common/uuid.js';
+import { mkdir } from 'fs/promises';
 import * as os from 'os';
 import * as inspector from 'inspector';
-import { AgentHostClaudeAgentEnabledEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostIpcChannels, IAgentHostInspectInfo, IAgentHostSocketInfo, IConnectionTrackerService, isAgentEnabled } from '../common/agentService.js';
-import { AgentHostCodexEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
+import { AgentHostAcpAgentEnabledEnvVar, AgentHostClaudeAgentEnabledEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostDeepSeekAgentEnabledEnvVar, AgentHostIpcChannels, AgentHostKimiAgentEnabledEnvVar, AgentHostOpencodeAgentEnabledEnvVar, AgentHostPiAgentEnabledEnvVar, IAgentHostInspectInfo, IAgentHostSocketInfo, IConnectionTrackerService } from '../common/agentService.js';
+import { AgentHostAcpEnabledConfigKey, AgentHostClaudeEnabledConfigKey, AgentHostCodexEnabledConfigKey, AgentHostDeepSeekEnabledConfigKey, AgentHostKimiEnabledConfigKey, AgentHostOpencodeEnabledConfigKey, AgentHostPiEnabledConfigKey, type AgentHostProviderEnabledConfigKey } from '../common/agentHostSchema.js';
+import { registerProviderWhenEnabled } from './agentProviderEnablement.js';
 import { AgentModelRefreshScheduler, MODEL_REFRESH_INTERVAL_MS } from './agentModelRefreshScheduler.js';
 import { AgentService } from './agentService.js';
 import { AgentHostStateManager, IAgentHostStateManager } from './agentHostStateManager.js';
@@ -25,11 +28,21 @@ import { IAgentHostCompletions } from './agentHostCompletions.js';
 import { CopilotAgent } from './copilot/copilotAgent.js';
 import { ClaudeAgent } from './claude/claudeAgent.js';
 import { ClaudeSdkPackage } from './claude/claudeAgentSdkService.js';
+import { scheduleOrphanedClaudeResumeDirCleanup } from './claude/claudeResumeTempCleanup.js';
 import { CodexAgent, CodexSdkPackage } from './codex/codexAgent.js';
+import { KimiAgent } from './kimi/kimiAgent.js';
+import { KimiSdkPackage } from './kimi/kimiCodeSdkService.js';
+import { DeepSeekAgent } from './deepseek/deepseekAgent.js';
+import { DeepSeekSdkPackage } from './deepseek/deepseekSdkService.js';
+import { PiAgent } from './pi/piAgent.js';
+import { PiSdkPackage } from './pi/piSdkService.js';
+import { AcpAgent } from './acp/acpAgent.js';
+import { OpencodeAgent } from './opencode/opencodeAgent.js';
+import { ACP_CLAUDE_AGENT_PROVIDER_ID, OPENCODE_AGENT_PROVIDER_ID } from '../common/agent.js';
 import { createCodexProviderConfiguration } from './codex/codexProviderConfiguration.js';
 import { ByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
 import { IAgentHostProxyResolver } from './agentHostProxyResolver.js';
-import { IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
+import { IAgentSdkDownloader, type IAgentSdkDownloadProgress, type IAgentSdkPackage } from './agentSdkDownloader.js';
 import { ProtocolServerHandler } from './protocolServerHandler.js';
 import { WebSocketProtocolServer } from './webSocketTransport.js';
 import { MessagePortProtocolServer } from './messagePortProtocolServer.js';
@@ -58,6 +71,11 @@ import { join } from '../../../base/common/path.js';
 import ErrorTelemetry from '../../telemetry/node/errorTelemetry.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { AgentHostLaunchKindEnvVar, readAgentHostLaunchKind, type AgentHostLaunchKind } from '../common/agentHostTelemetry.js';
+import { AgentHostLegacyUserDataDirEnvVar, AgentHostFumieHomeEnvVar, applyAgentHostProductEnv } from '../common/agentHostProductEnv.js';
+import { AgentHostDatabase } from './agentHostDatabase.js';
+import { AgentSdkManager, resolveDefaultAgentsDir } from './fumie/agentSdkManager.js';
+import { migrateLegacyFumieData } from './fumie/fumieDataMigration.js';
+import { scrubModelProviderEnvironment } from './modelProviderEnvironment.js';
 
 // Entry point for the agent host utility process.
 // Sets up IPC, logging, and registers agent providers (Copilot).
@@ -70,6 +88,13 @@ void startAgentHost().catch(err => {
 });
 
 async function startAgentHost(): Promise<void> {
+	applyAgentHostProductEnv(process.env, product);
+	scrubModelProviderEnvironment(process.env);
+	const codexHome = process.env[AgentHostCodexAgentCodexHomeEnvVar];
+	if (codexHome) {
+		await mkdir(codexHome, { recursive: true });
+	}
+
 	// Setup RPC - supports both Electron utility process and Node child process
 	let server: ChildProcessServer<string> | UtilityProcessServer;
 	if (isUtilityProcess(process)) {
@@ -103,6 +128,15 @@ async function startAgentHost(): Promise<void> {
 	}
 	logService.info('Agent Host process started successfully');
 
+	// Fumie keeps durable agent state outside the editor profile. Existing
+	// legacy data is migrated before any database or provider opens it.
+	const fumieHome = process.env[AgentHostFumieHomeEnvVar] ? URI.file(process.env[AgentHostFumieHomeEnvVar]) : undefined;
+	await migrateLegacyFumieData(process.env[AgentHostLegacyUserDataDirEnvVar], fumieHome?.fsPath, logService);
+	const sessionsHome = fumieHome ? joinPath(fumieHome, 'sessions') : undefined;
+	const rootConfigResource = sessionsHome ? joinPath(sessionsHome, 'agent-host-config.json') : undefined;
+	const storageResource = sessionsHome ? joinPath(sessionsHome, 'agent-host-storage.json') : undefined;
+	const orchestratorDatabase = sessionsHome ? new AgentHostDatabase(joinPath(sessionsHome, 'catalog.db').fsPath) : undefined;
+
 	// Create the real service implementation that lives in this process
 	let runtime!: IAgentHostRuntime;
 	let agentService: AgentService;
@@ -127,6 +161,13 @@ async function startAgentHost(): Promise<void> {
 			hostLaunchKind,
 			providerConfigurations: [createCodexProviderConfiguration(environmentService.userHome)],
 			byok: { kind: 'renderer', bridgeRegistry: byokLmBridgeRegistry },
+			...(sessionsHome ? {
+				sessionDataHome: sessionsHome,
+				rootConfigResource: rootConfigResource!,
+				storageResource: storageResource!,
+				orchestratorDatabase: orchestratorDatabase!,
+				pluginBasePath: joinPath(fumieHome!, 'plugins', 'cache'),
+			} : {}),
 		});
 		disposables.add(runtime);
 		agentService = runtime.agentService;
@@ -148,7 +189,9 @@ async function startAgentHost(): Promise<void> {
 		errorTelemetry.value = new ErrorTelemetry(runtimeServices.telemetryService);
 		const agentSdkDownloader = runtimeServices.agentSdkDownloader;
 		sdkDownloadProgress = runtime.sdkDownloadProgress;
-		agentService.registerProvider(instantiationService.createInstance(CopilotAgent));
+		if (!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes('copilotcli')) {
+			agentService.registerProvider(instantiationService.createInstance(CopilotAgent));
+		}
 		// Claude and Codex providers are gated on two things:
 		//  1. The user-facing enable toggle (`chat.agentHost.<x>Agent.enabled`,
 		//     forwarded as an env var by the starters). Claude defaults to on,
@@ -162,27 +205,98 @@ async function startAgentHost(): Promise<void> {
 		//     env-var override or a `product.agentSdks.codex` entry.
 		// If either gate fails, the provider is not registered and never appears
 		// in the agent picker (matches the pre-CDN UX exactly).
-		if (isAgentEnabled(process.env[AgentHostClaudeAgentEnabledEnvVar], true) && (!environmentService.isBuilt || agentSdkDownloader.isAvailable(ClaudeSdkPackage))) {
-			agentService.registerProvider(instantiationService.createInstance(ClaudeAgent));
+		//
+		// Registration is one-way (register-on-enable) for every provider below:
+		// the env-var toggle carries the value this process was spawned with and
+		// the renderer-forwarded root config carries every later change, so
+		// turning an Agent on takes effect immediately while turning it off takes
+		// effect on the next agent host restart. See
+		// {@link registerProviderWhenEnabled}.
+		const registerWhenEnabled = (
+			enabledEnvVar: string,
+			rootConfigKey: AgentHostProviderEnabledConfigKey,
+			register: () => void,
+			enabledByDefault?: boolean,
+		): void => {
+			disposables.add(registerProviderWhenEnabled(agentConfigurationService, { enabledEnvVar, rootConfigKey, enabledByDefault }, register));
+		};
+		if ((!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes('claude')) && (!environmentService.isBuilt || agentSdkDownloader.isAvailable(ClaudeSdkPackage))) {
+			registerWhenEnabled(AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeEnabledConfigKey, () => {
+				agentService.registerProvider(instantiationService.createInstance(ClaudeAgent));
+				// The SDK deletes the `claude-resume-<uuid>` scratch dir it
+				// materializes for a resume only when that query shuts down, so
+				// every host crash / force-quit / reload strands one — transcript
+				// copy and credentials file included — and they accumulate one per
+				// resume. Nothing else is positioned to notice, so sweep the
+				// unreachable ones from here, the moment we know this process is
+				// one that can produce them. This is the desktop app's host — the
+				// one that does most of the resuming, and the one users force-quit
+				// — so it is the entry point that matters most for the leak.
+				scheduleOrphanedClaudeResumeDirCleanup(logService);
+			}, true);
 		}
-		// Codex registration is one-way (register-on-enable): the env-var toggle
-		// or the renderer-forwarded `codexAgentEnabled` root config enables it.
-		// Disabling requires an agent host restart.
-		if (!environmentService.isBuilt || agentSdkDownloader.isAvailable(CodexSdkPackage)) {
-			let codexRegistered = false;
-			const registerCodexIfEnabled = () => {
-				if (codexRegistered) {
-					return;
+		if ((!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes('codex')) && (!environmentService.isBuilt || agentSdkDownloader.isAvailable(CodexSdkPackage))) {
+			registerWhenEnabled(AgentHostCodexAgentEnabledEnvVar, AgentHostCodexEnabledConfigKey, () => {
+				agentService.registerProvider(instantiationService.createInstance(CodexAgent));
+			});
+		}
+
+		const registerByokBackedProvider = (createProvider: () => KimiAgent | DeepSeekAgent | PiAgent): void => {
+			void byokLmBridgeRegistry.whenInitialSnapshot.then(() => {
+				if (!disposables.isDisposed) {
+					agentService.registerProvider(createProvider());
 				}
-				const enabledByEnv = isAgentEnabled(process.env[AgentHostCodexAgentEnabledEnvVar], false);
-				const enabledByRootConfig = agentConfigurationService.getRootValue(platformRootSchema, AgentHostCodexEnabledConfigKey) === true;
-				if (enabledByEnv || enabledByRootConfig) {
-					codexRegistered = true;
-					agentService.registerProvider(instantiationService.createInstance(CodexAgent));
+			}).catch(error => logService.error('[AgentHost] Failed waiting for the initial BYOK model snapshot', error));
+		};
+		const agentSdkManager = disposables.add(new AgentSdkManager({
+			agentsDir: resolveDefaultAgentsDir(),
+			hasProductSdk: id => !!product.agentSdks?.[id],
+		}, agentConfigurationService, logService));
+		// The BYOK-backed providers reach registration through the SDK manager:
+		// enabling hands the package to `manage`, which adopts or installs it and
+		// only then runs the register callback. `manage` throws on a second call
+		// for the same package, which the one-shot register-on-enable gate
+		// guarantees never happens — so flipping the toggle cannot start a second
+		// download either.
+		const manageByokSdk = (pkg: IAgentSdkPackage, enabledEnvVar: string, rootConfigKey: AgentHostProviderEnabledConfigKey, create: () => KimiAgent | DeepSeekAgent | PiAgent): void => {
+			if (product.sessionsAllowedAgentHostProviders && !product.sessionsAllowedAgentHostProviders.includes(pkg.id)) {
+				return;
+			}
+			registerWhenEnabled(enabledEnvVar, rootConfigKey, () => {
+				agentSdkManager.manage(pkg, () => registerByokBackedProvider(create));
+			});
+		};
+		manageByokSdk(KimiSdkPackage, AgentHostKimiAgentEnabledEnvVar, AgentHostKimiEnabledConfigKey, () => instantiationService.createInstance(KimiAgent));
+		manageByokSdk(DeepSeekSdkPackage, AgentHostDeepSeekAgentEnabledEnvVar, AgentHostDeepSeekEnabledConfigKey, () => instantiationService.createInstance(DeepSeekAgent));
+		manageByokSdk(PiSdkPackage, AgentHostPiAgentEnabledEnvVar, AgentHostPiEnabledConfigKey, () => instantiationService.createInstance(PiAgent));
+
+		// The ACP providers have no SDK to download and no model catalog to wait
+		// for: the protocol client ships with the product and the agents are
+		// user-installed command-line tools. So they register directly, gated only
+		// on the enable toggle (default off) and the product allowlist. An agent
+		// that turns out not to be installed reports that on first send, which is
+		// the only moment the process would have been started anyway.
+		//
+		// One registration per catalog agent: a picker row is keyed on a provider
+		// id, so this is what makes the list name each agent instead of the
+		// protocol they share. The per-provider allowlist check lives in the agent
+		// itself, which already consults it to decide what it may run.
+		registerWhenEnabled(AgentHostAcpAgentEnabledEnvVar, AgentHostAcpEnabledConfigKey, () => {
+			for (const provider of [ACP_CLAUDE_AGENT_PROVIDER_ID]) {
+				if (!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes(provider)) {
+					agentService.registerProvider(instantiationService.createInstance(AcpAgent, provider));
 				}
-			};
-			registerCodexIfEnabled();
-			disposables.add(agentConfigurationService.onDidRootConfigChange(registerCodexIfEnabled));
+			}
+		});
+
+		// opencode registers on the same terms as the ACP providers: nothing to
+		// download and no model catalog to wait for, because the binary is one the
+		// user installed and the models are opencode's own. An install that turns
+		// out to be missing reports that on the first send.
+		if (!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes(OPENCODE_AGENT_PROVIDER_ID)) {
+			registerWhenEnabled(AgentHostOpencodeAgentEnabledEnvVar, AgentHostOpencodeEnabledConfigKey, () => {
+				agentService.registerProvider(instantiationService.createInstance(OpencodeAgent));
+			});
 		}
 	} catch (err) {
 		logService.error('Failed to create AgentService', err);
@@ -249,7 +363,10 @@ async function startAgentHost(): Promise<void> {
 				agentService,
 				stateManager,
 				messagePortProtocolServer,
-				localProtocolHandlerConfig,
+				{
+					...localProtocolHandlerConfig,
+					beforeHandshake: clientId => byokLmBridgeRegistry.waitForInitialSnapshot(clientId),
+				},
 				clientFileSystemProvider,
 			));
 			protocolHandlers.push(messagePortProtocolHandler);
@@ -261,18 +378,21 @@ async function startAgentHost(): Promise<void> {
 					return;
 				}
 				const clientId = connection.ctx;
-				if (typeof clientId !== 'string' || !clientId) {
+				if (typeof clientId !== 'string' || !clientId || clientId === 'agentHost') {
 					return;
 				}
 				const connectionStore = new DisposableStore();
-				const getChannel = (channelName: string) => server.getChannel(channelName, c => c.ctx === clientId);
-				const proxyConnection = createAgentHostClientProxyConnection(getChannel(AGENT_HOST_CLIENT_PROXY_CHANNEL));
-				connectionStore.add(proxyResolver.register(clientId, proxyConnection));
-				if (byokLmBridgeRegistry) {
+				try {
+					const getChannel = (channelName: string) => server.getChannel(channelName, c => c.ctx === clientId);
+					const proxyConnection = createAgentHostClientProxyConnection(getChannel(AGENT_HOST_CLIENT_PROXY_CHANNEL));
+					connectionStore.add(proxyResolver.register(clientId, proxyConnection));
 					const byokLmConnection = createAgentHostClientByokLmConnection(getChannel(AGENT_HOST_CLIENT_BYOK_LM_CHANNEL));
 					connectionStore.add(byokLmBridgeRegistry.register(clientId, byokLmConnection));
+					authorityRegistrations.set(connection, connectionStore);
+				} catch (error) {
+					connectionStore.dispose();
+					logService.warn(`[AgentHost] Failed to register renderer reverse channels for ${clientId}: ${error instanceof Error ? error.message : String(error)}`);
 				}
-				authorityRegistrations.set(connection, connectionStore);
 			};
 			localDataPlaneDisposables.add(server.onDidAddConnection(registerConnection));
 			localDataPlaneDisposables.add(server.onDidRemoveConnection(connection => {
@@ -305,8 +425,13 @@ async function startAgentHost(): Promise<void> {
 			// The external local endpoint (out-of-process local clients such as the
 			// CLI) is not on the renderer's path; start it after registration and
 			// give it its own handler.
+			// The endpoint registry is runtime discovery state, not durable Fumie
+			// data: the tunnel CLI is launched by the upstream coordinator with
+			// `--user-data-dir <Electron userDataPath>` and looks for the registry
+			// there, so publishing it under FUMIE_HOME breaks tunnel delegation.
+			const endpointRegistryRoot = environmentService.userDataPath;
 			const localEndpoint = await startLocalAgentHostEndpoint(
-				environmentService.userDataPath,
+				endpointRegistryRoot,
 				logService,
 				instantiationService,
 				environmentService.logsHome,
@@ -327,14 +452,14 @@ async function startAgentHost(): Promise<void> {
 				));
 				protocolHandlers.push(localEndpointProtocolHandler);
 				try {
-					await publishLocalAgentHostEndpointMetadata(environmentService.userDataPath, endpointMetadata, logService);
+					await publishLocalAgentHostEndpointMetadata(endpointRegistryRoot, endpointMetadata, logService);
 					localDataPlaneDisposables.add(toDisposable(() => {
-						cleanupLocalAgentHostEndpoint(environmentService.userDataPath, endpointMetadata, logService);
+						cleanupLocalAgentHostEndpoint(endpointRegistryRoot, endpointMetadata, logService);
 					}));
 				} catch (error) {
 					logService.error('[AgentHost] Failed to publish local protocol endpoint; continuing with MessagePort only', error);
 					localEndpoint.server.dispose();
-					cleanupLocalAgentHostEndpoint(environmentService.userDataPath, endpointMetadata, logService);
+					cleanupLocalAgentHostEndpoint(endpointRegistryRoot, endpointMetadata, logService);
 				}
 			}
 		} catch (error) {

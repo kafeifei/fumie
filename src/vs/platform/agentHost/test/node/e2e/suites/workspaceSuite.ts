@@ -5,15 +5,15 @@
 
 import assert from 'assert';
 import { execSync } from 'child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
+import { retry } from '../../../../../../base/common/async.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { generateUuid } from '../../../../../../base/common/uuid.js';
 import { SubscribeResult } from '../../../../common/state/protocol/commands.js';
 import { PROTOCOL_VERSION } from '../../../../common/state/protocol/version/registry.js';
-import { ActionType, NotificationType, type IToolCallContentChangedAction, type IToolCallStartAction } from '../../../../common/state/sessionActions.js';
-import type { SessionAddedParams } from '../../../../common/state/protocol/notifications.js';
-import { buildDefaultChatUri, ROOT_STATE_URI, type SessionState, type TerminalState, type ToolResultContent } from '../../../../common/state/sessionState.js';
+import { ActionType, type IToolCallContentChangedAction, type IToolCallStartAction } from '../../../../common/state/sessionActions.js';
+import { buildDefaultChatUri, ROOT_STATE_URI, SessionStatus, type SessionState, type TerminalState, type ToolResultContent } from '../../../../common/state/sessionState.js';
 import { CopilotCliConfigKey } from '../../../../common/copilotCliConfig.js';
 import {
 	dispatchTurn,
@@ -150,10 +150,6 @@ export function defineWorkspaceTests(context: IAgentHostE2ETestContext): void {
 			});
 		}
 
-		const addedNotification = context.client.waitForNotification(n =>
-			n.method === NotificationType.SessionAdded,
-			60_000,
-		);
 		const sessionUri = URI.from({ scheme: config.scheme, path: `/${generateUuid()}` }).toString();
 		await context.client.call('createSession', {
 			channel: sessionUri, provider: config.provider, workingDirectories: [workingDirUri],
@@ -188,22 +184,56 @@ export function defineWorkspaceTests(context: IAgentHostE2ETestContext): void {
 		dispatchTurn(context.client, sessionUri, 'turn-wt',
 			'What is your current working directory? Reply with just the absolute path and nothing else.', 2);
 
-		const addedNotif = await addedNotification;
-		const addedSummary = (addedNotif.params as SessionAddedParams).summary;
-
-		const addedWorkingDirectory = addedSummary.workingDirectories?.[0];
-		assert.ok(addedWorkingDirectory, 'sessionAdded notification should have a workingDirectory');
+		await context.client.waitForNotification(
+			n => isActionNotification(n, 'chat/turnComplete') || isActionNotification(n, 'chat/error'),
+			90_000,
+		);
+		const materialized = await context.client.call<SubscribeResult>('subscribe', { channel: sessionUri });
+		const addedWorkingDirectory = (materialized.snapshot!.state as SessionState).workingDirectories?.[0];
+		assert.ok(addedWorkingDirectory, 'materialized session should have a workingDirectory');
 		assert.ok(addedWorkingDirectory.includes('.worktrees'),
 			`workingDirectory should be under the .worktrees folder, got: ${addedWorkingDirectory}`);
 		const resolvedWorkingDirectoryPath = URI.parse(addedWorkingDirectory).fsPath;
 		const canonicalWorkingDirectoryPath = realpathSync(resolvedWorkingDirectoryPath);
 		const includesWorkingDirectoryPath = (text: string): boolean =>
 			text.includes(resolvedWorkingDirectoryPath) || text.includes(canonicalWorkingDirectoryPath);
+		const chatUri = buildDefaultChatUri(sessionUri);
+		const waitForWorktreePresence = async (expected: boolean, message: string): Promise<void> => {
+			await retry(async () => {
+				assert.strictEqual(existsSync(resolvedWorkingDirectoryPath), expected, message);
+			}, 25, 200);
+		};
+		const assertContinuousArchiveRestore = async (): Promise<void> => {
+			await context.client.call('setSessionArchived', { channel: sessionUri, isArchived: true, preserveChanges: false });
+			const firstArchived = await context.client.call<SubscribeResult>('subscribe', { channel: sessionUri });
+			assert.ok((firstArchived.snapshot!.state as SessionState).status & SessionStatus.IsArchived,
+				'first archive should publish the Archived catalog state');
+			await waitForWorktreePresence(false, 'first background archive should remove the worktree checkout');
 
-		await context.client.waitForNotification(
-			n => isActionNotification(n, 'chat/turnComplete') || isActionNotification(n, 'chat/error'),
-			90_000,
-		);
+			await context.client.call('setSessionArchived', { channel: sessionUri, isArchived: false });
+			assert.strictEqual(existsSync(resolvedWorkingDirectoryPath), true,
+				'unarchive should restore the worktree before the request completes');
+			const restored = await context.client.call<SubscribeResult>('subscribe', { channel: sessionUri });
+			assert.strictEqual((restored.snapshot!.state as SessionState).status & SessionStatus.IsArchived, 0,
+				'unarchive should clear the Archived catalog state');
+
+			context.client.notify('unsubscribe', { channel: chatUri });
+			context.client.notify('unsubscribe', { channel: sessionUri });
+			context.client.clearReceived();
+			await context.client.call<SubscribeResult>('subscribe', { channel: sessionUri });
+			await context.client.call<SubscribeResult>('subscribe', { channel: chatUri });
+			assert.strictEqual(
+				context.client.receivedNotifications(notification => isActionNotification(notification, 'chat/error')).length,
+				0,
+				'reopening the restored session should not emit a chat error',
+			);
+
+			await context.client.call('setSessionArchived', { channel: sessionUri, isArchived: true, preserveChanges: false });
+			const secondArchived = await context.client.call<SubscribeResult>('subscribe', { channel: sessionUri });
+			assert.ok((secondArchived.snapshot!.state as SessionState).status & SessionStatus.IsArchived,
+				'second archive should publish the Archived catalog state');
+			await waitForWorktreePresence(false, 'second background archive should remove the worktree checkout');
+		};
 
 		const errors = context.client.receivedNotifications(n => isActionNotification(n, 'chat/error'));
 		assert.strictEqual(errors.length, 0,
@@ -234,7 +264,7 @@ export function defineWorkspaceTests(context: IAgentHostE2ETestContext): void {
 			});
 			try {
 				context.client.clearReceived();
-				dispatchTurn(context.client, addedSummary.resource, 'turn-wt-terminal', `Run exactly this shell command, with no modifications, in the session current working directory: \`${PRINT_CWD_COMMAND}\`. Do not specify a working-directory override.`, 3);
+				dispatchTurn(context.client, sessionUri, 'turn-wt-terminal', `Run exactly this shell command, with no modifications, in the session current working directory: \`${PRINT_CWD_COMMAND}\`. Do not specify a working-directory override.`, 3);
 
 				// The `pwd` output can arrive as streaming partial content
 				// (`toolCallContentChanged`) or in the final tool result
@@ -261,6 +291,7 @@ export function defineWorkspaceTests(context: IAgentHostE2ETestContext): void {
 			}
 			assert.deepStrictEqual(approvalLoop.errors, [], 'no unexpected tool calls should have been denied');
 			await context.client.waitForNotification(n => isActionNotification(n, 'chat/turnComplete'), 90_000);
+			await assertContinuousArchiveRestore();
 			return;
 		}
 
@@ -270,7 +301,7 @@ export function defineWorkspaceTests(context: IAgentHostE2ETestContext): void {
 			allow: [{ toolName: config.shellToolName }],
 		});
 		try {
-			dispatchTurn(context.client, addedSummary.resource, 'turn-wt-terminal', `Run exactly this shell command, with no modifications: \`${PRINT_CWD_COMMAND}\``, 3);
+			dispatchTurn(context.client, sessionUri, 'turn-wt-terminal', `Run exactly this shell command, with no modifications: \`${PRINT_CWD_COMMAND}\``, 3);
 
 			const toolStartNotif = await context.client.waitForNotification(n => {
 				if (!isActionNotification(n, 'chat/toolCallStart')) {
@@ -308,5 +339,6 @@ export function defineWorkspaceTests(context: IAgentHostE2ETestContext): void {
 			await approvalLoop.stop();
 		}
 		assert.deepStrictEqual(approvalLoop.errors, [], 'no unexpected tool calls should have been denied');
+		await assertContinuousArchiveRestore();
 	});
 }

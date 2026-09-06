@@ -22,6 +22,10 @@ import { GroupDirection, GroupOrientation } from '../../../workbench/services/ed
 import { SESSIONS_LIST_MINIMUM_WIDTH } from '../../browser/parts/sidebarPart.js';
 import { Menus } from '../../browser/menus.js';
 import { DEFAULT_NOTIFICATION_ROW_HEIGHT, onDidChangeNotificationRowHeight, setNotificationRowHeight } from '../../../workbench/browser/parts/notifications/notificationsViewer.js';
+import { NotificationService } from '../../../workbench/services/notification/common/notificationService.js';
+import { TestStorageService } from '../../../workbench/test/common/workbenchTestServices.js';
+import { ILogService } from '../../../platform/log/common/log.js';
+import Severity from '../../../base/common/severity.js';
 
 interface IViewSize { width: number; height: number }
 
@@ -79,6 +83,9 @@ suite('Sessions - Workbench', () => {
 		layoutPolicy: { isPhoneLayout: IObservable<boolean> };
 		_register<T extends IDisposable>(disposable: T): T;
 	}) => void;
+	const logRaisedNotifications = Reflect.get(Workbench.prototype, 'logRaisedNotifications') as (this: {
+		logService: Pick<ILogService, 'info' | 'warn' | 'error'>;
+	}, notificationService: NotificationService) => IDisposable;
 
 	// --- Harness ------------------------------------------------------------
 
@@ -381,6 +388,41 @@ suite('Sessions - Workbench', () => {
 			listener.dispose();
 			registeredDisposables.dispose();
 			setNotificationRowHeight(DEFAULT_NOTIFICATION_ROW_HEIGHT);
+		}
+	});
+
+	/**
+	 * A toast is at most three at a time and purged on a timer, and a phone has
+	 * no console to check afterwards — the client page builds the log it can
+	 * hand back out of this process's log stream. A notification that is not
+	 * written down as it is raised leaves no trace of itself anywhere.
+	 */
+	test('writes every notification it raises into the log', () => {
+		const store = new DisposableStore();
+		const logged: string[] = [];
+		const notificationService = store.add(new NotificationService(store.add(new TestStorageService())));
+		store.add(logRaisedNotifications.call({
+			logService: {
+				info: (message: string) => logged.push(`info ${message}`),
+				warn: (message: string) => logged.push(`warn ${message}`),
+				error: (message: string) => logged.push(`error ${message}`),
+			},
+		}, notificationService));
+
+		const raised = [
+			notificationService.notify({ severity: Severity.Error, message: 'Failed to connect to remote agent host.' }),
+			notificationService.notify({ severity: Severity.Warning, message: 'Cannot connect to This Mac: out of date.' }),
+			notificationService.notify({ severity: Severity.Info, message: 'Preference updated for This Mac.' }),
+		];
+		try {
+			assert.deepStrictEqual(logged, [
+				'error [notification] Failed to connect to remote agent host.',
+				'warn [notification] Cannot connect to This Mac: out of date.',
+				'info [notification] Preference updated for This Mac.',
+			], 'each notification must reach the log at the severity it was shown with');
+		} finally {
+			raised.forEach(handle => handle.close());
+			store.dispose();
 		}
 	});
 
@@ -1182,6 +1224,14 @@ suite('Sessions - Workbench', () => {
 		revealEditorOnOpen.call(harness, { groupId: 1, editor: { typeId: 'workbench.editors.files.fileEditorInput' } });
 
 		assert.deepStrictEqual(setEditorHiddenCalls, [{ hidden: false, explicit: true }]);
+	});
+
+	test('[Scenario 5] base revealEditorOnOpen does not reveal an embedded browser editor', () => {
+		const { harness, setEditorHiddenCalls } = createWillOpenHarness({ partVisibility: { editor: false, auxiliaryBar: true } });
+
+		revealEditorOnOpen.call(harness, { groupId: 1, editor: { typeId: 'workbench.editorinputs.browser', editorId: 'workbench.editor.browser' } });
+
+		assert.deepStrictEqual(setEditorHiddenCalls, []);
 	});
 
 	test('[Scenario 5] base revealEditorOnOpen does not reveal when the open targets a non-main-part group', () => {

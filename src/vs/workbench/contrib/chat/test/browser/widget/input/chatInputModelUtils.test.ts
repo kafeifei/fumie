@@ -1630,6 +1630,20 @@ suite('ChatInputModelUtils', () => {
 			const result = [visible, hiddenModel].filter(m => !isModelHiddenInPicker(m, id => hidden.has(id)));
 			assert.deepStrictEqual(result.map(m => m.identifier), ['agent-host-copilotcli:anthropic/claude-sonnet-4']);
 		});
+
+		test('hides a copy the host reports as hidden, with nothing hidden in this window', () => {
+			// The Agents window in a browser holds no visibility state for a Provider it
+			// cannot see. The host's flag is the only account of it, so it alone decides.
+			const model = createAgentHostByokModel('customendpoint', 'claude-opus-4-7', 'customendpoint/Example/claude-opus-4-7');
+			const hiddenByHost = { ...model, metadata: { ...model.metadata, byokModelHidden: true } };
+			assert.deepStrictEqual({
+				hiddenByHost: isModelHiddenInPicker(hiddenByHost, () => false),
+				visible: isModelHiddenInPicker(model, () => false),
+			}, {
+				hiddenByHost: true,
+				visible: false,
+			});
+		});
 	});
 
 	suite('resolveEditedRequestSelection', () => {

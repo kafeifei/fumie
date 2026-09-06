@@ -327,7 +327,7 @@ expands the Phase 4 surface area for no review benefit.
 
 | Concern | Phase | Production reference |
 |---|---|---|
-| `settingSources` (load CLAUDE.md / hooks / agents from disk) | Phase 9 (settings/permissions UX). Phase 4 starts with `[]` for SDK isolation. | `claudeCodeAgent.ts` line 486 |
+| `settingSources` (load CLAUDE.md / hooks / agents from disk) | Phase 9 (settings/permissions UX). Phase 4 starts with `[]` for SDK isolation. Landed as `['user', 'project', 'local']` for the routed transports; **native keeps `[]`** so no user/project settings can carry provider env, and the user's global `~/.claude/CLAUDE.md` reaches native sessions through `systemPrompt.append` instead (`claudeSdkOptions.ts`, `ClaudeBackingStore.readGlobalClaudeMd`). | `claudeCodeAgent.ts` line 486 |
 | `mcpServers` (per-session MCP gateway) | Phase 7 (tool integration) | `claudeCodeAgent.ts` line 472 |
 | `plugins` (skill plugin locations) | Defer until skills are in scope | `claudeCodeAgent.ts` line 473 |
 | `additionalDirectories` (multi-root) | When multi-root support is needed | `claudeCodeAgent.ts` line 432 |

@@ -44,9 +44,7 @@ export class BangLocalCommand extends Disposable implements ILocalChatCommand {
 		if (command === undefined) {
 			return undefined;
 		}
-		// The raw command doubles as a provisional title so a brand-new session
-		// isn't left untitled until the first real (non-command) request.
-		return { run: () => this._run(request.turnChannel, request.turnId, command), suggestedTitle: command };
+		return { run: () => this._run(request.turnChannel, request.turnId, command) };
 	}
 
 	private async _run(turnChannel: ProtocolURI, turnId: string, command: string): Promise<void> {

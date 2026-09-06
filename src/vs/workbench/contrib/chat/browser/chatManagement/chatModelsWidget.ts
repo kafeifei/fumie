@@ -12,6 +12,7 @@ import { ScrollbarVisibility } from '../../../../../base/common/scrollable.js';
 import { Button, IButtonOptions } from '../../../../../base/browser/ui/button/button.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { ILanguageModelsService, ILanguageModelProviderDescriptor, resolveProviderDeprecationLink } from '../../../chat/common/languageModels.js';
+import { ILanguageModelsConfigurationService } from '../../../chat/common/languageModelsConfiguration.js';
 import { localize } from '../../../../../nls.js';
 import { defaultButtonStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
@@ -24,7 +25,7 @@ import { IContextMenuService } from '../../../../../platform/contextview/browser
 import { IAction, toAction, Action, Separator } from '../../../../../base/common/actions.js';
 import { ActionBar } from '../../../../../base/browser/ui/actionbar/actionbar.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
-import { ChatModelsViewModel, getManageModelsProviderLabel, ILanguageModel, ILanguageModelEntry, ILanguageModelProviderEntry, ILanguageModelGroupEntry, SEARCH_SUGGESTIONS, isLanguageModelProviderEntry, isLanguageModelGroupEntry, IViewModelEntry, isStatusEntry, IStatusEntry } from './chatModelsViewModel.js';
+import { canManageProviderGroup, ChatModelsViewModel, getManageModelsProviderLabel, ILanguageModel, ILanguageModelEntry, ILanguageModelProviderEntry, ILanguageModelGroupEntry, SEARCH_SUGGESTIONS, isLanguageModelProviderEntry, isLanguageModelGroupEntry, IViewModelEntry, isStatusEntry, IStatusEntry } from './chatModelsViewModel.js';
 import { HighlightedLabel } from '../../../../../base/browser/ui/highlightedlabel/highlightedLabel.js';
 import { Link } from '../../../../../platform/opener/browser/link.js';
 import { SuggestEnabledInput } from '../../../codeEditor/browser/suggestEnabledInput/suggestEnabledInput.js';
@@ -57,7 +58,21 @@ const $ = DOM.$;
 const HEADER_HEIGHT = 30;
 const VENDOR_ROW_HEIGHT = 30;
 const MODEL_ROW_HEIGHT = 26;
+// A status reads as one line beside the models it is about, not as a card that
+// pushes them apart. Its message is clipped like any other row's and carried in
+// full by the row's own title, so length costs no height.
+const STATUS_ROW_HEIGHT = MODEL_ROW_HEIGHT;
 const CLOSE_MODAL_EDITOR_COMMAND_ID = 'workbench.action.closeModalEditor';
+
+export async function runStatusEntryAction(entry: IStatusEntry, target: EventTarget | null | undefined): Promise<boolean> {
+	// `explicitActionOnly` keeps the action to its own control: the row is inert,
+	// and only the button in the actions column runs it.
+	if (!entry.action || entry.explicitActionOnly || (DOM.isHTMLElement(target) && target.closest('.actions-container'))) {
+		return false;
+	}
+	await entry.action.run();
+	return true;
+}
 
 export function getModelHoverContent(model: ILanguageModel): MarkdownString {
 	const markdown = new MarkdownString('', { isTrusted: true, supportThemeIcons: true });
@@ -172,23 +187,31 @@ export function getModelHoverContent(model: ILanguageModel): MarkdownString {
  *
  * Exposed for unit testing. The Copilot sign-in action is independent of whether adding
  * configurable BYOK vendors is supported.
+ *
+ * `vendorsWithGroups` names the vendors the user has already added an entry for.
+ * A vendor that declares itself `singleton` stands for something the user only
+ * has one of, so once it is in that set it drops out of the dropdown rather than
+ * offering a second, indistinguishable copy.
  */
 export function buildAddModelsDropdownActions(
 	configurableVendors: ILanguageModelProviderDescriptor[],
 	supportsAddingModels: boolean,
 	runVendorAction: (vendor: ILanguageModelProviderDescriptor) => void | Promise<void>,
 	runCopilotSignInAction?: () => void | Promise<void>,
+	vendorsWithGroups: ReadonlySet<string> = new Set(),
 ): IAction[] {
 	if (!supportsAddingModels && !runCopilotSignInAction) {
 		return [];
 	}
 
+	const addableVendors = configurableVendors.filter(v => !v.singleton || !vendorsWithGroups.has(v.vendor));
+
 	// Sort vendors alphabetically by displayName, but sink deprecated providers (those declaring a
 	// `deprecation.link`, e.g. Ollama) to the end of the list. "OpenAI Compatible (Deprecated)" (customoai)
 	// is pinned after the sorted list and "Custom Endpoint" (customendpoint) after a separator at the very end.
-	const customEndpointVendor = configurableVendors.find(v => v.vendor === 'customendpoint');
-	const customOaiVendor = configurableVendors.find(v => v.vendor === 'customoai');
-	const sortedVendors = configurableVendors
+	const customEndpointVendor = addableVendors.find(v => v.vendor === 'customendpoint');
+	const customOaiVendor = addableVendors.find(v => v.vendor === 'customoai');
+	const sortedVendors = addableVendors
 		.filter(v => v.vendor !== 'customendpoint' && v.vendor !== 'customoai')
 		.sort((a, b) => {
 			const aDeprecated = a.deprecation?.link ? 1 : 0;
@@ -367,7 +390,10 @@ class ModelsSearchFilterDropdownMenuActionViewItem extends DropdownMenuActionVie
 class Delegate implements ITableVirtualDelegate<IViewModelEntry> {
 	readonly headerRowHeight = HEADER_HEIGHT;
 	getHeight(element: IViewModelEntry): number {
-		return isLanguageModelProviderEntry(element) || isLanguageModelGroupEntry(element) ? VENDOR_ROW_HEIGHT : MODEL_ROW_HEIGHT;
+		if (isLanguageModelProviderEntry(element) || isLanguageModelGroupEntry(element)) {
+			return VENDOR_ROW_HEIGHT;
+		}
+		return isStatusEntry(element) ? STATUS_ROW_HEIGHT : MODEL_ROW_HEIGHT;
 	}
 }
 
@@ -391,6 +417,10 @@ abstract class ModelsTableColumnRenderer<T extends IModelTableColumnTemplateData
 		row.classList.toggle('models-vendor-row', isVendor || isGroup);
 		row.classList.toggle('models-model-row', !isVendor && !isGroup);
 		row.classList.toggle('models-status-row', isStatus);
+		// Actionable keeps the action visible; clickable is what arms the row
+		// itself, which a status that only offers an undo does not want.
+		row.classList.toggle('models-status-row-actionable', isStatus && !!element.action);
+		row.classList.toggle('models-status-row-clickable', isStatus && !!element.action && !element.explicitActionOnly);
 		const isHidden = (isVendor && element.hidden) || (!isVendor && !isGroup && !isStatus && (element as ILanguageModelEntry).model?.hidden);
 		row.classList.toggle('models-row-hidden', !!isHidden);
 		if (isVendor) {
@@ -570,6 +600,10 @@ class ModelNameColumnRenderer extends ModelsTableColumnRenderer<IModelNameColumn
 
 	override renderElement(entry: IViewModelEntry, index: number, templateData: IModelNameColumnTemplateData): void {
 		DOM.clearNode(templateData.modelStatusIcon);
+		templateData.modelStatusIcon.className = 'model-status-icon';
+		templateData.modelStatusIcon.style.display = 'none';
+		templateData.statusIcon.className = 'status-icon';
+		templateData.statusIcon.style.display = 'none';
 		templateData.providerIcon.className = 'model-provider-icon';
 		templateData.providerIcon.style.display = 'none';
 		templateData.sourceDescription.textContent = '';
@@ -1022,7 +1056,7 @@ class ActionsColumnRenderer extends ModelsTableColumnRenderer<IActionsColumnTemp
 		const { vendorEntry } = entry;
 		const primaryActions: IAction[] = [];
 		const secondaryActions: IAction[] = [];
-		if (vendorEntry.vendor.configuration) {
+		if (canManageProviderGroup(vendorEntry)) {
 			secondaryActions.push(...createProviderGroupActions(this.viewModel, vendorEntry.vendor, vendorEntry.group.name, this.languageModelsService, this.dialogService));
 		} else if (vendorEntry.vendor.managementCommand) {
 			primaryActions.push(toAction({
@@ -1066,6 +1100,10 @@ class ActionsColumnRenderer extends ModelsTableColumnRenderer<IActionsColumnTemp
 		}
 
 		templateData.actionBar.setActions(primaryActions, secondaryActions);
+	}
+
+	protected override renderStatusElement(entry: IStatusEntry, index: number, templateData: IActionsColumnTemplateData): void {
+		templateData.actionBar.setActions(entry.action ? [entry.action] : []);
 	}
 
 	private createPinAction(modelIdentifier: string): IAction {
@@ -1168,6 +1206,7 @@ export class ChatModelsWidget extends Disposable {
 		@IExtensionsWorkbenchService private readonly extensionsWorkbenchService: IExtensionsWorkbenchService,
 		@IWorkbenchEnvironmentService private readonly environmentService: IWorkbenchEnvironmentService,
 		@IDefaultAccountService private readonly defaultAccountService: IDefaultAccountService,
+		@ILanguageModelsConfigurationService private readonly languageModelsConfigurationService: ILanguageModelsConfigurationService,
 	) {
 		super();
 
@@ -1321,6 +1360,9 @@ export class ChatModelsWidget extends Disposable {
 		}));
 		this._register(this.chatEntitlementService.onDidChangeUsageBasedBilling(() => this.createTable()));
 		this._register(this.languageModelsService.onDidChangeLanguageModelVendors(() => this.updateAddModelsButton()));
+		// A singleton vendor leaves the dropdown as soon as its entry exists, and
+		// comes back when the entry is deleted, so the button follows the groups.
+		this._register(this.languageModelsConfigurationService.onDidChangeLanguageModelGroups(() => this.updateAddModelsButton()));
 		this._register(this.languageModelsService.onDidChangePinnedModels(() => this.viewModel.refresh()));
 		this._register(this.contextKeyService.onDidChangeContext(e => {
 			if (e.affectsSome(new Set(['github.copilot.clientByokEnabled']))) {
@@ -1333,13 +1375,18 @@ export class ChatModelsWidget extends Disposable {
 		this.tableDisposables.clear();
 		DOM.clearNode(this.tableContainer);
 
+		// The Agents window sizes the Settings overlay so the table always fits,
+		// so horizontal panning (including the wheel-to-horizontal conversion)
+		// is disabled there entirely.
+		const allowHorizontalScrolling = !this.environmentService.isSessionsWindow;
 		this.tableViewport = $('.models-table-viewport');
+		this.tableViewport.classList.toggle('models-table-no-hscroll', !allowHorizontalScrolling);
 		this.tableInner = DOM.append(this.tableViewport, $('.models-table-inner'));
 		this.tableScrollable = this.tableDisposables.add(new DomScrollableElement(this.tableViewport, {
-			horizontal: ScrollbarVisibility.Auto,
+			horizontal: allowHorizontalScrolling ? ScrollbarVisibility.Auto : ScrollbarVisibility.Hidden,
 			vertical: ScrollbarVisibility.Hidden,
 			useShadows: false,
-			scrollYToX: true,
+			scrollYToX: allowHorizontalScrolling,
 		}));
 		this.tableContainer.appendChild(this.tableScrollable.getDomNode());
 
@@ -1446,7 +1493,9 @@ export class ChatModelsWidget extends Disposable {
 						} else if (isLanguageModelGroupEntry(e)) {
 							return e.id === 'visible' ? localize('visible.ariaLabel', 'Visible Models') : localize('hidden.ariaLabel', 'Hidden Models');
 						} else if (isStatusEntry(e)) {
-							return localize('status.ariaLabel', 'Status: {0}', e.message);
+							return e.action
+								? localize('status.action.ariaLabel', 'Status: {0}. Action: {1}', e.message, e.action.label)
+								: localize('status.ariaLabel', 'Status: {0}', e.message);
 						}
 						const ariaLabels = [];
 						ariaLabels.push(e.model.hidden
@@ -1626,6 +1675,7 @@ export class ChatModelsWidget extends Disposable {
 				return;
 			}
 			if (isStatusEntry(element)) {
+				await runStatusEntryAction(element, browserEvent?.target);
 				return;
 			}
 			if (isLanguageModelProviderEntry(element) || isLanguageModelGroupEntry(element)) {
@@ -1662,6 +1712,7 @@ export class ChatModelsWidget extends Disposable {
 			this.defaultAccountResolved && this.defaultAccountService.currentDefaultAccount === null
 				? () => this.commandService.executeCommand(CHAT_SETUP_ACTION_ID)
 				: undefined,
+			new Set(this.languageModelsConfigurationService.getLanguageModelsProviderGroups().map(group => group.vendor)),
 		);
 
 		this.addButton.enabled = this.dropdownActions.length > 0;

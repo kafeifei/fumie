@@ -20,6 +20,7 @@ import { TestInstantiationService } from '../../../../../platform/instantiation/
 import { IStorageService } from '../../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
 import { NullTelemetryService } from '../../../../../platform/telemetry/common/telemetryUtils.js';
+import { SessionTypeAvailability } from '../../../../../workbench/contrib/chat/browser/agentSessions/sessionTypeAvailability.js';
 import { IChatSessionsService } from '../../../../../workbench/contrib/chat/common/chatSessionsService.js';
 import { ILanguageModelsService } from '../../../../../workbench/contrib/chat/common/languageModels.js';
 import { ChatEntitlement, IChatEntitlementService } from '../../../../../workbench/services/chat/common/chatEntitlementService.js';
@@ -110,6 +111,13 @@ class TestSessionTypePicker extends SessionTypePicker {
 
 	showPicker(): void {
 		this._showPicker();
+	}
+
+	isSessionTypeDisabled(authRequirement: SessionTypeAuthRequirement, availability: SessionTypeAvailability): boolean {
+		return this._isSessionTypeDisabled(
+			{ id: 'test', label: 'Test', icon: Codicon.terminal, authRequirement },
+			availability,
+		);
 	}
 }
 
@@ -650,5 +658,31 @@ suite('SessionTypePicker', () => {
 		});
 
 		assert.deepStrictEqual(picker.selectedPick, { providerId: 'copilot', sessionTypeId: 'copilot-cli' });
+	});
+
+	test('selectSessionType applies the same write path as an explicit pick', () => {
+		management.setSessionTypesForFolder(folder, [
+			sessionType('local-1', 'codex', 'Codex'),
+			sessionType('local-1', 'kimi', 'Kimi'),
+		]);
+		session.set(createFakeSession('local-1', 'codex', folder), undefined);
+		const picker = createPicker(disposables, session, management, storage);
+		picker.render(document.createElement('div'));
+		picker.selectSessionType({ providerId: 'local-1', sessionTypeId: 'kimi' });
+		assert.deepStrictEqual(picker.selectedPick, { providerId: 'local-1', sessionTypeId: 'kimi' });
+		assert.deepStrictEqual(picker.getUserPickedSessionType(), { providerId: 'local-1', sessionTypeId: 'kimi' });
+	});
+
+	test('a type usable without GitHub stays enabled even when availability says sign in', () => {
+		const picker = createPicker(disposables, session, management, storage);
+		assert.deepStrictEqual({
+			noneSignIn: picker.isSessionTypeDisabled(SessionTypeAuthRequirement.None, SessionTypeAvailability.SignInRequired),
+			noneNoModels: picker.isSessionTypeDisabled(SessionTypeAuthRequirement.None, SessionTypeAvailability.NoModels),
+			githubSignIn: picker.isSessionTypeDisabled(SessionTypeAuthRequirement.GitHub, SessionTypeAvailability.SignInRequired),
+		}, {
+			noneSignIn: false,
+			noneNoModels: false,
+			githubSignIn: true,
+		});
 	});
 });

@@ -99,4 +99,67 @@ suite('MultiDiffEditorInput', () => {
 		await assert.rejects(viewModelPromise, CancellationError);
 		assert.strictEqual(referenceDisposed, true);
 	});
+
+	test('bounds model-reference fan-out and stops queued work after disposal', async () => {
+		const firstReferenceRequested = new DeferredPromise<void>();
+		const releaseReferences = new DeferredPromise<void>();
+		let requested = 0;
+		let inFlight = 0;
+		let maxInFlight = 0;
+		let disposed = 0;
+		const textModelService = new class extends mock<ITextModelService>() {
+			override createModelReference() {
+				requested++;
+				inFlight++;
+				maxInFlight = Math.max(maxInFlight, inFlight);
+				void firstReferenceRequested.complete();
+				return releaseReferences.p.then(() => {
+					inFlight--;
+					return {
+						object: new class extends mock<IResolvedTextEditorModel>() { }(),
+						dispose: () => disposed++,
+					};
+				});
+			}
+		}();
+		const textFileService = new class extends mock<ITextFileService>() {
+			override readonly files = new class extends mock<ITextFileEditorModelManager>() {
+				override readonly onDidChangeDirty = Event.None;
+			}();
+		}();
+		const resources = Array.from({ length: 600 }, (_, index) => new MultiDiffEditorItem(
+			undefined,
+			URI.parse(`file:///modified-${index}.ts`),
+			undefined,
+		));
+		const input = disposables.add(new MultiDiffEditorInput(
+			URI.parse('multi-diff-editor:test'),
+			'Test',
+			resources,
+			false,
+			textModelService,
+			new class extends mock<ITextResourceConfigurationService>() { }(),
+			new class extends mock<IInstantiationService>() { }(),
+			new class extends mock<IMultiDiffSourceResolverService>() { }(),
+			textFileService,
+		));
+
+		const viewModelPromise = input.getViewModel();
+		const loadingViewModelPromise = input.getViewModel({ waitForDiffOr1s: false });
+		await firstReferenceRequested.p;
+		const loadingViewModel = await loadingViewModelPromise;
+
+		assert.ok(requested <= 8, `expected at most 8 model references to start, got ${requested}`);
+		assert.ok(maxInFlight <= 8, `expected at most 8 model references in flight, got ${maxInFlight}`);
+		assert.strictEqual(loadingViewModel.model.documents.value, 'loading', 'session switches can attach the lightweight loading model without waiting for all files');
+
+		const requestedBeforeDisposal = requested;
+		input.dispose();
+		await releaseReferences.complete();
+
+		await assert.rejects(viewModelPromise, CancellationError);
+		assert.strictEqual(requested, requestedBeforeDisposal, 'disposing the input must stop queued model-reference work');
+		assert.strictEqual(inFlight, 0);
+		assert.strictEqual(disposed, requestedBeforeDisposal, 'late model references must be released');
+	});
 });

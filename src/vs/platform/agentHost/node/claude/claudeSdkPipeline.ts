@@ -3,23 +3,27 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { AgentInfo, McpServerStatus, PermissionMode, Query, SDKUserMessage, SlashCommand, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
+import type { AgentInfo, McpServerStatus, PermissionMode, Query, SDKMessage, SDKRateLimitInfo, SDKUserMessage, SlashCommand, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
+import { localize } from '../../../../nls.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, IReference, toDisposable } from '../../../../base/common/lifecycle.js';
 import { StopWatch } from '../../../../base/common/stopwatch.js';
 import { URI } from '../../../../base/common/uri.js';
+import { generateUuid } from '../../../../base/common/uuid.js';
 import { IInstantiationService } from '../../../instantiation/common/instantiation.js';
 import { ILogService } from '../../../log/common/log.js';
 import { ClaudeRuntimeEffortLevel } from '../../common/claudeModelConfig.js';
 import { AgentSignal } from '../../common/agent.js';
 import type { IAgentHostClientTelemetryContext } from '../../common/agentHostTelemetry.js';
 import { ISessionDatabase } from '../../common/sessionDataService.js';
+import { MessageKind, type PendingMessage } from '../../common/state/sessionState.js';
 import { ActionType } from '../../common/state/sessionActions.js';
-import { DeferredPromise } from '../../../../base/common/async.js';
+import { DeferredPromise, raceTimeout } from '../../../../base/common/async.js';
 import { ClaudePromptQueue, IPendingSdkMessage } from './claudePromptQueue.js';
 import { ClaudeSdkMessageRouter } from './claudeSdkMessageRouter.js';
-import type { SubagentRegistry } from './claudeSubagentRegistry.js';
+import { type SubagentRegistry } from './claudeSubagentRegistry.js';
+import { mapSubagentProcessRebuild } from './claudeSubagentSignals.js';
 
 /**
  * Callback the agent supplies via {@link ClaudeSdkPipeline.attachRematerializer}
@@ -55,9 +59,11 @@ export interface IRematerializer {
  *     Re-applied to a fresh Query on rebind.
  *   • Drain the SDK message stream, dispatch each message to the
  *     {@link ClaudeSdkMessageRouter}, settle the matching entry's
- *     deferred on `result`, and emit `ChatTurnComplete` only when
- *     the queue fully drains (intermediate results during steering
- *     preemption do NOT fire turn-complete — CONTEXT.md M10).
+ *     deferred on `result`. An intermediate result during steering
+ *     preemption closes the interrupted protocol turn and promotes the
+ *     pending steering message into a fresh visible turn; the terminal
+ *     result closes that new turn (CONTEXT.md M10). Output that keeps
+ *     coming after the queue drained is owned by {@link IPostDrainTurn}.
  *
  * Disposing the pipeline aborts the controller (terminating the SDK
  * subprocess per `sdk.d.ts:982`) and async-disposes the WarmQuery.
@@ -85,7 +91,87 @@ export interface ISdkResolvedCustomizations {
 	readonly plugins: readonly { readonly name: string; readonly path: string; readonly source?: string }[];
 }
 
+/**
+ * The Claude SDK runtime exposes this control-plane method, but the currently
+ * published TypeScript declaration omits it. Keep the compatibility shim
+ * deliberately narrow so an older SDK can degrade to the transcript summary
+ * without weakening the rest of the strongly-typed Query surface.
+ */
+interface IQueryWithSessionTitleGeneration extends Query {
+	generateSessionTitle?(description: string, options?: { readonly persist?: boolean }): Promise<string>;
+}
+
+/**
+ * Turn identity for SDK output that arrives while the prompt queue is drained.
+ *
+ * The queue only holds entries the host itself pushed (`send` / `injectSteering`),
+ * so it says nothing about the stream once the matching `result` settled — yet
+ * the SDK keeps producing: a background subagent reports late, and the harness
+ * runs its own top-level turn when that subagent's completion wakes it. Both
+ * need a turn id or {@link ClaudeSdkMessageRouter.handle} drops the message
+ * whole, which is why neither used to reach the chat at all.
+ *
+ * `isAutonomous` distinguishes the two:
+ *   • `false` — the turn the settled entry owned. It is closed already, so its
+ *     id is only an attribution anchor for output that belongs to work that
+ *     turn started (a background subagent's late messages, its
+ *     `task_notification`). Those signals carry `parentToolCallId` and the host
+ *     re-keys them onto the subagent's own chat, so nothing surfaces on the
+ *     closed turn.
+ *   • `true` — a turn this pipeline opened for the harness's own top-level
+ *     continuation, and must therefore close on the next `result`.
+ */
+interface IPostDrainTurn {
+	readonly turnId: string;
+	readonly stopWatch: StopWatch;
+	readonly clientContext?: IAgentHostClientTelemetryContext;
+	readonly isAutonomous: boolean;
+}
+
+/**
+ * How long a rebind waits for the outgoing subprocess to actually exit before
+ * it materializes the replacement anyway. A healthy CLI shutdown is well under
+ * a second, and in the `recover` case the process is usually dead already, so
+ * this only ever fires for a wedged subprocess. Bounded on purpose: resuming
+ * from a transcript that is missing its tail is bad, but never rebinding at all
+ * (a session that answers nothing, forever) is worse.
+ */
+const REBIND_EXIT_TIMEOUT_MS = 10_000;
+
+/**
+ * True for SDK output that belongs to the harness's own top-level model turn.
+ * Subagent-scoped envelopes (`parent_tool_use_id`) are excluded because they
+ * render in the subagent's chat, and every lifecycle / status `system` envelope
+ * is excluded because those trail a settled turn as a matter of course — a
+ * turn opened for one would be empty.
+ */
+function isTopLevelModelOutput(message: SDKMessage): boolean {
+	return (message.type === 'stream_event' || message.type === 'assistant') && message.parent_tool_use_id === null;
+}
+
 export class ClaudeSdkPipeline extends Disposable {
+	private _shutdownPromise: Promise<void> | undefined;
+	/**
+	 * Ask the live Claude backend to generate a title for `description`.
+	 *
+	 * This is a Query control request, not a second user turn, and it runs
+	 * with `persist: false` so the backend answers with a title without
+	 * appending a custom-title entry to the session's own transcript — the
+	 * title is host-owned state, and the harness transcript must stay exactly
+	 * as the user's turns left it.
+	 *
+	 * `undefined` means the installed SDK predates the control method and
+	 * callers should keep whatever title they already have.
+	 */
+	async generateSessionTitle(description: string): Promise<string | undefined> {
+		const query = await this._ensureQueryBound() as IQueryWithSessionTitleGeneration;
+		if (!query.generateSessionTitle) {
+			return undefined;
+		}
+		const title = await query.generateSessionTitle(description, { persist: false });
+		return title.trim() || undefined;
+	}
+
 	/**
 	 * Phase 11 — hot-swap the SDK's plugin set in place via
 	 * `Query.reloadPlugins()`. Commands / agents / mcpServers added or
@@ -184,6 +270,7 @@ export class ClaudeSdkPipeline extends Disposable {
 	 * tracks the lifetime of {@link _warm} and is only swapped here.
 	 */
 	private _bindWarmQuery(): Query {
+		this._backgroundTasksActive = undefined;
 		const query = this._warm.query(this._queue.iterable);
 		this._query = query;
 		return query;
@@ -198,6 +285,16 @@ export class ClaudeSdkPipeline extends Disposable {
 	private _query: Query | undefined;
 	private _warm: WarmQuery;
 	private _abortController: AbortController;
+
+	/**
+	 * The session's subagent spawn book. The router owns the live reads and
+	 * writes; the pipeline keeps the handle only so a rebind can close out the
+	 * spawns the replaced subprocess left open (see
+	 * {@link mapSubagentProcessRebuild}).
+	 */
+	private readonly _subagents: SubagentRegistry;
+	/** Undefined until this process reports its first full background-task level. */
+	private _backgroundTasksActive: boolean | undefined;
 
 	private readonly _queue: ClaudePromptQueue;
 
@@ -230,18 +327,23 @@ export class ClaudeSdkPipeline extends Disposable {
 	/** Tracks whether the consumer loop is currently draining {@link _query}. */
 	private _consumerLoopRunning = false;
 
+	/** Turn identity for SDK output that arrives with the prompt queue drained. See {@link IPostDrainTurn}. */
+	private _postDrainTurn: IPostDrainTurn | undefined;
+
 	private readonly _onDidProduceSignal = this._register(new Emitter<AgentSignal>());
 	/**
 	 * Single fan-out for every {@link AgentSignal} this session produces:
 	 *   • Router-mapped per-message signals (response parts, tool calls,
 	 *     pending confirmations, etc.).
-	 *   • `ChatTurnComplete` action, fired when the LAST entry in the
-	 *     queue drains via `result` (intermediate results during steering
-	 *     preempt do NOT fire — CONTEXT.md M10).
-	 *   • `steering_consumed` signal, fired the moment the iterable yields
-	 *     a steering entry to the SDK.
+	 *   • `ChatTurnComplete` / `ChatTurnStarted` actions at the steering
+	 *     preemption boundary, followed by `ChatTurnComplete` when the new
+	 *     turn drains.
 	 */
 	readonly onDidProduceSignal: Event<AgentSignal> = this._onDidProduceSignal.event;
+
+	private readonly _onDidRateLimitInfo = this._register(new Emitter<SDKRateLimitInfo>());
+	/** Account-level Claude plan utilization, independent of protocol turn ownership. */
+	readonly onDidRateLimitInfo: Event<SDKRateLimitInfo> = this._onDidRateLimitInfo.event;
 
 	private readonly _router: ClaudeSdkMessageRouter;
 
@@ -258,6 +360,7 @@ export class ClaudeSdkPipeline extends Disposable {
 		@ILogService private readonly _logService: ILogService,
 	) {
 		super();
+		this._subagents = subagents;
 		this._warm = warm;
 		this._abortController = abortController;
 		this._wireAbortHandler(abortController);
@@ -265,11 +368,6 @@ export class ClaudeSdkPipeline extends Disposable {
 			ClaudePromptQueue,
 			sessionId,
 			() => this._abortController.signal,
-			(pendingId: string) => this._onDidProduceSignal.fire({
-				kind: 'steering_consumed',
-				chat: this.chatChannelUri,
-				id: pendingId,
-			}),
 		));
 		this._router = this._register(instantiationService.createInstance(
 			ClaudeSdkMessageRouter, chatChannelUri, resource, dbRef, subagents, clientToolOwner,
@@ -279,6 +377,9 @@ export class ClaudeSdkPipeline extends Disposable {
 		// `_abortController` so a swap aborts the live subprocess.
 		this._register(toDisposable(() => this._abortController.abort()));
 		this._register(toDisposable(() => {
+			if (this._shutdownPromise) {
+				return;
+			}
 			void Promise.resolve(this._warm[Symbol.asyncDispose]()).catch((err: unknown) =>
 				this._logService.warn(`[ClaudeSdkPipeline] WarmQuery dispose failed: ${err}`));
 		}));
@@ -296,6 +397,28 @@ export class ClaudeSdkPipeline extends Disposable {
 	get hasActiveTurn(): boolean { return !this._queue.isEmpty; }
 
 	/**
+	 * Whether a background subagent is still running inside the warm
+	 * subprocess. Deliberately a *sibling* of {@link hasActiveTurn} rather than
+	 * folded into it: `hasActiveTurn` means "a foreground turn is in flight or
+	 * queued" and is read by steering, preemption and abort logic that must not
+	 * start treating background work as a live turn.
+	 *
+	 * The two are only combined at the teardown gates
+	 * (`ClaudeAgent._canReleaseChat` / `_releaseChat`), where both answer the
+	 * same question: would tearing this pipeline down destroy work in progress?
+	 * A background subagent is an in-process task of this very subprocess
+	 * (sdk.d.ts: "in-process background subagent"), so releasing the session
+	 * aborts it and its `system.task_notification` can never arrive.
+	 *
+	 * The SDK's full task level supersedes edge bookends as soon as it arrives.
+	 * Older SDKs without that signal fall back to open registry entries, never
+	 * task age. Ambient housekeeping does not keep a session alive.
+	 */
+	get hasOpenBackgroundSubagents(): boolean {
+		return this._backgroundTasksActive ?? this._subagents.hasOpenBackgroundSpawns();
+	}
+
+	/**
 	 * Abort the live SDK subprocess and **await its actual exit**.
 	 *
 	 * `WarmQuery[Symbol.asyncDispose]()` calls the query's `close()`, which
@@ -307,14 +430,16 @@ export class ClaudeSdkPipeline extends Disposable {
 	 * the `--session-id` (the CLI rejects a fresh spawn while `<id>.jsonl`
 	 * still exists, and the dying process would otherwise recreate it).
 	 */
-	async shutdownAndWait(): Promise<void> {
-		this._abortController.abort();
-		try {
-			await this._warm[Symbol.asyncDispose]();
-			await this._query?.return(undefined);
-		} catch (err) {
-			this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] shutdownAndWait: teardown failed`, err);
-		}
+	shutdownAndWait(): Promise<void> {
+		return this._shutdownPromise ??= (async () => {
+			this._abortController.abort();
+			try {
+				await this._warm[Symbol.asyncDispose]();
+				await this._query?.return(undefined);
+			} catch (err) {
+				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] shutdownAndWait: teardown failed`, err);
+			}
+		})();
 	}
 
 	/**
@@ -450,26 +575,24 @@ export class ClaudeSdkPipeline extends Disposable {
 
 	/**
 	 * Push a `priority: 'now'` steering message into the iterable. The
-	 * caller pre-builds the {@link SDKUserMessage} (the pipeline is SDK
-	 * messaging-shaped, not protocol-shaped). `pendingMessageId` is the
-	 * protocol `PendingMessage.id` that {@link onSteeringConsumed} will
-	 * carry when the SDK accepts the message.
+	 * caller pre-builds the {@link SDKUserMessage}. The complete protocol
+	 * {@link PendingMessage} is retained until the SDK emits the intermediate
+	 * result that proves the interrupted request has ended; at that boundary
+	 * the pending bubble is atomically promoted into a permanent user turn.
 	 *
-	 * No-op if the pipeline is aborted or no in-flight / queued request
-	 * exists to inherit a `turnId` from (CONTEXT.md M10: steering folds
-	 * into the in-progress protocol Turn).
+	 * No-op if the pipeline is aborted or no in-flight / queued request exists.
 	 */
-	injectSteering(prompt: SDKUserMessage, pendingMessageId: string): void {
+	injectSteering(prompt: SDKUserMessage, steeringMessage: PendingMessage): void {
 		if (this._abortController.signal.aborted) {
-			this._logService.warn(`[Claude:${this.sessionId}] injectSteering: dropped (controller aborted) id=${pendingMessageId}`);
+			this._logService.warn(`[Claude:${this.sessionId}] injectSteering: dropped (controller aborted) id=${steeringMessage.id}`);
 			return;
 		}
 		const parent = this._queue.peekParent();
 		if (!parent) {
-			this._logService.warn(`[Claude:${this.sessionId}] injectSteering: dropped (no in-flight turn) id=${pendingMessageId}`);
+			this._logService.warn(`[Claude:${this.sessionId}] injectSteering: dropped (no in-flight turn) id=${steeringMessage.id}`);
 			return;
 		}
-		const sdkUuid = typeof prompt.uuid === 'string' ? prompt.uuid : pendingMessageId;
+		const sdkUuid = typeof prompt.uuid === 'string' ? prompt.uuid : steeringMessage.id;
 		// Steering deferreds aren't observed by anyone (the agent's send
 		// promise is the original entry's deferred); attach a no-op catch
 		// so a `failAll` rejection on abort/crash doesn't surface as an
@@ -477,13 +600,16 @@ export class ClaudeSdkPipeline extends Disposable {
 		this._queue.push({
 			sdkMessage: prompt,
 			sdkUuid,
-			turnId: parent.turnId,
+			// The SDK transcript keys this top-level user message by the same
+			// uuid. Reusing it as the live turn id keeps live and replayed
+			// transcript identities stable.
+			turnId: steeringMessage.id,
 			clientContext: parent.clientContext,
-			stopWatch: parent.stopWatch,
+			stopWatch: StopWatch.create(false),
 			deferred: new DeferredPromise<void>(),
-			steeringPendingId: pendingMessageId,
+			steeringMessage,
 		}).catch(() => { /* expected on abort/crash */ });
-		this._logService.info(`[Claude:${this.sessionId}] injectSteering: enqueued id=${pendingMessageId} sdkUuid=${sdkUuid}`);
+		this._logService.info(`[Claude:${this.sessionId}] injectSteering: enqueued id=${steeringMessage.id} sdkUuid=${sdkUuid} parentTurnId=${parent.turnId}`);
 	}
 
 	/**
@@ -503,6 +629,7 @@ export class ClaudeSdkPipeline extends Disposable {
 		}
 		this._abortController.abort();
 		this._queue.failAll(new CancellationError());
+		this._cancelAutonomousTurn();
 		// Mark unhealthy but keep the `_query` handle: the next `send` rebinds,
 		// and `shutdownAndWait` still needs it to await the subprocess exit.
 		this._needsRebind = true;
@@ -523,6 +650,9 @@ export class ClaudeSdkPipeline extends Disposable {
 
 	private _wireAbortHandler(controller: AbortController): void {
 		controller.signal.addEventListener('abort', () => {
+			if (this._abortController === controller) {
+				this._backgroundTasksActive = false;
+			}
 			this._queue.notifyAborted();
 		}, { once: true });
 	}
@@ -587,22 +717,84 @@ export class ClaudeSdkPipeline extends Disposable {
 	}
 
 	/**
+	 * Wait for the outgoing SDK subprocess to actually exit, bounded by
+	 * {@link REBIND_EXIT_TIMEOUT_MS}.
+	 *
+	 * A rebind rebuilds the session in `resume` mode, which makes the SDK read
+	 * this session's transcript back out of the `SessionStore` and materialize
+	 * a temp dir for the fresh CLI. The outgoing subprocess writes the tail of
+	 * that transcript as it shuts down, so materializing the replacement first
+	 * races that final flush: the new CLI resumes onto a truncated — often
+	 * near-empty — snapshot, and the session comes back with no memory of what
+	 * it was doing (a turn that produces no output at all).
+	 *
+	 * Waiting is a two-step, exactly as {@link shutdownAndWait} documents:
+	 * `WarmQuery[Symbol.asyncDispose]()` only *fires* the SDK cleanup, while
+	 * `Query.return()` awaits it through to `transport.waitForExit()` — the OS
+	 * process actually exiting after its last flush.
+	 *
+	 * Never rejects: a teardown failure or a subprocess that refuses to die is
+	 * logged and the rebind continues. Losing the transcript tail is the very
+	 * bug this guards against, but wedging the rebind forever would take the
+	 * whole session down instead of one turn.
+	 */
+	private async _awaitPreviousWarmExit(reason: 'restart' | 'recover', oldWarm: WarmQuery, oldQuery: Query | undefined): Promise<void> {
+		const exited = (async () => {
+			await oldWarm[Symbol.asyncDispose]();
+			await oldQuery?.return(undefined);
+			return true;
+		})().catch((err: unknown) => {
+			this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] rebind (${reason}): previous WarmQuery teardown failed: ${err}`);
+			return true;
+		});
+		if (await raceTimeout(exited, REBIND_EXIT_TIMEOUT_MS) === undefined) {
+			this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] rebind (${reason}): previous subprocess did not exit within ${REBIND_EXIT_TIMEOUT_MS}ms; resuming anyway (transcript tail may be missing)`);
+		}
+	}
+
+	/**
 	 * Dispose the dead SDK plumbing and rebuild via the agent-supplied
 	 * rematerializer in `resume` mode. Re-applies the current model /
 	 * effort / permission mode to the fresh Query.
+	 *
+	 * Ordering is load-bearing: the outgoing subprocess must be *gone* before
+	 * the replacement is materialized. See {@link _awaitPreviousWarmExit}.
 	 */
 	private async _rebindQuery(reason: 'restart' | 'recover'): Promise<void> {
 		if (!this._rematerializer) {
 			throw new Error(`ClaudeSdkPipeline.rebind: no rematerializer attached (reason=${reason})`);
 		}
 		const oldWarm = this._warm;
+		const oldQuery = this._query;
+		const oldController = this._abortController;
 		// Install a placeholder controller BEFORE awaiting the
 		// rematerializer so a concurrent {@link abort} has a live target
 		// instead of returning early as idempotent against the already-
 		// aborted old controller.
 		const placeholder = new AbortController();
 		this._abortController = placeholder;
-		const built = await this._rematerializer(reason);
+		// Drop ownership of the outgoing stream first. Tearing it down ends its
+		// `for await`, and the consumer loop must read that as "a rebind
+		// retired me" (return quietly) rather than "the stream died"
+		// (`failAll` on entries the rebind is about to replay). This is the
+		// same `_query`-identity handoff the loop already uses post-rebind.
+		this._query = undefined;
+		this._backgroundTasksActive = false;
+		await this._awaitPreviousWarmExit(reason, oldWarm, oldQuery);
+		const built = await this._rematerializer(reason).catch((err: unknown) => {
+			// The outgoing subprocess is gone, but `_warm` still points at it,
+			// so put its controller back: `_abortController` must stay paired
+			// with `_warm` for abort()/dispose, and the orphaned placeholder
+			// would answer for neither. The pipeline stays marked for recovery
+			// so the next send retries the rebind.
+			this._abortController = oldController;
+			this._needsRebind = true;
+			if (placeholder.signal.aborted) {
+				oldController.abort();
+				this._queue.failAll(new CancellationError());
+			}
+			throw err;
+		});
 		// Dispose may have run while we were awaiting the rematerializer.
 		// The dispose chain has already torn down the OLD warm/controller;
 		// the freshly-built pair would otherwise leak its subprocess. Mirror
@@ -620,14 +812,10 @@ export class ClaudeSdkPipeline extends Disposable {
 			built.abortController.abort();
 			void Promise.resolve(built.warm[Symbol.asyncDispose]()).catch((err: unknown) =>
 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] rebind-aborted: warm dispose failed: ${err}`));
-			void Promise.resolve(oldWarm[Symbol.asyncDispose]()).catch((err: unknown) =>
-				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] previous WarmQuery dispose failed during aborted rebind: ${err}`));
 			this._queue.failAll(new CancellationError());
 			this._needsRebind = true;
 			throw new CancellationError();
 		}
-		void Promise.resolve(oldWarm[Symbol.asyncDispose]()).catch((err: unknown) =>
-			this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] previous WarmQuery dispose failed during rebind: ${err}`));
 		this._warm = built.warm;
 		this._abortController = built.abortController;
 		this._wireAbortHandler(built.abortController);
@@ -641,15 +829,37 @@ export class ClaudeSdkPipeline extends Disposable {
 		this._appliedEffort = undefined;
 		this._appliedPermissionMode = undefined;
 		this._bindWarmQuery();
+		this._closeOrphanedSubagents(reason);
 		await this._replayCurrentConfig();
+	}
+
+	/**
+	 * The subprocess just swapped, so every subagent spawn still open belonged
+	 * to the dead one and can never report its own completion. Close their
+	 * chats through the ordinary `subagent_completed` route so the host's own
+	 * reduction runs (turn ended, session summary re-aggregated, `InProgress`
+	 * cleared) — nothing here mutates state directly.
+	 */
+	private _closeOrphanedSubagents(reason: 'restart' | 'recover'): void {
+		const orphans = mapSubagentProcessRebuild(this.chatChannelUri, this._subagents);
+		if (orphans.length === 0) {
+			return;
+		}
+		this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] rebind (${reason}) orphaned ${orphans.length} open subagent(s); completing their chats so the session does not stay 'running'`);
+		for (const orphan of orphans) {
+			this._onDidProduceSignal.fire(orphan);
+		}
 	}
 
 	/**
 	 * Consumer loop. Drains the SDK iterator, dispatches each message
 	 * to the {@link ClaudeSdkMessageRouter} (awaited so async file-edit
-	 * observation completes before the next message), settles the head
-	 * entry's deferred on `result`, and fires `ChatTurnComplete` only
-	 * when the queue fully drains.
+	 * observation completes before the next message). A terminal `result`
+	 * maps normally and closes the active protocol turn. An intermediate
+	 * steering-preempt result suppresses its SDK diagnostic, closes the
+	 * interrupted turn, and atomically promotes the retained pending message
+	 * into a fresh protocol turn. Subsequent SDK output is therefore routed to
+	 * the new user message rather than folded into the original turn.
 	 *
 	 * On any uncaught error (cancellation, transport failure, or the
 	 * post-loop "stream ended without result" guard) the catch block
@@ -665,8 +875,20 @@ export class ClaudeSdkPipeline extends Disposable {
 		}
 		try {
 			for await (const message of query) {
+				// A rebind can leave the previous SDK iterator alive briefly. It no
+				// longer owns router state or the shared prompt queue once `_query`
+				// changes, even if it still produces a buffered message.
+				if (this._query !== query) {
+					return;
+				}
 				if (this._abortController.signal.aborted) {
 					throw new CancellationError();
+				}
+				if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
+					// A complete per-process level, independent of task_started /
+					// task_notification ordering and their unrelated tool-use ids.
+					this._backgroundTasksActive = message.tasks.some(task => !task.ambient);
+					continue;
 				}
 				if (message.type === 'system' && message.subtype === 'init') {
 					// Capture the loaded native-plugin list on every init (incl.
@@ -676,35 +898,88 @@ export class ClaudeSdkPipeline extends Disposable {
 						this._isResumed = true;
 					}
 				}
-				const parent = this._queue.peekParent();
-				const turnId = parent?.turnId;
-				const clientContext = parent?.clientContext;
-				const turnDuration = parent?.stopWatch.elapsed();
+				if (message.type === 'rate_limit_event') {
+					// This is account state, not turn content. Publish it before routing
+					// so an idle/post-drain event is not lost for lacking a turn id.
+					this._onDidRateLimitInfo.fire(message.rate_limit_info);
+				}
+				const activeEntry = this._queue.peekParent();
+				if (!activeEntry && isTopLevelModelOutput(message)) {
+					this._openAutonomousTurn();
+				}
+				const owner = activeEntry ?? this._postDrainTurn;
+				// Only a steering message queued behind the in-flight request makes
+				// its result an intermediate boundary. Every other result — the last
+				// one, one with an ordinary send waiting behind it, one closing the
+				// autonomous turn — is terminal for its request and must map its
+				// usage like any other.
+				const isIntermediateResult = message.type === 'result' && this._queue.steeringSuccessor !== undefined;
 				try {
-					await this._router.handle(message, turnId, {
-						turnDuration,
-						mode: this._currentPermissionMode,
-						clientContext,
-					});
+					if (isIntermediateResult) {
+						// Claude reports the interrupted request as an execution error.
+						// Do not render that implementation detail. Nothing else about
+						// the message is actionable: the SDK session continues, so the
+						// tools the interrupted request had in flight still report under
+						// the ids the mapper is holding, and the terminal result owns the
+						// cleanup for whatever never arrives.
+						this._logService.info(`[Claude:${this.sessionId}] intermediate result (steering preemption); not mapped`);
+					} else {
+						await this._router.handle(message, owner?.turnId, {
+							turnDuration: owner?.stopWatch.elapsed(),
+							mode: this._currentPermissionMode,
+							clientContext: owner?.clientContext,
+						});
+					}
 				} catch (handlerErr) {
 					this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] router threw, skipping: ${handlerErr}`);
+				}
+				// The router is async, so ownership may have changed while it was
+				// handling the message. Never let that old result settle a new turn.
+				if (this._query !== query) {
+					return;
 				}
 				if (message.type === 'result') {
 					const completed = this._queue.settleHead();
 					this._logService.info(`[Claude:${this.sessionId}] result for sdkUuid=${completed?.sdkUuid}`);
-					// Final result: queue fully drained → protocol turn done.
-					// Intermediate result (still pending entries from a
-					// steering preempt) does NOT fire ChatTurnComplete.
+					if (!completed && this._postDrainTurn?.isAutonomous) {
+						// The autonomous turn has no queue entry to settle, so its own
+						// result is the only boundary that can close it. Demote rather
+						// than clear: the id stays the attribution anchor for anything
+						// this stream still owes (a background subagent reporting late).
+						this._fireTurnComplete(this._postDrainTurn);
+						this._postDrainTurn = { ...this._postDrainTurn, isAutonomous: false };
+					}
 					if (completed && this._queue.isEmpty) {
-						this._onDidProduceSignal.fire({
-							kind: 'action',
-							resource: this.chatChannelUri,
-							action: {
-								type: ActionType.ChatTurnComplete,
-								turnId: completed.turnId,
-								duration: Math.max(0, completed.stopWatch.elapsed()),
-							},
-						});
+						this._postDrainTurn = {
+							turnId: completed.turnId,
+							stopWatch: completed.stopWatch,
+							clientContext: completed.clientContext,
+							isAutonomous: false,
+						};
+					}
+					if (completed && !this._queue.isEmpty) {
+						const next = this._queue.peekParent();
+						if (next?.steeringMessage) {
+							// The intermediate result is the first authoritative SDK
+							// boundary where no more output belongs to the old request.
+							// Close it before replacing the pending bubble with the new
+							// persistent user turn.
+							this._fireTurnComplete(completed);
+							next.stopWatch.reset();
+							this._onDidProduceSignal.fire({
+								kind: 'action',
+								resource: this.chatChannelUri,
+								action: {
+									type: ActionType.ChatTurnStarted,
+									turnId: next.turnId,
+									startedAt: new Date().toISOString(),
+									message: next.steeringMessage.message,
+									queuedMessageId: next.steeringMessage.id,
+								},
+							});
+						}
+					} else if (completed) {
+						this._fireTurnComplete(completed);
 					}
 				}
 			}
@@ -728,12 +1003,89 @@ export class ClaudeSdkPipeline extends Disposable {
 			// not clobber the fresh one. Mark unhealthy (keep the handle for
 			// teardown); the next `send` rebinds.
 			if (this._query === query) {
+				this._backgroundTasksActive = false;
 				this._queue.failAll(fatal);
+				this._cancelAutonomousTurn();
 				this._needsRebind = true;
 			}
 			if (!isCancellationError(fatal)) {
 				throw fatal;
 			}
 		}
+	}
+
+	/**
+	 * Open a protocol turn for a top-level continuation the harness started on
+	 * its own — no user prompt, so nothing pushed the prompt queue. Follows the
+	 * steering-promotion path exactly (fresh turn id, `ChatTurnStarted` on the
+	 * signal fan-out, `ChatTurnComplete` at the closing `result`), so the turn
+	 * persists and replays through the machinery that already exists.
+	 *
+	 * No-op once such a turn is open: one continuation is one turn, however many
+	 * messages it spans.
+	 */
+	private _openAutonomousTurn(): void {
+		if (this._postDrainTurn?.isAutonomous) {
+			return;
+		}
+		const turnId = generateUuid();
+		this._postDrainTurn = {
+			turnId,
+			stopWatch: StopWatch.create(false),
+			// Carry the originating turn's telemetry context: the continuation is
+			// downstream of whatever that client asked for.
+			clientContext: this._postDrainTurn?.clientContext,
+			isAutonomous: true,
+		};
+		this._logService.info(`[Claude:${this.sessionId}] opening autonomous turn ${turnId} (prompt queue drained)`);
+		this._onDidProduceSignal.fire({
+			kind: 'action',
+			resource: this.chatChannelUri,
+			action: {
+				type: ActionType.ChatTurnStarted,
+				turnId,
+				startedAt: new Date().toISOString(),
+				message: {
+					text: localize('claude.autonomousTurn', "Claude continued on its own"),
+					origin: { kind: MessageKind.SystemNotification },
+				},
+			},
+		});
+	}
+
+	/**
+	 * Close an open autonomous turn when the stream dies before its `result`.
+	 * A queued entry surfaces that as a rejected deferred, which the agent turns
+	 * into an error on the turn; an autonomous turn has no deferred, so without
+	 * this it would run forever in the UI. Harmless to call when the client has
+	 * already cancelled — the reducer ignores the second close.
+	 */
+	private _cancelAutonomousTurn(): void {
+		const turn = this._postDrainTurn;
+		if (!turn?.isAutonomous) {
+			return;
+		}
+		this._postDrainTurn = { ...turn, isAutonomous: false };
+		this._onDidProduceSignal.fire({
+			kind: 'action',
+			resource: this.chatChannelUri,
+			action: {
+				type: ActionType.ChatTurnCancelled,
+				turnId: turn.turnId,
+				duration: Math.max(0, turn.stopWatch.elapsed()),
+			},
+		});
+	}
+
+	private _fireTurnComplete(entry: { readonly turnId: string; readonly stopWatch: StopWatch }): void {
+		this._onDidProduceSignal.fire({
+			kind: 'action',
+			resource: this.chatChannelUri,
+			action: {
+				type: ActionType.ChatTurnComplete,
+				turnId: entry.turnId,
+				duration: Math.max(0, entry.stopWatch.elapsed()),
+			},
+		});
 	}
 }

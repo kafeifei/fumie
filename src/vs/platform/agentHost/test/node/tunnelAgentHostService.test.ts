@@ -10,7 +10,7 @@ import { NullLogService } from '../../../log/common/log.js';
 import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { isTunnelGatewaySelectionRejectedError, TUNNEL_GATEWAY_SELECTION_REJECTED_ERROR_NAME } from '../../common/tunnelAgentHost.js';
-import type { ITunnelRelayClient } from '../../common/tunnelAgentHostConnector.js';
+import type { ITunnelDescriptor, ITunnelRelayClient } from '../../common/tunnelAgentHostConnector.js';
 import type { ITunnelMessageSocket } from '../../common/tunnelMessageSocket.js';
 import {
 	PendingGatewaySelection,
@@ -312,5 +312,160 @@ suite('PendingGatewaySelection', () => {
 		pending.dispose();
 		assert.strictEqual(ws.closeCalls, 1);
 		assert.strictEqual(relayClient.disposeCalls, 1);
+	});
+});
+
+/**
+ * A Dev Tunnels management client that records what it was asked for.
+ *
+ * Only the calls the listing makes are implemented; the service reaches the
+ * real SDK through one private factory, which {@link useManagementClient}
+ * replaces so no test ever touches an account.
+ */
+class FakeManagementClient {
+	readonly requests: unknown[] = [];
+
+	constructor(
+		private readonly _tunnels: readonly ITunnelDescriptor[] = [],
+		private readonly _error?: Error,
+		private readonly _limits: readonly { name?: string; current: number; limit?: number; periodSeconds?: number }[] = [],
+	) {
+	}
+
+	async listUserLimits(): Promise<readonly { name?: string; current: number; limit?: number; periodSeconds?: number }[]> {
+		if (this._error) {
+			throw this._error;
+		}
+		return this._limits;
+	}
+
+	async listTunnels(_clusterId: undefined, _domain: undefined, options: unknown): Promise<readonly ITunnelDescriptor[]> {
+		this.requests.push(options);
+		if (this._error) {
+			throw this._error;
+		}
+		return this._tunnels;
+	}
+}
+
+function useManagementClient(service: TunnelAgentHostMainService, client: FakeManagementClient): void {
+	(service as unknown as { _createManagementClient: () => Promise<FakeManagementClient> })._createManagementClient =
+		async () => client;
+}
+
+/** The tunnel Fumie opens for the mobile web client: a label of its own, and no protocol tag. */
+const MOBILE_WEB_TUNNEL: ITunnelDescriptor = {
+	tunnelId: 'mobile',
+	clusterId: 'use',
+	labels: ['fumie-mobile-web', 'mobile-abcdef0123'],
+};
+
+const AGENT_HOST_TUNNEL: ITunnelDescriptor = {
+	tunnelId: 'desktop',
+	clusterId: 'use',
+	labels: ['vscode-server-launcher', 'protocolv6'],
+};
+
+suite('TunnelAgentHostService - listUserLimits', () => {
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('reports the account allowance the service itself keeps, without its rate bookkeeping', async () => {
+		// The only place a real quota figure can come from: counting rows would
+		// miss every tunnel in another cluster or made by another client.
+		const service = new TunnelAgentHostMainService(new NullLogService());
+		try {
+			useManagementClient(service, new FakeManagementClient([], undefined, [
+				{ name: 'TunnelsPerUserPerCluster', current: 10, limit: 10, periodSeconds: 3600 },
+				{ name: 'TunnelPortsPerTunnel', current: 1 },
+			]));
+
+			assert.deepStrictEqual(await service.listUserLimits('token', 'github'), [
+				{ name: 'TunnelsPerUserPerCluster', current: 10, limit: 10 },
+				{ name: 'TunnelPortsPerTunnel', current: 1, limit: undefined },
+			]);
+		} finally {
+			service.dispose();
+		}
+	});
+
+	test('rejects rather than reporting an account with no limits', async () => {
+		const service = new TunnelAgentHostMainService(new NullLogService());
+		try {
+			useManagementClient(service, new FakeManagementClient([], new Error('limits endpoint unreachable')));
+
+			await assert.rejects(() => service.listUserLimits('token', 'github'), /limits endpoint unreachable/);
+		} finally {
+			service.dispose();
+		}
+	});
+});
+
+suite('TunnelAgentHostService - listTunnels', () => {
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('asks only for agent-host tunnels by default', async () => {
+		const service = new TunnelAgentHostMainService(new NullLogService());
+		try {
+			const client = new FakeManagementClient([AGENT_HOST_TUNNEL, MOBILE_WEB_TUNNEL]);
+			useManagementClient(service, client);
+
+			const tunnels = await service.listTunnels('token', 'github');
+
+			assert.deepStrictEqual(client.requests, [{
+				labels: ['vscode-server-launcher'],
+				requireAllLabels: true,
+				includePorts: true,
+				tokenScopes: ['connect'],
+			}]);
+			assert.deepStrictEqual(tunnels.map(tunnel => tunnel.tunnelId), ['desktop']);
+		} finally {
+			service.dispose();
+		}
+	});
+
+	test('rejects when the enumeration fails instead of reporting an empty account', async () => {
+		// Swallowing this made a network or token failure indistinguishable
+		// from an account holding nothing, which is the one answer the quota
+		// page must never give while it cannot tell.
+		const service = new TunnelAgentHostMainService(new NullLogService());
+		try {
+			useManagementClient(service, new FakeManagementClient([], new Error('tunnel service unreachable')));
+
+			await assert.rejects(
+				() => service.listTunnels('token', 'github', { includeAllTunnels: true }),
+				/tunnel service unreachable/,
+			);
+		} finally {
+			service.dispose();
+		}
+	});
+
+	test('includeAllTunnels returns a differently-labelled tunnel the cap still counts', async () => {
+		// The mobile web tunnel is exactly the case that reached
+		// 'TunnelsPerUserPerCluster' while being invisible: another label, and
+		// a protocol version below the agent-host floor.
+		const service = new TunnelAgentHostMainService(new NullLogService());
+		try {
+			const client = new FakeManagementClient([AGENT_HOST_TUNNEL, MOBILE_WEB_TUNNEL]);
+			useManagementClient(service, client);
+
+			const tunnels = await service.listTunnels('token', 'github', { includeAllTunnels: true });
+
+			assert.deepStrictEqual(client.requests, [{ includePorts: true, tokenScopes: ['connect'] }]);
+			assert.deepStrictEqual(tunnels.map(tunnel => tunnel.tunnelId), ['desktop', 'mobile']);
+			assert.deepStrictEqual(
+				tunnels.find(tunnel => tunnel.tunnelId === 'mobile'),
+				{
+					tunnelId: 'mobile',
+					clusterId: 'use',
+					name: 'fumie-mobile-web',
+					tags: ['fumie-mobile-web', 'mobile-abcdef0123'],
+					protocolVersion: 2,
+					hostConnectionCount: 0,
+				},
+			);
+		} finally {
+			service.dispose();
+		}
 	});
 });

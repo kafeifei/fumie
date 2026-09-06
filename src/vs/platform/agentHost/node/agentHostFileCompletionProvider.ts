@@ -11,7 +11,7 @@ import { basename, extUriBiasedIgnorePathCase } from '../../../base/common/resou
 import { compare } from '../../../base/common/strings.js';
 import { URI } from '../../../base/common/uri.js';
 import { ILogService } from '../../log/common/log.js';
-import { findDeepestContainingWorkingDirectory } from '../common/agentHostWorkingDirectories.js';
+import { findDeepestContainingWorkingDirectory, readCompletionsWorkingDirectoriesMeta } from '../common/agentHostWorkingDirectories.js';
 import { CompletionItem, CompletionItemKind, CompletionsParams } from '../common/state/protocol/commands.js';
 import { MessageAttachmentKind } from '../common/state/protocol/state.js';
 import { CompletionTriggerCharacter, IAgentHostCompletionItemProvider } from './agentHostCompletions.js';
@@ -103,6 +103,11 @@ class FileCompletionCandidateAccessor implements IItemAccessor<IFileCompletionCa
  * `.gitignore`), ranks them with the same fuzzy scorer used by the
  * VS Code Quick Open file picker, and returns up to {@link MAX_RESULTS}
  * matches.
+ *
+ * When the request targets a session that does not exist on the host yet (a
+ * client-local composer draft), the working directories come from the
+ * request's `_meta` instead — see
+ * {@link readCompletionsWorkingDirectoriesMeta}.
  */
 export class AgentHostFileCompletionProvider implements IAgentHostCompletionItemProvider {
 
@@ -117,7 +122,10 @@ export class AgentHostFileCompletionProvider implements IAgentHostCompletionItem
 	) { }
 
 	async provideCompletionItems(params: CompletionsParams, token: CancellationToken): Promise<readonly CompletionItem[]> {
-		const workingDirectoryStrings = this._stateManager.getSessionState(params.channel)?.workingDirectories;
+		// A composer draft has no session on the host yet, so its working
+		// directories arrive on the request's `_meta` instead of session state.
+		const workingDirectoryStrings = this._stateManager.getSessionState(params.channel)?.workingDirectories
+			?? readCompletionsWorkingDirectoriesMeta(params._meta);
 		if (!workingDirectoryStrings?.length) {
 			return [];
 		}

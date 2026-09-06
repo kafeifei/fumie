@@ -55,6 +55,7 @@ export const SessionsFocusContext = new RawContextKey<boolean>('sessionsFocus', 
 export const SessionsVisibleContext = new RawContextKey<boolean>('sessionsVisible', false, localize('sessionsVisible', "Whether the sessions part is visible"));
 export const MultipleSessionsVisibleContext = new RawContextKey<boolean>('multipleSessionsVisible', false, localize('multipleSessionsVisible', "Whether more than one session is visible in the sessions part's grid"));
 export const SessionsHasClosedItemContext = new RawContextKey<boolean>('sessionsHasClosedItem', false, localize('sessionsHasClosedItem', "Whether a chat or session was closed recently and can be reopened with the Reopen Closed Chat or Session command"));
+export const SidePaneVisibleContext = new RawContextKey<boolean>('sessionsSidePaneVisible', true, localize('sessionsSidePaneVisible', "Whether the side pane (the editor area and/or the Files/Changes detail panel) is visible. While it is hidden, the session status the title bar normally carries moves into the floating status card over the sessions area"));
 
 /**
  * Focus is inside the Agents window's editor surface: an editor part, or the

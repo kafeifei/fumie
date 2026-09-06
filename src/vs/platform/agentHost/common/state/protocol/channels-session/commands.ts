@@ -10,6 +10,7 @@ import type { URI } from '../common/state.js';
 import type { BaseParams } from '../common/commands.js';
 import type { SessionActiveClient } from './state.js';
 import type { MessageAttachment } from '../channels-chat/state.js';
+import type { ModelSelection } from '../channels-root/state.js';
 
 // ─── createSession ───────────────────────────────────────────────────────────
 
@@ -49,6 +50,23 @@ export interface CreateSessionParams extends BaseParams {
 	channel: URI;
 	/** Agent provider ID */
 	provider?: string;
+	/**
+	 * Model the session starts on. Its {@link ModelSelection.id} matches a
+	 * {@link SessionModelInfo.id} advertised by the selected provider, and
+	 * {@link ModelSelection.config} carries the values resolved against that
+	 * model's {@link SessionModelInfo.configSchema}.
+	 *
+	 * Absent means the provider picks its own default. Because the model can
+	 * decide how the provider authenticates the session — a BYOK selection
+	 * routes through the client-supplied provider, a first-party one does not —
+	 * a client that has a selection SHOULD send it here rather than relying on
+	 * the host's default, which may not be reachable with the credentials the
+	 * host holds.
+	 *
+	 * This mirrors {@link AutomationSessionTemplate.model}, which already
+	 * describes the model of a session an automation run creates.
+	 */
+	model?: ModelSelection;
 	/**
 	 * The working directories the session's agent is granted tool access to.
 	 * A session may span multiple directories; they are equal peers except when
@@ -109,6 +127,25 @@ export interface CreateSessionParams extends BaseParams {
  * @version 1
  */
 export interface DisposeSessionParams extends BaseParams { }
+
+// ─── setSessionArchived ─────────────────────────────────────────────────────
+
+/**
+ * Persists a session's archived state through its owning provider backend.
+ * The server only publishes the matching state action after this request
+ * succeeds, so clients never have to reconcile an optimistic archive.
+ *
+ * @category Commands
+ * @method setSessionArchived
+ * @direction Client → Server
+ * @messageType Request
+ * @version 1
+ */
+export interface SetSessionArchivedParams extends BaseParams {
+	isArchived: boolean;
+	/** One-shot user receipt allowing this archive to preserve Git-visible dirt. */
+	preserveChanges?: boolean;
+}
 
 // ─── fetchTurns ──────────────────────────────────────────────────────────────
 

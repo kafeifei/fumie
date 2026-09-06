@@ -22,7 +22,7 @@ import { DiffEditorInput } from '../../../../workbench/common/editor/diffEditorI
 import { IEditorService } from '../../../../workbench/services/editor/common/editorService.js';
 import { IViewsService } from '../../../../workbench/services/views/common/viewsService.js';
 import { Menus } from '../../../browser/menus.js';
-import { SessionHasChangesContext, SessionIsCreatedContext, SinglePaneDiffEditorInputActiveContext, SinglePaneLayoutEnabledContext } from '../../../common/contextkeys.js';
+import { SessionHasChangesContext, SessionIsCreatedContext, SidePaneVisibleContext, SinglePaneDiffEditorInputActiveContext, SinglePaneLayoutEnabledContext } from '../../../common/contextkeys.js';
 import { logChangesViewViewModeChange } from '../../../common/sessionsTelemetry.js';
 import { ISessionsService } from '../../../services/sessions/browser/sessionsService.js';
 import { OPEN_PULL_REQUEST_ACTION_ID } from '../../github/common/types.js';
@@ -174,22 +174,30 @@ const singlePaneDiffEditorTitleVisible = ContextKeyExpr.and(
 /** Anchor action hosting the Create Pull Request button bar in the title bar. */
 class ChangesHeaderActionsAction extends Action2 {
 	constructor() {
+		const changesHeaderActionsWhen = ContextKeyExpr.and(
+			IsSessionsWindowContext,
+			IsAuxiliaryWindowContext.toNegated(),
+			SinglePaneLayoutEnabledContext,
+			SessionIsCreatedContext,
+			SessionHasChangesContext
+		);
 		super({
 			id: CHANGES_HEADER_ACTIONS_ID,
 			title: localize2('changesView.headerActions', "Changes Actions"),
 			f1: false,
-			menu: {
+			// Follows the session status: title bar while the side pane is open,
+			// floating status card once it is hidden. Never both at once.
+			menu: [{
 				id: Menus.TitleBarSessionMenu,
 				group: 'navigation',
 				order: 5,
-				when: ContextKeyExpr.and(
-					IsSessionsWindowContext,
-					IsAuxiliaryWindowContext.toNegated(),
-					SinglePaneLayoutEnabledContext,
-					SessionIsCreatedContext,
-					SessionHasChangesContext
-				)
-			},
+				when: ContextKeyExpr.and(changesHeaderActionsWhen, SidePaneVisibleContext)
+			}, {
+				id: Menus.SidebarStatusOverlay,
+				group: 'navigation',
+				order: 5,
+				when: ContextKeyExpr.and(changesHeaderActionsWhen, SidePaneVisibleContext.negate())
+			}],
 		});
 	}
 	override async run(): Promise<void> { }

@@ -426,13 +426,15 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 	}
 
 	public getViewState(): IMultiDiffEditorViewState {
+		const currentDocStates = Object.fromEntries(this._viewItems.get().map(i => [i.getKey(), i.getViewState()]));
+		const currentActiveDiffItemKey = this._viewModel.get()?.activeDiffItem.get()?.getKey();
 		const viewState: IMultiDiffEditorViewState = {
 			scrollState: {
-				top: this.scrollTop.get(),
-				left: this.scrollLeft.get(),
+				top: this._pendingScrollState?.top ?? this.scrollTop.get(),
+				left: this._pendingScrollState?.left ?? this.scrollLeft.get(),
 			},
-			docStates: Object.fromEntries(this._viewItems.get().map(i => [i.getKey(), i.getViewState()])),
-			activeDiffItemKey: this._viewModel.get()?.activeDiffItem.get()?.getKey(),
+			docStates: { ...this._lastDocStates, ...currentDocStates },
+			activeDiffItemKey: currentActiveDiffItemKey ?? this._lastActiveDiffItemKey,
 		};
 		if (this._logger.isEnabled) {
 			const docStates = Object.values(viewState.docStates ?? {});
@@ -513,7 +515,6 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 		if (key === undefined || items.length === 0) {
 			return false;
 		}
-		this._lastActiveDiffItemKey = undefined;
 		const target = items.find(i => i.getKey() === key);
 		if (!target) {
 			if (this._logger.isEnabled) {
@@ -524,6 +525,7 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 			}
 			return false;
 		}
+		this._lastActiveDiffItemKey = undefined;
 		this._logger.log('restored active diff item', { file: target.modifiedUri ?? target.originalUri, preserveFocus: this._preserveFocusOnLoad });
 		viewModel.activeDiffItem.setCache(target, undefined);
 

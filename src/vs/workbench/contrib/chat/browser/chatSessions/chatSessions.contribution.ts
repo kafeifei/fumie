@@ -1162,8 +1162,12 @@ export class ChatSessionsService extends Disposable implements IChatSessionsServ
 					this._onDidChangeItemsProviders.fire({ chatSessionType });
 				}
 
-				// Remove any in-progress tracking for this provider since it's no longer available
-				this.updateInProgressStatus(chatSessionType);
+				// Remove any in-progress tracking for this provider since it's no
+				// longer available. Recomputing it here would report a count for a
+				// type we just unregistered, which reads as an unknown type.
+				if (this.inProgressMap.delete(chatSessionType)) {
+					this._onDidChangeInProgress.fire();
+				}
 			}
 		};
 	}

@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Limiter } from '../../../base/common/async.js';
+import { Limiter, SequencerByKey } from '../../../base/common/async.js';
 import { Disposable } from '../../../base/common/lifecycle.js';
 import { URI } from '../../../base/common/uri.js';
 import { AgentProvider } from '../common/agent.js';
@@ -28,37 +28,19 @@ export interface IStoredRegisteredSession extends Omit<IRegisteredSession, 'exte
 export type RegisteredSessionMigration = (entry: IStoredRegisteredSession) => Promise<IRegisteredSession | undefined>;
 
 /**
- * A durable, orchestrator-owned index of the sessions that exist, keyed by
- * session URI. Unlike the agents' `listSessions()` (which enumerates their own
- * SDK sessions/threads and maps them to session URIs via invariant I3), this
- * registry is authoritative on the AH side and does not depend on the agent
- * exposing a session whose SDK id equals the session id.
+ * Fumie's durable, authoritative top-level session catalog, keyed by session
+ * URI. Provider-native catalogs are inputs to source-aware discovery, but a
+ * session is visible only after it has been recorded here. A URI's provider
+ * and first-observed creation time are immutable once registered.
  *
- * Provider backfill markers are retained for compatibility/diagnostics.
- * AgentService starts native discovery at provider registration and reruns it
- * only when a provider reports a catalog/readiness change. Concurrent callers
- * in one host share a single in-flight pass per provider; concurrently running
- * host processes are outside the supported database contract.
- *
- * The legacy global marker ({@link isBackfilled} / {@link markBackfilled}) is
- * retained only for reading databases written before per-provider tracking
- * existed. `AgentService` never writes it anymore: there is no reliable
- * in-process signal for "every provider that will ever register has now
- * registered" (provider registration is asynchronous and conditionally gated
- * outside this layer), so writing it early risks a downgrade to pre-per-provider
- * code silently skipping a provider (e.g. Codex) that only registers later.
- * `markBackfilled` remains callable for tests and any explicit migration
- * tooling, but nothing in the per-provider sweep invokes it automatically.
- *
- * Sessions passed to {@link tombstone} are durably tombstoned so a forced
- * or repeated native discovery pass — which re-reads a provider's catalog from
- * scratch — cannot register them. This covers both a session the user
- * explicitly deleted and one that must never be listed at all (e.g. a
- * throwaway chat surface, tombstoned at creation). Tombstones are cleared only
- * by an explicit {@link register} of the same session URI (i.e. an explicit
- * create/restore), never by backfill itself.
+ * Restore and discovery registrations atomically respect tombstones. Explicit
+ * creation may intentionally reuse a deleted URI and therefore clears its
+ * tombstone. Legacy global and per-provider backfill markers are retained for
+ * compatibility and discovery diagnostics; they do not determine membership.
  */
 export class AgentSessionRegistry extends Disposable {
+
+	private readonly _sessionSequencer = new SequencerByKey<string>();
 
 	constructor(private readonly _database: IAgentHostDatabase) {
 		super();
@@ -66,12 +48,20 @@ export class AgentSessionRegistry extends Disposable {
 
 	/** Records a session using source-aware provenance and tombstone behavior. */
 	register(session: URI, sessionOptions: IAgentHostDatabaseSessionOptions, registerOptions: IAgentHostDatabaseRegisterOptions): Promise<boolean> {
-		return this._database.registerSession(session.toString(), sessionOptions, registerOptions);
+		const key = session.toString();
+		return this._sessionSequencer.queue(key, async () => {
+			const existing = await this._database.getSession(key);
+			if (existing && existing.provider !== sessionOptions.provider) {
+				throw new Error(`Cannot reassign session ${key} from provider ${existing.provider} to ${sessionOptions.provider}`);
+			}
+			return this._database.registerSession(key, sessionOptions, registerOptions);
+		});
 	}
 
 	/** Removes any registry entry for `session` without writing a tombstone. */
-	async unregister(session: URI): Promise<void> {
-		await this._database.unregisterSession(session.toString());
+	unregister(session: URI): Promise<void> {
+		const key = session.toString();
+		return this._sessionSequencer.queue(key, () => this._database.unregisterSession(key));
 	}
 
 	/**
@@ -81,8 +71,14 @@ export class AgentSessionRegistry extends Disposable {
 	 * be listed (e.g. a throwaway chat surface) out of the registry entirely.
 	 * No-op on the registry entry if absent; the tombstone is still written.
 	 */
-	async tombstone(session: URI): Promise<void> {
-		await this._database.tombstoneAndUnregisterSession(session.toString());
+	tombstone(session: URI): Promise<void> {
+		const key = session.toString();
+		return this._sessionSequencer.queue(key, () => this._database.tombstoneAndUnregisterSession(key));
+	}
+
+	/** Whether `session` is currently a member of the Fumie catalog. */
+	async has(session: URI): Promise<boolean> {
+		return (await this._database.getSession(session.toString())) !== undefined;
 	}
 
 	/** Every registered session URI key without running legacy metadata migration. */
@@ -110,8 +106,9 @@ export class AgentSessionRegistry extends Disposable {
 		const result = entries.map((entry, index): IRegisteredSession => {
 			const migrated = migrations[index];
 			if (migrated) {
+				this._assertMigrationPreservesIdentity(entry, migrated);
 				updates.push({
-					session: migrated.session.toString(),
+					session: entry.session.toString(),
 					external: migrated.external,
 				});
 				return migrated;
@@ -145,7 +142,8 @@ export class AgentSessionRegistry extends Disposable {
 		};
 		const migrated = await migrate?.(entry);
 		if (migrated) {
-			await this._database.updateSessionExternal([{ session: migrated.session.toString(), external: migrated.external }]);
+			this._assertMigrationPreservesIdentity(entry, migrated);
+			await this._database.updateSessionExternal([{ session: entry.session.toString(), external: migrated.external }]);
 			return migrated;
 		}
 		if (entry.external === undefined) {
@@ -171,10 +169,7 @@ export class AgentSessionRegistry extends Disposable {
 		return this._database.isSessionRegistryBackfilled();
 	}
 
-	/**
-	 * @deprecated legacy global one-shot marker; see {@link markProviderBackfilled}.
-	 * Not invoked by the per-provider backfill sweep — see the class doc comment.
-	 */
+	/** Writes the legacy global marker for explicit migration tooling. */
 	async markBackfilled(): Promise<void> {
 		await this._database.markSessionRegistryBackfilled();
 	}
@@ -194,19 +189,29 @@ export class AgentSessionRegistry extends Disposable {
 		return this._database.isSessionTombstoned(session.toString());
 	}
 
-	/** Clears an explicit-deletion tombstone for `session` (used on explicit create/restore). */
-	async clearTombstone(session: URI): Promise<void> {
-		await this._database.clearSessionTombstone(session.toString());
+	/** Clears an explicit-deletion tombstone for `session` (used on explicit create). */
+	clearTombstone(session: URI): Promise<void> {
+		const key = session.toString();
+		return this._sessionSequencer.queue(key, () => this._database.clearSessionTombstone(key));
 	}
 
 	/** Maintains the host-owned index of Agent-Merge-enabled sessions. */
-	async setAgentMergeEnabled(session: URI, enabled: boolean): Promise<void> {
-		await this._database.setSessionAgentMergeEnabled(session.toString(), enabled);
+	setAgentMergeEnabled(session: URI, enabled: boolean): Promise<void> {
+		const key = session.toString();
+		return this._sessionSequencer.queue(key, () => this._database.setSessionAgentMergeEnabled(key, enabled));
 	}
 
 	/** Session URIs the index marks Agent-Merge-enabled, without opening any session database. */
 	async listAgentMergeEnabled(): Promise<readonly URI[]> {
 		const sessions = await this._database.listAgentMergeEnabledSessions();
 		return sessions.map(session => URI.parse(session));
+	}
+
+	private _assertMigrationPreservesIdentity(stored: IStoredRegisteredSession, migrated: IRegisteredSession): void {
+		if (migrated.session.toString() !== stored.session.toString()
+			|| migrated.provider !== stored.provider
+			|| migrated.startTime !== stored.startTime) {
+			throw new Error(`Session migration cannot change the identity of ${stored.session.toString()}`);
+		}
 	}
 }

@@ -314,14 +314,14 @@ export const platformSessionSchema = createSchema({
 		description: localize('agentHost.sessionConfig.autoApproveDescription', "Tool approval behavior for this session"),
 		enum: ['default', 'assisted', 'autoApprove'],
 		enumLabels: [
-			localize('agentHost.sessionConfig.autoApprove.default', "Manual permissions"),
-			localize('agentHost.sessionConfig.autoApprove.assisted', "Assisted permissions"),
-			localize('agentHost.sessionConfig.autoApprove.bypass', "Allow all"),
+			localize('agentHost.sessionConfig.autoApprove.default', "Default Permissions"),
+			localize('agentHost.sessionConfig.autoApprove.assisted', "Auto-Review"),
+			localize('agentHost.sessionConfig.autoApprove.bypass', "Full Access"),
 		],
 		enumDescriptions: [
-			localize('agentHost.sessionConfig.autoApprove.defaultDescription', "Asks when approval settings don't apply"),
-			localize('agentHost.sessionConfig.autoApprove.assistedDescription', "Evaluates risk before running tools"),
-			localize('agentHost.sessionConfig.autoApprove.bypassDescription', "Runs tool calls without asking"),
+			localize('agentHost.sessionConfig.autoApprove.defaultDescription', "Ask when needed"),
+			localize('agentHost.sessionConfig.autoApprove.assistedDescription', "Review tool calls automatically"),
+			localize('agentHost.sessionConfig.autoApprove.bypassDescription', "Run tools without asking"),
 		],
 		default: 'default',
 		sessionMutable: true,
@@ -415,6 +415,59 @@ export const AgentHostByokModelsEnabledConfigKey = 'byokModelsEnabled';
  */
 export const AgentHostCodexEnabledConfigKey = 'codexAgentEnabled';
 
+/**
+ * Root config keys forwarded from the renderer carrying the value of the
+ * matching `chat.agentHost.<x>Agent.enabled` setting, alongside
+ * {@link AgentHostCodexEnabledConfigKey}. Every provider gated on one of these
+ * registers as soon as it turns `true`; disabling still requires an agent host
+ * restart, because nothing unregisters a provider.
+ */
+export const AgentHostClaudeEnabledConfigKey = 'claudeAgentEnabled';
+export const AgentHostKimiEnabledConfigKey = 'kimiAgentEnabled';
+export const AgentHostDeepSeekEnabledConfigKey = 'deepseekAgentEnabled';
+export const AgentHostPiEnabledConfigKey = 'piAgentEnabled';
+export const AgentHostAcpEnabledConfigKey = 'acpAgentEnabled';
+export const AgentHostOpencodeEnabledConfigKey = 'opencodeAgentEnabled';
+
+/** Root config key of a provider's register-on-enable toggle. */
+export type AgentHostProviderEnabledConfigKey =
+	| typeof AgentHostClaudeEnabledConfigKey
+	| typeof AgentHostCodexEnabledConfigKey
+	| typeof AgentHostKimiEnabledConfigKey
+	| typeof AgentHostDeepSeekEnabledConfigKey
+	| typeof AgentHostPiEnabledConfigKey
+	| typeof AgentHostAcpEnabledConfigKey
+	| typeof AgentHostOpencodeEnabledConfigKey;
+
+/**
+ * Root config key published by the host's Fumie-owned agent SDK manager:
+ * provider id → {@link IAgentSdkStatusEntry}. Clients render
+ * installing/failed agents in the agent picker instead of hiding them.
+ * Host-written; clients treat it as read-only.
+ */
+export const AgentSdkStatusConfigKey = 'agentSdkStatus';
+
+/** Readiness of one managed agent SDK. */
+export type AgentSdkState = 'installing' | 'ready' | 'failed';
+
+/** One entry of the published {@link AgentSdkStatusConfigKey} map. */
+export interface IAgentSdkStatusEntry {
+	readonly displayName: string;
+	readonly state: AgentSdkState;
+	/** Present when `state === 'failed'`: tail of the installer output. */
+	readonly error?: string;
+}
+
+/** Published {@link AgentSdkStatusConfigKey} value: provider id → readiness. */
+export type AgentSdkStatusMap = Record<string, IAgentSdkStatusEntry>;
+
+/**
+ * Root config key written by a client to re-run a failed agent SDK install.
+ * Value shape `"<nonce>:<providerId>"` — the nonce forces a config delta when
+ * the same SDK is retried repeatedly.
+ */
+export const AgentSdkRetryRequestConfigKey = 'agentSdkRetryRequest';
+
 /** Root config key carrying the effective edit auto-approve patterns. */
 export const AgentHostEditAutoApprovePatternsConfigKey = 'editAutoApprovePatterns';
 
@@ -494,15 +547,11 @@ const agentHostProxyConfigDefinition = {
 };
 export const agentHostProxyConfigSchema = createSchema(agentHostProxyConfigDefinition);
 
-/** Root config key forwarded from the renderer for active-agent title generation. */
-export const AgentHostActiveAgentTitleGenerationConfigKey = 'activeAgentTitleGeneration';
-
 /** Root config key controlling rich-link guidance for Markdown plan documents. */
 export const AgentHostMarkdownPlanRichLinksEnabledConfigKey = 'markdownPlanRichLinksEnabled';
 
 /** Root config key forwarded from the renderer for the artifact tools and their instruction. */
 export const AgentHostArtifactToolsConfigKey = 'artifactTools';
-
 // Root config key forwarded from the renderer when the `chat.agentSessions.migrateLegacyCopilotCli`
 // setting changes. When `true`, `listSessions` surfaces un-adopted extension-host Copilot CLI
 // sessions as adoptable agent-host sessions, and opening one adopts it in place. Experimental; off.
@@ -754,6 +803,42 @@ export const platformRootSchema = createSchema({
 		description: localize('agentHost.config.codexAgentEnabled.description', "Whether the Codex provider is enabled."),
 		default: false,
 	}),
+	[AgentHostClaudeEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.claudeAgentEnabled.title', "Claude Agent"),
+		description: localize('agentHost.config.claudeAgentEnabled.description', "Whether the Claude provider is enabled."),
+		default: false,
+	}),
+	[AgentHostKimiEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.kimiAgentEnabled.title', "Kimi Agent"),
+		description: localize('agentHost.config.kimiAgentEnabled.description', "Whether the Kimi provider is enabled."),
+		default: false,
+	}),
+	[AgentHostDeepSeekEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.deepseekAgentEnabled.title', "DeepSeek Agent"),
+		description: localize('agentHost.config.deepseekAgentEnabled.description', "Whether the DeepSeek provider is enabled."),
+		default: false,
+	}),
+	[AgentHostPiEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.piAgentEnabled.title', "Pi Agent"),
+		description: localize('agentHost.config.piAgentEnabled.description', "Whether the Pi provider is enabled."),
+		default: false,
+	}),
+	[AgentHostAcpEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.acpAgentEnabled.title', "ACP Agents"),
+		description: localize('agentHost.config.acpAgentEnabled.description', "Whether the Agent Client Protocol providers are enabled."),
+		default: false,
+	}),
+	[AgentHostOpencodeEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.opencodeAgentEnabled.title', "opencode Agent"),
+		description: localize('agentHost.config.opencodeAgentEnabled.description', "Whether the opencode provider is enabled."),
+		default: false,
+	}),
 	[AgentHostTerminalAutoApproveEnabledConfigKey]: schemaProperty<boolean>({
 		type: 'boolean',
 		title: localize('agentHost.config.terminalAutoApproveEnabled.title', "Terminal Auto Approve"),
@@ -789,12 +874,6 @@ export const platformRootSchema = createSchema({
 		title: localize('agentHost.config.githubMcpServerEnabled.title', "GitHub MCP Server"),
 		description: localize('agentHost.config.githubMcpServerEnabled.description', "Whether agent sessions include a GitHub MCP server by default."),
 		default: true,
-	}),
-	[AgentHostActiveAgentTitleGenerationConfigKey]: schemaProperty<boolean>({
-		type: 'boolean',
-		title: localize('agentHost.config.activeAgentTitleGeneration.title', "Active Agent Title Generation"),
-		description: localize('agentHost.config.activeAgentTitleGeneration.description', "Whether the active agent names sessions and chats with rename tools instead of utility-model title generation."),
-		default: false,
 	}),
 	[AgentHostMarkdownPlanRichLinksEnabledConfigKey]: schemaProperty<boolean>({
 		type: 'boolean',
@@ -857,6 +936,18 @@ export const platformRootSchema = createSchema({
 		description: localize('agentHost.config.mcpServers.description', "Agent-host-level MCP servers exposed to every session, keyed by server name. Each value is a server configuration (see `<serverName>`)."),
 		properties: mcpServersValueProperties,
 		default: {},
+	}),
+	[AgentSdkStatusConfigKey]: schemaProperty<Record<string, { displayName: string; state: string; error?: string }>>({
+		type: 'object',
+		title: localize('agentHost.config.agentSdkStatus.title', "Agent SDK Status"),
+		description: localize('agentHost.config.agentSdkStatus.description', "Host-published readiness of source-build agent SDKs, keyed by provider id. Read-only for clients."),
+		default: {},
+	}),
+	[AgentSdkRetryRequestConfigKey]: schemaProperty<string>({
+		type: 'string',
+		title: localize('agentHost.config.agentSdkRetryRequest.title', "Agent SDK Retry Request"),
+		description: localize('agentHost.config.agentSdkRetryRequest.description', "Client-written `\"<nonce>:<providerId>\"` request to re-run a failed agent SDK install."),
+		default: '',
 	}),
 });
 

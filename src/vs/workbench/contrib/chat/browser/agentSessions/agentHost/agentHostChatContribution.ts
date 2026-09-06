@@ -17,27 +17,30 @@ import { LOCAL_AGENT_HOST_AUTHORITY } from '../../../../../../platform/agentHost
 import { type ProtectedResourceMetadata } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
 import { type AgentInfo, type RootState } from '../../../../../../platform/agentHost/common/state/sessionState.js';
-import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID } from '../../../../../../platform/agentHost/common/agentModelSource.js';
+import { ACP_CLAUDE_AGENT_PROVIDER_ID } from '../../../../../../platform/agentHost/common/agent.js';
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { IDefaultAccountService } from '../../../../../../platform/defaultAccount/common/defaultAccount.js';
 import { IInstantiationService, ServicesAccessor } from '../../../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../../../platform/log/common/log.js';
 import { Registry } from '../../../../../../platform/registry/common/platform.js';
+import product from '../../../../../../platform/product/common/product.js';
 import { IWorkbenchContribution } from '../../../../../common/contributions.js';
 import { IAgentHostFileSystemService } from '../../../../../services/agentHost/common/agentHostFileSystemService.js';
+import '../../../../../services/agentHost/browser/codexAccountService.js';
+import { agentHostModelProviderPresentationRegistry } from '../../../../../services/agentHost/browser/agentHostModelProviderPresentation.js';
 import { IAuthenticationService } from '../../../../../services/authentication/common/authentication.js';
 import { IWorkbenchEnvironmentService } from '../../../../../services/environment/common/environmentService.js';
 import { ChatSessionsExtensions, IAsyncChatSessionActivationRegistry, IChatSessionsService, isLocalAgentHostTarget } from '../../../common/chatSessionsService.js';
 import { ChatAgentLocation } from '../../../common/constants.js';
 import { ICustomizationHarnessService } from '../../../common/customizationHarnessService.js';
 import { ILanguageModelsService } from '../../../common/languageModels.js';
-import { languageModelSourcePresentationRegistry } from '../../../common/languageModelSourcePresentation.js';
+import { registerAgentHostModelSourcePresentations } from './agentHostModelSourcePresentations.js';
 import { Target } from '../../../common/promptSyntax/promptTypes.js';
 import { AgentCustomizationItemProvider } from './agentCustomizationItemProvider.js';
 import { agentHostProviderHasBuiltInGitHubMcpServer, COPILOT_CHAT_GITHUB_MCP_COLLECTION_ID } from './agentHostLocalCustomizations.js';
 import { AgentHostDownloadProgress } from './agentHostDownloadProgress.js';
-import { authenticateProtectedResources, AgentHostAuthenticationRecovery, AgentHostAuthTokenCache, resolveAuthenticationInteractively } from './agentHostAuth.js';
-import { AgentHostLanguageModelProvider, agentHostProviderSupportsAutoModel } from './agentHostLanguageModelProvider.js';
+import { authenticateProtectedResources, AgentHostAuthenticationRecovery, AgentHostAuthTokenCache, forwardsWorkbenchCredentials, resolveAuthenticationInteractively } from './agentHostAuth.js';
+import { AgentHostLanguageModelProvider, agentHostProviderSupportsAutoModel, agentVendorModels } from './agentHostLanguageModelProvider.js';
 import { AgentHostSessionHandler } from './agentHostSessionHandler.js';
 import { AgentHostPromptCacheNotification } from './agentHostPromptCacheNotification.js';
 import { IAgentHostActiveClientService } from './agentHostActiveClientService.js';
@@ -46,13 +49,10 @@ import { AICustomizationManagementSection } from '../../../common/aiCustomizatio
 
 const LOCAL_AGENT_HOST_SESSION_TYPE_PREFIX = 'agent-host-';
 
-languageModelSourcePresentationRegistry.register({
-	ownerVendor: 'agent-host-codex',
-	sourceId: CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID,
-	label: localize('agentHostModelSource.chatGPT.label', "ChatGPT"),
-	icon: Codicon.openai,
-	description: localize('agentHostModelSource.chatGPT.description', "Models provided by your ChatGPT subscription"),
-});
+// The presentations themselves live next door, keyed by provider rather than by
+// vendor, so a remote host can put the same names on its own vendors.
+registerAgentHostModelSourcePresentations('codex', `${LOCAL_AGENT_HOST_SESSION_TYPE_PREFIX}codex`);
+registerAgentHostModelSourcePresentations(ACP_CLAUDE_AGENT_PROVIDER_ID, `${LOCAL_AGENT_HOST_SESSION_TYPE_PREFIX}${ACP_CLAUDE_AGENT_PROVIDER_ID}`);
 
 Registry.as<IAsyncChatSessionActivationRegistry>(ChatSessionsExtensions.AsyncActivation).register({
 	matchSessionType: sessionType => isLocalAgentHostTarget(sessionType),
@@ -230,6 +230,9 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 	}
 
 	private _shouldRegisterAgent(provider: AgentProvider): boolean {
+		if (product.sessionsAllowedAgentHostProviders && !product.sessionsAllowedAgentHostProviders.includes(provider)) {
+			return false;
+		}
 		return shouldSurfaceLocalAgentHostProvider(provider, this._configurationService, this._isSessionsWindow);
 	}
 
@@ -262,7 +265,7 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 			} else {
 				// Push updated models to existing model provider
 				const modelProvider = this._modelProviders.get(agent.provider);
-				modelProvider?.updateModels(agent.models);
+				modelProvider?.updateModels(agentVendorModels(agent));
 			}
 		}
 	}
@@ -356,14 +359,20 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 		// model groups (per-session provider selection) resolve their display names
 		// from the Copilot extension's pre-existing vendors, so registering them
 		// here would add nothing and risk clobbering those shared vendors on dispose.
-		const vendorDescriptor = { vendor, displayName: agent.displayName, configuration: undefined, managementCommand: undefined, when: undefined };
+		// `hiddenFromManagement`: this vendor exists to route a harness's models, not
+		// to be an entry the user manages. It has no configuration, so Manage Models
+		// could only ever render it as a row with nothing to do — and the providers
+		// worth managing (a subscription, a BYOK endpoint) list themselves.
+		const vendorDescriptor = { vendor, displayName: agent.displayName, configuration: undefined, managementCommand: undefined, when: undefined, hiddenFromManagement: true };
 		this._languageModelsService.deltaLanguageModelChatProviderDescriptors([vendorDescriptor], []);
 		store.add(toDisposable(() => this._languageModelsService.deltaLanguageModelChatProviderDescriptors([], [vendorDescriptor])));
-		const modelProvider = store.add(new AgentHostLanguageModelProvider(sessionType, vendor));
+		const presentationFactory = agentHostModelProviderPresentationRegistry.get(agent.provider);
+		const presentation = presentationFactory ? this._instantiationService.invokeFunction(presentationFactory) : undefined;
+		const modelProvider = store.add(new AgentHostLanguageModelProvider(sessionType, vendor, agent.capabilities?.modelCatalog, presentation));
 		this._modelProviders.set(agent.provider, modelProvider);
 		store.add(toDisposable(() => this._modelProviders.delete(agent.provider)));
 		store.add(this._languageModelsService.registerLanguageModelProvider(vendor, modelProvider));
-		modelProvider.updateModels(agent.models);
+		modelProvider.updateModels(agentVendorModels(agent));
 
 		// Re-authenticate when credentials change
 		store.add(this._defaultAccountService.onDidChangeDefaultAccount(() => {
@@ -387,6 +396,19 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 	 * Resolves tokens via the standard VS Code authentication service.
 	 */
 	private async _authenticateWithServer(agents: readonly AgentInfo[]): Promise<void> {
+		// The minimal Sessions product uses the providers' own credentials:
+		// Codex reads the configured provider catalog and Claude runs directly
+		// through its SDK. Do not activate VS Code authentication providers or
+		// surface an unrelated sign-in flow in this product.
+		if (!forwardsWorkbenchCredentials(product)) {
+			// LocalAgentHostService starts with authentication pending. Even though
+			// this product intentionally performs no VS Code authentication, the
+			// pending state still has to settle so draft sessions can resolve their
+			// config and eagerly create their backend session.
+			this._agentHostService.setAuthenticationPending(false);
+			return;
+		}
+
 		const generation = this._authenticationGeneration;
 		if (!this._isAuthenticationCurrent(generation)) {
 			return;

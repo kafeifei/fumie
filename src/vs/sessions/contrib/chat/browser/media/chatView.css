@@ -178,3 +178,68 @@
 .agent-sessions-workbench .interactive-session .chat-input-toolbars .chat-sessionPicker-container {
 	display: none;
 }
+
+/* Hide Copilot ChatMode (Agent/Ask/Plan) and the leftover custom-agent chip
+ * labeled "Agent". Custom agents stay in AI Customizations. Harness
+ * (Codex / Claude / Kimi / …) has its own picker in new sessions and a
+ * static label in created chats. */
+.agent-sessions-workbench .chat-mode-picker-item,
+.agent-sessions-workbench .chat-agent-picker-item {
+	display: none !important;
+}
+
+.agent-sessions-workbench .chat-input-toolbar .sessions-chat-agent-label {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 3px 4px;
+	font-size: var(--vscode-agents-fontSize-label2, 11px);
+	line-height: 16px;
+	color: var(--vscode-icon-foreground);
+	white-space: nowrap;
+	cursor: default;
+}
+
+.agent-sessions-workbench .chat-input-toolbar .actions-container > .sessions-chat-agent-item {
+	min-width: 20px;
+	flex-shrink: 1 !important;
+}
+
+.agent-sessions-workbench .chat-input-toolbar .sessions-chat-agent-label,
+.agent-sessions-workbench .chat-input-toolbar .sessions-chat-agent-name {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.agent-sessions-workbench .chat-input-toolbar .sessions-chat-agent-label > .codicon,
+.agent-sessions-workbench .chat-input-toolbar .sessions-chat-agent-icon {
+	width: 12px;
+	height: 12px;
+	font-size: 12px;
+	flex-shrink: 0;
+}
+
+/* Agent, model and execution stay inside the input. Attachments and permissions
+ * use the native secondary toolbar alongside context usage below the input. */
+.agent-sessions-workbench .interactive-session .chat-input-toolbar .actions-container {
+	gap: var(--vscode-spacing-size40);
+}
+
+.agent-sessions-workbench .interactive-session .chat-input-toolbar .actions-container > .sessions-chat-agent-item {
+	margin-left: auto;
+}
+
+.agent-sessions-workbench .interactive-session .chat-input-toolbar .actions-container:not(:has(> .sessions-chat-agent-item)) > .action-item:has(.model-picker-split) {
+	margin-left: auto;
+}
+
+.agent-sessions-workbench .interactive-session .chat-secondary-toolbar {
+	min-height: 28px;
+	margin-top: 4px;
+	align-items: center;
+}
+
+.agent-sessions-workbench .interactive-session .chat-secondary-input-toolbar .actions-container {
+	gap: var(--vscode-spacing-size40);
+}

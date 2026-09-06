@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { LazyStatefulPromise, raceTimeout } from '../../../../base/common/async.js';
+import { DeferredPromise, LazyStatefulPromise, Limiter, raceTimeout } from '../../../../base/common/async.js';
 import { BugIndicatingError, CancellationError, onUnexpectedError } from '../../../../base/common/errors.js';
 import { Event, ValueWithChangeEvent } from '../../../../base/common/event.js';
 import { IMarkdownString } from '../../../../base/common/htmlContent.js';
@@ -31,6 +31,9 @@ import { IEditorResolverService, RegisteredEditorPriority } from '../../../servi
 import { ILanguageSupport, ITextFileEditorModel, ITextFileService } from '../../../services/textfile/common/textfiles.js';
 import { MultiDiffEditorIcon } from './icons.contribution.js';
 import { IMultiDiffSourceResolverService, IResolvedMultiDiffSource, MultiDiffEditorItem } from './multiDiffSourceResolverService.js';
+
+const MAX_CONCURRENT_MODEL_RESOLVES = 4;
+const MODEL_RESOLVE_PUBLISH_BATCH = 4;
 
 export class MultiDiffEditorInput extends EditorInput implements ILanguageSupport {
 	public static fromResourceMultiDiffEditorInput(input: IResourceMultiDiffEditorInput, instantiationService: IInstantiationService): MultiDiffEditorInput {
@@ -102,7 +105,6 @@ export class MultiDiffEditorInput extends EditorInput implements ILanguageSuppor
 				}
 
 				const vm = store.add(new MultiDiffEditorViewModel(model, this._instantiationService));
-				await raceTimeout(vm.waitForDiffOr1s(), 1000);
 				if (this._store.isDisposed) {
 					throw new CancellationError();
 				}
@@ -189,8 +191,20 @@ export class MultiDiffEditorInput extends EditorInput implements ILanguageSuppor
 		target.setLanguage(languageId, source);
 	}
 
-	public async getViewModel(): Promise<MultiDiffEditorViewModel> {
-		return this._viewModel.getPromise();
+	public async getViewModel(options?: { readonly waitForDiffOr1s?: boolean }): Promise<MultiDiffEditorViewModel> {
+		const viewModel = await this._viewModel.getPromise();
+		if (options?.waitForDiffOr1s !== false) {
+			// Preserve the existing contract for generic multi-diff callers: reveal,
+			// actions, and tab metadata may address any item in the final list. The
+			// Session Changes pane opts out explicitly so it can attach immediately
+			// and render the incrementally populated prefix.
+			await viewModel.waitForComplete();
+			await raceTimeout(viewModel.waitForDiffOr1s(), 1000);
+		}
+		if (this._store.isDisposed) {
+			throw new CancellationError();
+		}
+		return viewModel;
 	}
 
 	private readonly _viewModel;
@@ -198,14 +212,38 @@ export class MultiDiffEditorInput extends EditorInput implements ILanguageSuppor
 	private async _createModel(): Promise<IMultiDiffEditorModel & IDisposable> {
 		const source = await this._resolvedSource.getPromise();
 		const textResourceConfigurationService = this._textResourceConfigurationService;
+		const modelReferenceLimiter = new Limiter<RefCounted<IDocumentDiffItem> | undefined>(MAX_CONCURRENT_MODEL_RESOLVES);
+		const pendingModelResolves = new Set<DeferredPromise<RefCounted<IDocumentDiffItem> | undefined>>();
+		const queueModelResolve = (factory: () => Promise<RefCounted<IDocumentDiffItem> | undefined>) => {
+			const result = new DeferredPromise<RefCounted<IDocumentDiffItem> | undefined>();
+			pendingModelResolves.add(result);
+			const limited = modelReferenceLimiter.queue(factory);
+			void limited.then(value => {
+				pendingModelResolves.delete(result);
+				void result.complete(value);
+			}, error => {
+				pendingModelResolves.delete(result);
+				void result.error(error);
+			});
+			return result.p;
+		};
 
-		const documentsWithPromises = mapObservableArrayCached(this, source.resources, async (r, store) => {
+		const documentsWithPromises = mapObservableArrayCached(this, source.resources, (r, store) => queueModelResolve(async () => {
 			/** @description documentsWithPromises */
+			if (store.isDisposed || this._store.isDisposed) {
+				return undefined;
+			}
+
 			let original: IReference<IResolvedTextEditorModel> | undefined;
 			let modified: IReference<IResolvedTextEditorModel> | undefined;
 
 			const multiDiffItemStore = new DisposableStore();
-			const createModelReference = async (resource: URI | undefined) => resource ? this._textModelService.createModelReference(resource) : undefined;
+			const createModelReference = async (resource: URI | undefined) => {
+				if (!resource || store.isDisposed || this._store.isDisposed) {
+					return undefined;
+				}
+				return this._textModelService.createModelReference(resource);
+			};
 
 			const [originalResult, modifiedResult] = await Promise.allSettled([
 				createModelReference(r.originalUri),
@@ -221,7 +259,7 @@ export class MultiDiffEditorInput extends EditorInput implements ILanguageSuppor
 				if (modified) { multiDiffItemStore.add(modified); }
 			}
 
-			if (store.isDisposed) {
+			if (store.isDisposed || this._store.isDisposed) {
 				multiDiffItemStore.dispose();
 				return undefined;
 			}
@@ -259,24 +297,73 @@ export class MultiDiffEditorInput extends EditorInput implements ILanguageSuppor
 				}),
 			};
 			return store.add(RefCounted.createOfNonDisposable(result, multiDiffItemStore, this));
-		}, i => JSON.stringify([i.modifiedUri?.toString(), i.originalUri?.toString()]));
+		}), i => JSON.stringify([i.modifiedUri?.toString(), i.originalUri?.toString()]));
 
 		const documents = observableValue<readonly RefCounted<IDocumentDiffItem>[] | 'loading'>('documents', 'loading');
+		const isComplete = observableValue('isComplete', false);
+		let updateGeneration = 0;
+		let isDisposed = false;
 
 		const updateDocuments = derived(async reader => {
 			/** @description Update documents */
 			const docsPromises = documentsWithPromises.read(reader);
-			const docs = await Promise.all(docsPromises);
-			const newDocuments = docs.filter(isDefined);
-			documents.set(newDocuments, undefined);
+			const generation = ++updateGeneration;
+			isComplete.set(false, undefined);
+			if (docsPromises.length === 0) {
+				documents.set([], undefined);
+				isComplete.set(true, undefined);
+				return;
+			}
+
+			const docs: (RefCounted<IDocumentDiffItem> | undefined)[] = new Array(docsPromises.length);
+			const settled = new Array<boolean>(docsPromises.length).fill(false);
+			let completed = 0;
+			let contiguousSettled = 0;
+			let lastPublishedThrough = 0;
+			const publish = () => {
+				if (isDisposed || generation !== updateGeneration || contiguousSettled === lastPublishedThrough) {
+					return;
+				}
+				lastPublishedThrough = contiguousSettled;
+				documents.set(docs.slice(0, contiguousSettled).filter(isDefined), undefined);
+			};
+
+			await Promise.all(docsPromises.map(async (promise, index) => {
+				const doc = await promise;
+				if (isDisposed || generation !== updateGeneration) {
+					return;
+				}
+				docs[index] = doc;
+				settled[index] = true;
+				completed++;
+				while (settled[contiguousSettled]) {
+					contiguousSettled++;
+				}
+				if (contiguousSettled - lastPublishedThrough >= MODEL_RESOLVE_PUBLISH_BATCH || completed === docsPromises.length) {
+					publish();
+				}
+			}));
+			publish();
+			if (!isDisposed && generation === updateGeneration) {
+				isComplete.set(true, undefined);
+			}
 		});
 
 		const a = recomputeInitiallyAndOnChange(updateDocuments);
-		await updateDocuments.get();
 
 		const result: IMultiDiffEditorModel & IDisposable = {
-			dispose: () => a.dispose(),
+			dispose: () => {
+				isDisposed = true;
+				updateGeneration++;
+				for (const pending of pendingModelResolves) {
+					void pending.complete(undefined);
+				}
+				pendingModelResolves.clear();
+				modelReferenceLimiter.dispose();
+				a.dispose();
+			},
 			documents: new ValueWithChangeEventFromObservable(documents),
+			isComplete: new ValueWithChangeEventFromObservable(isComplete),
 			contextKeys: source.source?.contextKeys,
 		};
 		return result;

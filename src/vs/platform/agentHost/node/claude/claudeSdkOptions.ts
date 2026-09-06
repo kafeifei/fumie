@@ -15,11 +15,13 @@ import { resolveClaudeEffort } from '../../common/claudeModelConfig.js';
 import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
 import type { ModelSelection } from '../../common/state/protocol/state.js';
 import { IClaudeAgentSdkService } from './claudeAgentSdkService.js';
+import { ClaudeConfigDirEnvVar, ClaudeSecureStorageConfigDirEnvVar } from './claudeBackingStore.js';
 import { buildClientToolMcpServer } from './clientTools/claudeClientToolMcpServer.js';
 import { toClaudeSdkModelId } from './claudeModelSelection.js';
 import type { IAgentHostNativeOTelConfig, IAgentHostTraceContext } from '../../common/otel/agentHostOTelService.js';
 import type { ClaudeTransport } from './claudeProxyService.js';
 import { SessionClientToolsDiff } from './clientTools/claudeSessionClientToolsModel.js';
+import { withoutModelProviderEnvironment } from '../modelProviderEnvironment.js';
 import { McpServerType } from '../../../mcp/common/mcpPlatformTypes.js';
 import type { IMcpServerDefinition } from '../../../agentPlugins/common/pluginParsers.js';
 import { isEqual } from '../../../../base/common/resources.js';
@@ -42,6 +44,17 @@ export type ClaudeDeniedMcpServerSpec =
 export interface IBuildOptionsInput {
 	readonly sessionId: string;
 	readonly workingDirectory: URI;
+	/**
+	 * Fumie's Claude transcript namespace. Both halves are required and are
+	 * deliberately not defaulted here: `configDir` decides where the
+	 * subprocess writes its JSONL, `sessionStore` decides what Fumie reads
+	 * back, and setting only one would leave transcripts in the user's own
+	 * `~/.claude` (the SDK's store is a mirror, not a relocation).
+	 */
+	readonly store: {
+		readonly sessionStore: NonNullable<Options['sessionStore']>;
+		readonly configDir: string;
+	};
 	/**
 	 * Additional directories (index 1..N of the session's ordered set) the agent
 	 * is granted tool access to beyond the primary {@link workingDirectory}
@@ -97,6 +110,44 @@ export interface IBuildOptionsInput {
 	readonly telemetry?: IAgentHostNativeOTelConfig;
 	readonly traceContext?: IAgentHostTraceContext;
 	readonly getUserPromptAdditionalContext?: () => string | undefined;
+	/**
+	 * Session-constant host briefing appended to the `claude_code` system-prompt
+	 * preset (`composeSessionHostContext`). Rides the SDK options rather than the
+	 * per-turn {@link getUserPromptAdditionalContext} channel so it reaches the
+	 * model exactly once per session and never persists into the transcript.
+	 * Omitted → bare preset.
+	 */
+	readonly systemPromptAppend?: string;
+	/**
+	 * The user's global `~/.claude/CLAUDE.md`, verbatim
+	 * (`ClaudeBackingStore.readGlobalClaudeMd`). Consumed **only** under the
+	 * native transport, which pins `settingSources: []` below and therefore
+	 * loads no instruction file from disk — the system-prompt append is the
+	 * only channel those sessions have left. Ignored under `byok` / `proxy`,
+	 * which already load the same file through the `user` setting source; the
+	 * transport check lives here rather than at the call sites so passing it
+	 * unconditionally can never double-inject.
+	 */
+	readonly globalClaudeMd?: string;
+}
+
+/** Tells the model where the appended global instructions came from. */
+const GlobalInstructionsHeading = '# User global instructions (~/.claude/CLAUDE.md)';
+
+/**
+ * Route a Claude subprocess's config root at Fumie's own namespace instead of
+ * the user's `~/.claude`. Every Fumie-spawned query needs this, not just the
+ * ones that run a turn: the CLI reads *and writes* `$CLAUDE_CONFIG_DIR`'s
+ * `.claude.json` (cached usage utilization, and other per-install state) even
+ * for a query that only answers control requests, so leaving it unset mutates
+ * a user file and can read a different account's state than Fumie's own.
+ *
+ * Moving the config dir must not move the credential store with it: see
+ * {@link ClaudeSecureStorageConfigDirEnvVar}.
+ */
+function applyClaudeConfigDirEnv(env: Record<string, string | undefined>, configDir: string): void {
+	env[ClaudeConfigDirEnvVar] = configDir;
+	env[ClaudeSecureStorageConfigDirEnvVar] = '';
 }
 
 /**
@@ -105,8 +156,8 @@ export interface IBuildOptionsInput {
  *   1. `process.env.PATH` (composed into `Options.settings.env.PATH`
  *      so ripgrep wins over any system install),
  *   2. `process.env` keys via {@link buildSubprocessEnv} (used to
- *      strip `VSCODE_*` / `ELECTRON_*` / `NODE_OPTIONS` /
- *      `ANTHROPIC_API_KEY` from the spawn env),
+ *      strip `VSCODE_*` / `ELECTRON_*` / `NODE_OPTIONS` and ambient
+ *      model-provider configuration from the spawn env),
  *   3. the memoized `rgDiskPath()` lookup.
  * The returned options carry the caller-supplied `abortController` so a
  * racing dispose unwinds `sdk.startup()` cleanly.
@@ -120,18 +171,45 @@ export async function buildOptions(
 	transport: ClaudeTransport,
 	logStderr: (data: string) => void,
 ): Promise<Options> {
-	const isProxy = transport.kind === 'proxy';
-	const subprocessEnv = buildSubprocessEnv(isProxy);
+	// Native keeps the user's non-provider runtime environment (PATH, HOME, shell
+	// tools); both routed transports supply every credential themselves and take
+	// the sparse env. Provider variables are scrubbed in every mode.
+	const subprocessEnv = buildSubprocessEnv(transport.kind !== 'native');
 	const telemetryEnv = buildClaudeTelemetryEnv(input.telemetry, input.traceContext);
 	Object.assign(subprocessEnv, telemetryEnv);
+	// Fumie's sessions never land in the user's own Claude store. The SDK
+	// session store below is a mirror — the subprocess still writes JSONL under
+	// whatever `$CLAUDE_CONFIG_DIR` it sees — so the root has to move here too.
+	applyClaudeConfigDirEnv(subprocessEnv, input.store.configDir);
+	if (transport.kind === 'byok') {
+		// Pin the BYOK loopback proxy as the session's *only* credential: the CLI
+		// otherwise prefers its own stored login (macOS Keychain
+		// `Claude Code-credentials` from `claude /login`, or
+		// `CLAUDE_CODE_OAUTH_TOKEN`) over an inherited `ANTHROPIC_API_KEY` and
+		// sends that OAuth token upstream, which the proxy rejects (its nonce is
+		// what authenticates) — observed against a gateway even with
+		// `ANTHROPIC_AUTH_TOKEN` set. `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`
+		// (cc >= 2.1.198) is the flag that stops it: the CLI then reads *no*
+		// local credential (Keychain, `apiKeyHelper`, `/login` key) and the host
+		// owns the provider. It also strips the provider variables
+		// (`ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`)
+		// from *settings-sourced* env, so the endpoint and token must be handed
+		// in through the spawn env here — putting them in `settings.env` below
+		// would leave the CLI with no credential at all ("Not logged in").
+		subprocessEnv['ANTHROPIC_BASE_URL'] = transport.baseUrl;
+		subprocessEnv['ANTHROPIC_AUTH_TOKEN'] = `${transport.nonce}.${input.sessionId}`;
+		subprocessEnv['CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'] = '1';
+		subprocessEnv['ANTHROPIC_API_KEY'] = undefined;
+		subprocessEnv['CLAUDE_CODE_OAUTH_TOKEN'] = undefined;
+	}
 	const resolvedRgDiskPath = await rgDiskPath();
 	const settingsEnv: Record<string, string> = {
 		...telemetryEnv,
 		// Proxied (Copilot-routed) mode points the SDK at the local proxy on a
-		// per-session bearer. Native (BYO-Anthropic) mode omits both so the SDK
-		// uses its own credential resolution from the subprocess env
-		// (`ANTHROPIC_API_KEY`, or `CLAUDE_CODE_OAUTH_TOKEN` from `claude
-		// setup-token` — both forwarded by `buildSubprocessEnv`).
+		// per-session bearer. The other two never set provider variables here:
+		// BYOK carries them on the spawn env above (the host-managed-provider flag
+		// strips settings-sourced ones), while native relies only on the SDK-owned
+		// first-party login (for example the macOS Keychain entry).
 		...(transport.kind === 'proxy'
 			? {
 				ANTHROPIC_BASE_URL: transport.handle.baseUrl,
@@ -149,6 +227,16 @@ export async function buildOptions(
 		PATH: `${dirname(resolvedRgDiskPath)}${delimiter}${process.env.PATH ?? ''}`,
 	};
 
+	// The host briefing first, then the user's own global instructions — see
+	// {@link IBuildOptionsInput.globalClaudeMd} for why only native gets the
+	// second half.
+	const systemPromptAppend = [
+		input.systemPromptAppend,
+		transport.kind === 'native' && input.globalClaudeMd
+			? `${GlobalInstructionsHeading}\n${input.globalClaudeMd}`
+			: undefined,
+	].filter((part): part is string => part !== undefined && part.length > 0).join('\n\n');
+
 	return {
 		cwd: input.workingDirectory.fsPath,
 		...(input.additionalDirectories && input.additionalDirectories.length > 0
@@ -156,6 +244,20 @@ export async function buildOptions(
 			: {}),
 		executable: process.execPath as 'node',
 		env: subprocessEnv,
+		// Fumie's authoritative copy. Read back per call, so no SDK read has to
+		// flip a process-level `$CLAUDE_CONFIG_DIR` and race a concurrent one.
+		sessionStore: input.store.sessionStore,
+		// Flush transcript entries to the store as they are produced instead of
+		// batching them to the end of the turn (the SDK default). Fumie rebuilds
+		// a session by tearing the subprocess down and resuming a NEW one out of
+		// this store, so anything the dying process has not flushed yet is
+		// context the resumed session never sees — a turn that answers nothing,
+		// or a session that has forgotten the conversation. `ClaudeSdkPipeline`
+		// closes that window by awaiting the old subprocess's exit before it
+		// materializes the replacement; eager flushing is the second line of
+		// defence, and it is the only one that covers a host or subprocess that
+		// dies without getting to run its shutdown at all.
+		sessionStoreFlush: 'eager',
 		abortController: input.abortController,
 		allowDangerouslySkipPermissions: true,
 		canUseTool: input.canUseTool,
@@ -163,7 +265,15 @@ export async function buildOptions(
 		disallowedTools: ['WebSearch'],
 		includePartialMessages: true,
 		forwardSubagentText: true,
-		enableFileCheckpointing: true,
+		// `enableFileCheckpointing` is deliberately absent: the SDK rejects it
+		// outright alongside `sessionStore` ("backup blobs are not mirrored, so
+		// rewindFiles() fails after a store-backed resume"), and every Fumie
+		// session now carries a store, so setting it fails startup for all of
+		// them. Nothing is lost: Fumie never calls `rewindFiles`, and file-edit
+		// before/after content comes from {@link ClaudeFileEditObserver}
+		// snapshotting the disk off the message stream, not from SDK
+		// checkpoints. Restore it only if the SDK lifts the restriction AND a
+		// caller actually needs `rewindFiles`.
 		model: toClaudeSdkModelId(input.model),
 		effort: resolveClaudeEffort(input.model),
 		permissionMode: input.permissionMode,
@@ -176,14 +286,22 @@ export async function buildOptions(
 			? { plugins: input.plugins.map(plugin => ({ type: 'local' as const, path: plugin.uri.fsPath, skipMcpDiscovery: plugin.skipMcpDiscovery })) }
 			: {}),
 		...(input.agent ? { agent: input.agent } : {}),
-		settingSources: ['user', 'project', 'local'],
+		// Official native Claude uses only its first-party login. User/project
+		// settings may contain provider env and cannot participate in Fumie model
+		// routing. Routed modes keep non-provider settings; BYOK additionally
+		// enables the SDK's host-managed-provider isolation flag above.
+		settingSources: transport.kind === 'native' ? [] : ['user', 'project', 'local'],
 		settings: {
 			env: settingsEnv,
 			...(input.deniedMcpServers?.length
 				? { deniedMcpServers: [...input.deniedMcpServers] }
 				: {}),
 		},
-		systemPrompt: { type: 'preset', preset: 'claude_code' },
+		systemPrompt: {
+			type: 'preset',
+			preset: 'claude_code',
+			...(systemPromptAppend ? { append: systemPromptAppend } : {}),
+		},
 		...(input.getUserPromptAdditionalContext ? {
 			hooks: {
 				UserPromptSubmit: [{
@@ -263,24 +381,38 @@ export function toClaudeMcpServers(
 /**
  * Build a minimal {@link Options} bag for an ephemeral model-enumeration
  * query (Phase 19, native transport). No workspace (`cwd = os.tmpdir()`), no
- * proxy env, and the user's `ANTHROPIC_API_KEY` preserved so the SDK can
- * authenticate. Reads the user's real `~/.claude` config so subscription
- * models (e.g. Opus) surface; verified not to write any session transcript
- * because the enumeration never iterates a turn. The caller (`_fetchNativeModels`)
- * aborts the returned `abortController` during teardown, alongside `query.close()`.
+ * provider environment, and no user/project/local setting sources: only the
+ * SDK-owned first-party login may authorize the subscription catalog. Verified
+ * not to write any session transcript because the enumeration never iterates a
+ * turn. The caller (`_fetchNativeModels`) aborts the returned `abortController`
+ * during teardown, alongside `query.close()`.
+ *
+ * `configDir` is `IClaudeBackingStore.subprocessConfigDir`, the same root a
+ * session gets: the query still reads and writes `.claude.json` there (see
+ * {@link applyClaudeConfigDirEnv}), and without it the enumeration would touch
+ * the user's own `~/.claude`.
+ *
+ * Unlike {@link buildOptions}, this deliberately does NOT set
+ * `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: that flag makes the CLI skip its
+ * `GET /api/oauth/usage` fetch entirely, and the usage snapshot this query
+ * collects alongside the catalog (`usage_EXPERIMENTAL…`) is exactly what that
+ * fetch produces. With the flag set the response still reports
+ * `rate_limits_available: true` — a plan predicate, not a data-presence one —
+ * but carries `rate_limits: null`, so the account panel silently loses every
+ * window. Real sessions keep the flag; their rate-limit data arrives on the
+ * server-pushed `rate_limit_event` stream during a turn, not from this
+ * endpoint.
  */
-export function buildModelEnumerationOptions(): Options {
+export function buildModelEnumerationOptions(configDir: string): Options {
+	const env = buildSubprocessEnv(false);
+	applyClaudeConfigDirEnv(env, configDir);
 	return {
 		cwd: tmpdir(),
 		executable: process.execPath as 'node',
-		env: buildSubprocessEnv(false),
+		env,
 		abortController: new AbortController(),
+		settingSources: [],
 		systemPrompt: { type: 'preset', preset: 'claude_code' },
-		settings: {
-			env: {
-				CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-			},
-		},
 	};
 }
 
@@ -300,11 +432,10 @@ export function buildModelEnumerationOptions(): Options {
  *   must not leak to the Copilot proxy (stripped). `PATH` for ripgrep is
  *   supplied through `settings.env`, not here.
  *
- * - **Native (BYO-Anthropic), `false`:** inherit the real `process.env` so the
- *   user's own credentials (`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`,
- *   or `ANTHROPIC_API_KEY`) and `PATH` actually reach the `claude` subprocess.
- *   Without this spread, replace semantics wipe the inherited token and the CLI
- *   reports "Not logged in".
+ * - **Native (first-party login), `false`:** inherit the non-provider portion of
+ *   `process.env` so `PATH`, `HOME`, and normal tool configuration reach the
+ *   subprocess, while every ambient model-provider variable is removed. Native
+ *   authentication remains SDK-owned (for example its Keychain login).
  *
  * In both modes the agent host's own `NODE_OPTIONS`, `ELECTRON_*`, and
  * `VSCODE_*` variables are stripped (they break the Electron-node subprocess),
@@ -375,10 +506,10 @@ function resolveSignalEndpoint(endpoint: string, signal: 'logs' | 'metrics', pro
 }
 
 export function buildSubprocessEnv(proxied: boolean = true): Record<string, string | undefined> {
-	// Proxy mode: a sparse env (creds arrive via settings.env), and the user's
-	// personal ANTHROPIC_API_KEY must not leak to the Copilot proxy.
-	// Native mode: inherit the real env so the user's own credentials + PATH
-	// reach the subprocess (replace semantics wipe anything not present here).
+	// Proxy mode: a sparse env (creds arrive via settings.env), and ambient
+	// provider configuration must not leak to the Copilot proxy.
+	// Native mode: retain the ordinary runtime env (including PATH) but strip all
+	// provider variables; first-party authentication remains owned by the SDK.
 	const env: Record<string, string | undefined> = proxied
 		? {
 			ELECTRON_RUN_AS_NODE: '1',
@@ -389,7 +520,7 @@ export function buildSubprocessEnv(proxied: boolean = true): Record<string, stri
 			// Load rules from additional directories https://code.claude.com/docs/en/memory#load-from-additional-directories
 			CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1'
 		}
-		: { ...process.env, ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: undefined };
+		: { ...withoutModelProviderEnvironment(process.env), ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: undefined };
 	// Replace semantics mean the sparse (proxied) env would otherwise drop the
 	// agent host's own marker, so set it in both modes. See `AiAgentEnvVar`.
 	env[AiAgentEnvVar] = AiAgentEnvValue;

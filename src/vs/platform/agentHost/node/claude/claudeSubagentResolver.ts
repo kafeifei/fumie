@@ -14,6 +14,7 @@ import {
 	type Turn,
 } from '../../common/state/protocol/state.js';
 import { IClaudeAgentSdkService } from './claudeAgentSdkService.js';
+import type { IClaudeStoreRouting } from './claudeBackingStore.js';
 import { mapSessionMessagesToTurns } from './claudeReplayMapper.js';
 import { scanTranscriptForAgentIds, SUBAGENT_TOOL_NAMES, type SubagentRegistry } from './claudeSubagentRegistry.js';
 
@@ -36,6 +37,14 @@ export interface ISubagentLookupContext {
 	readonly parentSessionId: string;
 	/** Pre-fetched parent transcript when available; otherwise the strategy must fetch its own. */
 	readonly parentTranscript?: readonly Turn[];
+	/**
+	 * Addresses the store that holds the parent's transcript, and with it the
+	 * subagent rows filed under it. Required rather than optional: Fumie's own
+	 * store is keyed by project, so a read that omits it does not fall back to
+	 * a wider search — it finds nothing, and every strategy here reads as
+	 * "this subagent has no transcript".
+	 */
+	readonly routing: IClaudeStoreRouting;
 	readonly token: CancellationToken;
 }
 
@@ -77,7 +86,7 @@ export async function fetchParentTurns(
 		return ctx.parentTranscript;
 	}
 	try {
-		const messages = await sdk.getSessionMessages(ctx.parentSessionId, { includeSystemMessages: true });
+		const messages = await sdk.getSessionMessages(ctx.parentSessionId, { includeSystemMessages: true, ...ctx.routing });
 		return mapSessionMessagesToTurns(messages, ctx.parentUri, logService);
 	} catch (err) {
 		logService.warn(`[claudeSubagentResolver] ${strategyLabel}: parent transcript fetch failed: ${err}`);
@@ -132,7 +141,7 @@ export class PromptMatchStrategy implements ISubagentLookupStrategy {
 
 		let agentIds: readonly string[];
 		try {
-			agentIds = await this._sdk.listSubagents(ctx.parentSessionId);
+			agentIds = await this._sdk.listSubagents(ctx.parentSessionId, ctx.routing);
 		} catch (err) {
 			this._logService.warn(`[claudeSubagentResolver] PromptMatch: listSubagents failed: ${err}`);
 			return undefined;
@@ -143,7 +152,7 @@ export class PromptMatchStrategy implements ISubagentLookupStrategy {
 			}
 			let messages;
 			try {
-				messages = await this._sdk.getSubagentMessages(ctx.parentSessionId, agentId);
+				messages = await this._sdk.getSubagentMessages(ctx.parentSessionId, agentId, ctx.routing);
 			} catch (err) {
 				this._logService.warn(`[claudeSubagentResolver] PromptMatch: getSubagentMessages(${agentId}) failed: ${err}`);
 				continue;
@@ -226,7 +235,7 @@ export class ResultMatchStrategy implements ISubagentLookupStrategy {
 		}
 		let agentIds: readonly string[];
 		try {
-			agentIds = await this._sdk.listSubagents(ctx.parentSessionId);
+			agentIds = await this._sdk.listSubagents(ctx.parentSessionId, ctx.routing);
 		} catch (err) {
 			this._logService.warn(`[claudeSubagentResolver] ResultMatch: listSubagents failed: ${err}`);
 			return undefined;
@@ -237,7 +246,7 @@ export class ResultMatchStrategy implements ISubagentLookupStrategy {
 				return undefined;
 			}
 			try {
-				const messages = await this._sdk.getSubagentMessages(ctx.parentSessionId, agentId);
+				const messages = await this._sdk.getSubagentMessages(ctx.parentSessionId, agentId, ctx.routing);
 				if (extractLastAssistantText(messages)?.trim() === expected.trim()) {
 					if (matchedAgentId) {
 						return undefined;
@@ -410,6 +419,7 @@ export async function getSubagentTranscript(
 	subagentUri: URI,
 	parentUri: URI,
 	parentSessionId: string,
+	routing: IClaudeStoreRouting,
 	toolCallId: string,
 	parentRegistry: SubagentRegistry,
 	sdk: IClaudeAgentSdkService,
@@ -419,6 +429,7 @@ export async function getSubagentTranscript(
 	const agentId = await resolveAgentIdViaChain(toolCallId, {
 		parentUri,
 		parentSessionId,
+		routing,
 		token,
 	}, {
 		strategies: buildDefaultStrategies(sdk, logService),
@@ -430,7 +441,7 @@ export async function getSubagentTranscript(
 	}
 	let messages;
 	try {
-		messages = await sdk.getSubagentMessages(parentSessionId, agentId);
+		messages = await sdk.getSubagentMessages(parentSessionId, agentId, routing);
 	} catch (err) {
 		logService.warn(`[getSubagentTranscript] getSubagentMessages(${agentId}) failed: ${err}`);
 		return [];
