@@ -25,8 +25,8 @@ before the existing `gulp vscode-<platform>-<arch>-min-ci` step:
 ```
 
 The template runs `node build/agent-sdk/produce.ts --vscode-platform=<x>
---arch=$(VSCODE_ARCH)`, which iterates the SDKs (`SDKS = ['claude',
-'codex']`), figures out the matching `sdkTarget` for `(vscode-platform,
+--arch=$(VSCODE_ARCH)`, which discovers every folder under `agents/`,
+figures out the matching `sdkTarget` for `(vscode-platform,
 arch, sdk)` via `getSdkTargetForBuild`, runs `buildOne` for each in
 parallel, and drops the tarballs in
 `$(Build.SourcesDirectory)/.build/agent-sdk/tarballs/`.
@@ -87,10 +87,11 @@ gulp graph. As its own pipeline step:
 
 ## Files
 
-- `agents/<sdk>/` — one folder per SDK we ship. Each contains a
-  `package.json` (single dependency: the SDK's own npm package, pinned
-  to an exact version) and a `package-lock.json` (full transitive
-  graph). Folder name = SDK id = key under `product.agentSdks` = path
+- `agents/<sdk>/` — one folder per SDK we ship. Public npm SDKs contain a
+  `package.json` with one exact dependency and a `package-lock.json` for the
+  transitive graph. Private SDKs declare `agentSdkSource` with an exact
+  repository commit, package-manager version, and Node target; the upstream
+  frozen lockfile is used during the source build. Folder name = SDK id = key under `product.agentSdks` = path
   segment in the CDN URL. The set of folders IS the SDK list — no
   parallel array to keep in sync.
 - `common.ts` — types, `getSdks()` (discovers SDKs from `agents/`),
@@ -99,11 +100,12 @@ gulp graph. As its own pipeline step:
   arch, sdk) → npm-suffix`), `buildCdnUrl()` / `buildCdnUrlTemplate()`,
   `sha256OfFile()`, `parseFlags()` for CLI flag parsing, and
   `readAgentSdkResults()` for the gulpfile-side reader.
-- `package.ts` — `buildOne({ sdk, sdkTarget, outDir })`. Runs on any
-  OS: copies `agents/<sdk>/{package.json,package-lock.json}` into a
-  scratch dir, `npm ci` with `npm_config_libc/os/cpu` fetches the
-  foreign platform binary verbatim from the locked graph, then
+- `package.ts` — `buildOne({ sdk, sdkTarget, outDir })`. Dispatches to the
+  exact npm-lock or source-build acquisition strategy, then runs
   node-tar+gzip with reproducible flags. Has a thin CLI at bottom.
+- `kimiSource.ts` — Kimi's source-build strategy. Fetches the exact commit,
+  validates the private SDK version and pnpm pin, installs the frozen upstream
+  graph without lifecycle scripts, and produces a self-contained ESM bundle.
 - `upload.ts` — `uploadOne(...)`. HEAD-then-decide: absent → upload;
   matching sha → skip (idempotent re-runs); different / no-metadata sha
   → fail loud, refusing to overwrite content-addressed history. Thin CLI.
@@ -114,6 +116,8 @@ gulp graph. As its own pipeline step:
 
 ## Bumping an SDK version
 
+For an npm SDK:
+
 1. Edit the `dependencies` version in `build/agent-sdk/agents/<sdk>/package.json`
    to the new exact version.
 2. From that directory: `npm install --package-lock-only --ignore-scripts`
@@ -123,6 +127,11 @@ gulp graph. As its own pipeline step:
    shipped types and the build-time pin stay in lockstep.
 4. `npm install` at repo root to refresh the root lockfile.
 5. Commit all four edits together.
+
+For Kimi, update the SDK `version`, full `commit`, and exact `packageManager`
+in `agents/kimi/package.json` together. Confirm those values against the
+upstream `packages/node-sdk/package.json` and root `package.json`, then build
+the same target twice and verify identical tarball SHA-256 values before upload.
 
 The `test/versionSync.test.ts` build test (run by `cd build && npm run
 test` in PR CI) enforces step 3: it fails if an SDK's `agents/<sdk>`
@@ -143,12 +152,39 @@ Build one tarball locally:
 node build/agent-sdk/package.ts --sdk=claude --target=darwin-arm64 --out=/tmp/out
 ```
 
-For OSS contributors who want to drive the agent host without going
-through the CDN, point the dev override env vars at a local SDK install:
+Some agent SDKs are source-built rather than downloaded from a public package
+registry. In source builds the agent host's SDK manager installs the pinned
+upstream source into the shared per-agent layout; manual (re)builds use:
 
 ```sh
-VSCODE_AGENT_HOST_CLAUDE_SDK_ROOT=/path/to/anthropic-claude-sdk-install \
+npm run install-kimi-sdk
+# node build/agent-sdk/package.ts --sdk=kimi --install-dir=build/agent-sdk/agents/kimi
+```
+
+Default dest: `build/agent-sdk/agents/kimi` (the `node_modules` and pin stamp
+are gitignored). Use the provider's documented local SDK-root override when
+working with a source-built SDK.
+Do not install under `/tmp`. Do not commit the built tree.
+
+For local development without a downloaded SDK artifact, point the development
+override at a local SDK install:
+
+```sh
+VSCODE_AGENT_HOST_CLAUDE_SDK_ROOT=/path/to/local-sdk-install \
   ./scripts/code.sh
 ```
 
-(See `src/vs/platform/agentHost/common/agentService.ts` for env var names.)
+Other source-built providers use the same SDK-root shape and are opt-in. Their
+model and authentication settings come from the normal provider catalog; this
+document intentionally does not describe any organization-specific inference
+service or credential contract:
+
+```sh
+VSCODE_AGENT_HOST_KIMI_AGENT_ENABLED=true \
+VSCODE_AGENT_HOST_KIMI_SDK_ROOT=/path/to/kimi-sdk-root \
+  ./scripts/code.sh
+```
+
+(See `src/vs/platform/agentHost/common/agentService.ts` and
+`src/vs/platform/agentHost/node/kimi/README.md` for the complete local launch
+contract and secret-isolation guidance.)

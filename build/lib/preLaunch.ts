@@ -58,8 +58,27 @@ async function isExpectedElectronInstalled(): Promise<boolean> {
 }
 
 async function ensureCompiled() {
-	if (!(await exists('out'))) {
-		await runProcess(npm, ['run', 'compile']);
+	const requiredOutput = [
+		'out/vs/code/electron-main/main.js',
+		'out/vs/base/browser/ui/codicons/codicon/codicon.ttf',
+	];
+	const missingOutput: string[] = [];
+	for (const output of requiredOutput) {
+		if (!(await exists(output))) {
+			missingOutput.push(output);
+		}
+	}
+
+	if (missingOutput.length === 0) {
+		return;
+	}
+
+	await runProcess(npm, ['run', await exists('out') ? 'transpile-client' : 'compile']);
+
+	for (const output of requiredOutput) {
+		if (!(await exists(output))) {
+			throw new Error(`Compilation completed without required output: ${output}`);
+		}
 	}
 }
 

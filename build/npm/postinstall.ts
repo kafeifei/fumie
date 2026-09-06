@@ -319,14 +319,26 @@ async function main() {
 	fs.writeFileSync(stateFile, JSON.stringify(_state));
 	fs.writeFileSync(stateContentsFile, JSON.stringify(computeContents()));
 
-	// Symlink .claude/ files to their canonical locations to test Claude agent harness
+	// Share Fumie-owned skills with the Claude harness. Project instructions stay
+	// in the tracked root CLAUDE.md adapter; creating a second hidden CLAUDE.md
+	// would make Claude load two project instruction entries.
 	const claudeDir = path.join(root, '.claude');
 	fs.mkdirSync(claudeDir, { recursive: true });
 
-	const claudeMdLink = path.join(claudeDir, 'CLAUDE.md');
-	const claudeMdLinkType = ensureAgentHarnessLink(path.join('..', '.github', 'copilot-instructions.md'), claudeMdLink);
-	if (claudeMdLinkType !== 'existing') {
-		log('.', `Created ${claudeMdLinkType} .claude/CLAUDE.md -> .github/copilot-instructions.md`);
+	const legacyClaudeMdLink = path.join(claudeDir, 'CLAUDE.md');
+	try {
+		if (fs.lstatSync(legacyClaudeMdLink).isSymbolicLink()) {
+			const actualTarget = path.resolve(path.dirname(legacyClaudeMdLink), fs.readlinkSync(legacyClaudeMdLink));
+			const legacyTarget = path.resolve(root, '.github', 'copilot-instructions.md');
+			if (actualTarget === legacyTarget) {
+				fs.unlinkSync(legacyClaudeMdLink);
+				log('.', 'Removed legacy .claude/CLAUDE.md instruction link');
+			}
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+			throw error;
+		}
 	}
 
 	const claudeSkillsLink = path.join(claudeDir, 'skills');

@@ -30,10 +30,49 @@ function code() {
 		node build/lib/preLaunch.ts
 	fi
 
+	# Darwin source Electron ships ad-hoc signed; re-sign with a local
+	# Developer ID so keychain ACLs persist (see scripts/sign-darwin-dev-electron.sh).
+	# Install the Dock trampoline before signing so Keep-in-Dock launches Agents.
+	if [[ "$OSTYPE" == "darwin"* ]]; then
+		"$ROOT/scripts/install-darwin-dev-electron-dock-app.sh"
+		"$ROOT/scripts/sign-darwin-dev-electron.sh"
+	fi
+
 	# Manage built-in extensions
 	if [[ "$1" == "--builtin" ]]; then
 		exec "$CODE" build/builtin
 		return
+	fi
+
+	# Fumie source-build Agent runtime setup. Provider models and credentials
+	# stay in the profile's Models configuration and secret storage.
+	INJECT_SH="$ROOT/scripts/fumie-configure-agents.sh"
+	FUMIE_LAUNCHING_AGENTS=0
+	for fumie_arg in "$@"; do
+		if [[ "$fumie_arg" == "--agents" ]]; then
+			FUMIE_LAUNCHING_AGENTS=1
+			break
+		fi
+	done
+	if [[ ! -f "$INJECT_SH" ]]; then
+		if [[ "$FUMIE_LAUNCHING_AGENTS" == "1" ]]; then
+			echo "[code.sh] REFUSING to launch Agents: missing $INJECT_SH" >&2
+			exit 1
+		fi
+	else
+		# shellcheck disable=SC1091
+		. "$INJECT_SH"
+		fumie_configure_agents
+		if [[ "$FUMIE_LAUNCHING_AGENTS" == "1" ]]; then
+			fumie_require_agents_runtime || exit 1
+			fumie_udd="$(fumie_user_data_dir_from_args "$@" || true)"
+			if [[ -z "${fumie_udd:-}" && "$OSTYPE" == "darwin"* ]]; then
+				fumie_udd="$HOME/Library/Application Support/Fumie"
+			fi
+			if [[ -n "${fumie_udd:-}" ]]; then
+				fumie_merge_agent_settings "$fumie_udd/User/settings.json"
+			fi
+		fi
 	fi
 
 	# Configuration
@@ -58,13 +97,13 @@ function code-wsl()
 	export DISPLAY="$HOST_IP:0"
 
 	# in a wsl shell
-	ELECTRON="$ROOT/.build/electron/Code - OSS.exe"
+	ELECTRON="$ROOT/.build/electron/Fumie.exe"
 	if [ -f "$ELECTRON"  ]; then
 		local CWD=$(pwd)
 		cd $ROOT
 		export WSLENV=ELECTRON_RUN_AS_NODE/w:VSCODE_DEV/w:$WSLENV
 		local WSL_EXT_ID="ms-vscode-remote.remote-wsl"
-		local WSL_EXT_WLOC=$(echo "" | VSCODE_DEV=1 ELECTRON_RUN_AS_NODE=1 "$ROOT/.build/electron/Code - OSS.exe" "out/cli.js" --locate-extension $WSL_EXT_ID)
+		local WSL_EXT_WLOC=$(echo "" | VSCODE_DEV=1 ELECTRON_RUN_AS_NODE=1 "$ROOT/.build/electron/Fumie.exe" "out/cli.js" --locate-extension $WSL_EXT_ID)
 		cd $CWD
 		if [ -n "$WSL_EXT_WLOC" ]; then
 			# replace \r\n with \n in WSL_EXT_WLOC

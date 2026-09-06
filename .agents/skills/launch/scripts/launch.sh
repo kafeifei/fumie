@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch Code OSS (VS Code from sources) with:
 #   - a fresh, slimmed copy of the authenticated user-data-dir (so Copilot/GitHub auth works)
-#   - an isolated --shared-data-dir (otherwise two instances share ~/.vscode-oss-shared and crash each other)
+#   - an isolated --shared-data-dir (otherwise two instances share ~/.fumie-shared and crash each other)
 #   - unique debug ports for renderer (CDP), extension host, main process, and agent host
 #
 # Auth on macOS comes from the OS keychain (per-app, shared automatically) plus
@@ -25,14 +25,14 @@
 #                       launch while build outputs remain current.
 #
 # Defaults:
-#   --source-user-data-dir  $CODE_OSS_DEV_AUTHED_USER_DATA_DIR  (else ~/.vscode-oss-dev)
+#   --source-user-data-dir  $CODE_OSS_DEV_AUTHED_USER_DATA_DIR  (else ~/.vsfumie-dev)
 #   --repo                  $PWD if it looks like a vscode checkout; otherwise pass it explicitly
 
 set -euo pipefail
 umask 077
 
 AGENTS=0
-SOURCE_UDD="${CODE_OSS_DEV_AUTHED_USER_DATA_DIR:-$HOME/.vscode-oss-dev}"
+SOURCE_UDD="${CODE_OSS_DEV_AUTHED_USER_DATA_DIR:-$HOME/.vsfumie-dev}"
 REPO=""
 EXTRA_ARGS=()
 CLONE_EXTENSIONS=0
@@ -95,7 +95,7 @@ read -r CDP_PORT EXTHOST_PORT MAIN_PORT AGENTHOST_PORT <<< "$PORTS"
 
 STAMP=$(date +%Y%m%d-%H%M%S)-$$
 # mktemp fills in the X's only when they trail the template; elsewhere they stay literal.
-RUN_NAME="code-oss-dev-$STAMP-XXXXXX"
+RUN_NAME="fumie-dev-$STAMP-XXXXXX"
 RUN_BASE="${TMPDIR:-/tmp}"
 # Electron's main IPC socket ("<run-dir>/user-data/<version>-main.sock") must fit
 # the ~103-byte unix socket limit, which macOS's default TMPDIR alone overflows.

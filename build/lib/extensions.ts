@@ -337,6 +337,47 @@ const productJson = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '.
 const builtInExtensions: IExtensionDefinition[] = productJson.builtInExtensions || [];
 const webBuiltInExtensions: IExtensionDefinition[] = productJson.webBuiltInExtensions || [];
 
+/**
+ * The exact set of extension folder names a complete desktop package carries
+ * under `Contents/Resources/app/extensions` (the `node_modules` folder that
+ * ships beside them is not an extension and is not listed here).
+ *
+ * It lives next to the filters `doPackageLocalExtensionsStream` applies so a
+ * packaging script cannot re-implement them and drift. A build that silently
+ * ships a subset still installs and signs cleanly and only fails at runtime —
+ * on 2026-09-04 one shipped seven extensions instead of the full set.
+ */
+export function getExpectedBuiltinExtensionNames(): string[] {
+	const names = new Set<string>();
+
+	// Local extensions, exactly as the native and non-native packaging streams
+	// together select them.
+	for (const manifestPath of glob.sync('extensions/*/package.json', { cwd: root }) as string[]) {
+		const name = path.basename(path.dirname(manifestPath));
+
+		if (excludedExtensions.indexOf(name) !== -1) {
+			continue;
+		}
+
+		if (builtInExtensions.some(extension => extension.name === name)) {
+			continue;
+		}
+
+		names.add(name);
+	}
+
+	// Copilot is excluded above because `packageCopilotExtensionStream` packages
+	// it separately, but it does ship.
+	names.add('copilot');
+
+	// ... and these are downloaded from the marketplace rather than built.
+	for (const extension of builtInExtensions) {
+		names.add(extension.name);
+	}
+
+	return [...names].sort();
+}
+
 type ExtensionKind = 'ui' | 'workspace' | 'web';
 interface IExtensionManifest {
 	main?: string;
@@ -481,13 +522,28 @@ export function packageCopilotExtensionStream(disableMangle: boolean): Stream {
 	);
 
 	const productionDependencies = getProductionDependencies('extensions/copilot');
-	const dependenciesSrc = productionDependencies.map(d => path.relative(root, d)).map(d => [`${d}/**`, `!${d}/**/{test,tests}/**`]).flat();
+	const dependenciesSrc = [
+		...productionDependencies.map(d => path.relative(root, d)).map(d => [`${d}/**`, `!${d}/**/{test,tests}/**`]).flat(),
+		// postinstall removes this development marker while the dependency stream
+		// is being copied. The target-platform packaging step creates the real
+		// marker only after it materializes the matching native shim.
+		'!extensions/copilot/node_modules/@github/copilot/shims.txt',
+	];
+
+	const copilotSdkEntryStream = gulp.src(
+		'extensions/copilot/node_modules/@github/copilot/sdk/index.js',
+		{ base: '.' }
+	);
 
 	return es.merge(
 		localExtensionsStream,
 		gulp.src(dependenciesSrc, { base: '.' })
 			.pipe(util2.cleanNodeModules(path.join(root, 'build', '.moduleignore')))
-			.pipe(util2.cleanNodeModules(path.join(root, 'build', `.moduleignore.${process.platform}`)))
+			.pipe(util2.cleanNodeModules(path.join(root, 'build', `.moduleignore.${process.platform}`))),
+		// The global app-root moduleignore strips this entry because Agent Host
+		// does not use the Copilot CLI SDK. The built-in Copilot extension does;
+		// mirror its .vscodeignore and add the entry back only to that extension.
+		copilotSdkEntryStream,
 	).pipe(util2.setExecutableBit(['**/*.sh']));
 }
 

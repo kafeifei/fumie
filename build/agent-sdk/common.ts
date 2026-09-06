@@ -11,13 +11,12 @@
  * `product.json` at packaging time.
  *
  * Source of truth for the SDK list and version pins:
- *   `build/agent-sdk/agents/<sdk>/{package.json,package-lock.json}`.
+ *   `build/agent-sdk/agents/<sdk>/package.json`.
  * Each subdirectory under `agents/` is one SDK. The folder name is the
- * SDK id (the key under `product.agentSdks`); the `package.json` names
- * exactly one npm dependency (the SDK's own package) and its exact
- * version; the `package-lock.json` pins the full transitive graph for
- * byte-deterministic `npm ci`. Add an SDK by adding a folder, run
- * `npm install` inside it once to generate the lockfile, commit both.
+ * SDK id (the key under `product.agentSdks`). Public npm SDKs name exactly
+ * one dependency and pin its full graph in `package-lock.json`. Private
+ * source-built SDKs instead declare `agentSdkSource` with an exact upstream
+ * commit and package-manager version.
  *
  * `getSdkTargetForBuild()` hard-codes the
  * `(vscodePlatform, arch, sdk) → sdkTarget` table; the SDK's own npm
@@ -66,27 +65,55 @@ export function getSdks(): readonly Sdk[] {
 export function getAgentDir(sdk: Sdk): string {
 	const dir = path.join(AGENTS_DIR, sdk);
 	if (!fs.existsSync(dir)) {
-		throw new Error(`Unknown SDK '${sdk}': no directory at ${dir}. Add a folder under build/agent-sdk/agents/ with a package.json + package-lock.json.`);
+		throw new Error(`Unknown SDK '${sdk}': no directory at ${dir}. Add a folder under build/agent-sdk/agents/ with a package.json and either a package-lock.json or agentSdkSource metadata.`);
 	}
 	return dir;
 }
 
-interface IAgentPackageJson {
-	readonly dependencies?: Readonly<Record<string, string>>;
+interface IAgentSdkSourceJson {
+	readonly name?: string;
+	readonly repository?: string;
+	readonly commit?: string;
+	readonly packageManager?: string;
+	readonly target?: string;
 }
 
-let _agentMetaCache: Map<Sdk, { name: string; version: string }> | undefined;
+interface IAgentPackageJson {
+	readonly version?: string;
+	readonly dependencies?: Readonly<Record<string, string>>;
+	readonly agentSdkSource?: IAgentSdkSourceJson;
+}
+
+export interface INpmAgentMeta {
+	readonly kind: 'npm';
+	readonly name: string;
+	readonly version: string;
+}
+
+export interface ISourceAgentMeta {
+	readonly kind: 'source';
+	readonly name: string;
+	readonly version: string;
+	readonly repository: string;
+	readonly commit: string;
+	readonly packageManager: string;
+	readonly target: string;
+}
+
+export type AgentMeta = INpmAgentMeta | ISourceAgentMeta;
+
+let _agentMetaCache: Map<Sdk, AgentMeta> | undefined;
 
 /**
- * Returns the npm package name and pinned version this SDK ships. Read
- * from `agents/<sdk>/package.json`'s single dependency.
+ * Returns the package name, pinned version, and acquisition strategy for
+ * this SDK. Read from `agents/<sdk>/package.json`.
  *
  * The agent's `package.json` MUST declare exactly one dependency (the SDK's
  * own npm package) at an exact version — no `^` / `~` ranges. Ranges
  * would let `npm install` resolve different versions across runs, which
  * the CDN's HEAD-then-fail upload rejects.
  */
-export function getAgentMeta(sdk: Sdk): { name: string; version: string } {
+export function getAgentMeta(sdk: Sdk): AgentMeta {
 	if (!_agentMetaCache) {
 		_agentMetaCache = new Map();
 	}
@@ -98,6 +125,35 @@ export function getAgentMeta(sdk: Sdk): { name: string; version: string } {
 	const json = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as IAgentPackageJson;
 	const deps = json.dependencies ?? {};
 	const entries = Object.entries(deps);
+	const source = json.agentSdkSource;
+	if (source) {
+		if (entries.length !== 0) {
+			throw new Error(`Expected no dependencies in source-built SDK ${pkgPath}, found ${entries.length}: ${entries.map(([k]) => k).join(', ')}`);
+		}
+		if (!json.version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(json.version)) {
+			throw new Error(`Expected an exact package version in source-built SDK ${pkgPath}`);
+		}
+		if (!source.name || !source.repository || !source.commit || !source.packageManager || !source.target) {
+			throw new Error(`Incomplete agentSdkSource in ${pkgPath}: name, repository, commit, packageManager, and target are required`);
+		}
+		if (!/^[0-9a-f]{40}$/.test(source.commit)) {
+			throw new Error(`Refusing to use source commit '${source.commit}' from ${pkgPath}: must be a full 40-character lowercase SHA`);
+		}
+		if (!/^pnpm@\d+\.\d+\.\d+$/.test(source.packageManager)) {
+			throw new Error(`Refusing to use package manager '${source.packageManager}' from ${pkgPath}: expected an exact pnpm version`);
+		}
+		const meta: ISourceAgentMeta = {
+			kind: 'source',
+			name: source.name,
+			version: json.version,
+			repository: source.repository,
+			commit: source.commit,
+			packageManager: source.packageManager,
+			target: source.target,
+		};
+		_agentMetaCache.set(sdk, meta);
+		return meta;
+	}
 	if (entries.length !== 1) {
 		throw new Error(`Expected exactly one dependency in ${pkgPath}, found ${entries.length}: ${entries.map(([k]) => k).join(', ')}`);
 	}
@@ -105,7 +161,7 @@ export function getAgentMeta(sdk: Sdk): { name: string; version: string } {
 	if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
 		throw new Error(`Refusing to use ${name}@${version} from ${pkgPath}: must be an exact version (no ^ or ~ ranges)`);
 	}
-	const meta = { name, version };
+	const meta: INpmAgentMeta = { kind: 'npm', name, version };
 	_agentMetaCache.set(sdk, meta);
 	return meta;
 }

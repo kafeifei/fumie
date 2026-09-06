@@ -33,6 +33,7 @@ import { fetchUrls } from './lib/fetch.ts';
 import { downloadFeedPackage } from './lib/azureFeed.ts';
 import { ensureCopilotPlatformPackage, getCopilotExcludeFilter, getCopilotRuntimePrebuildFiles, getCopilotTgrepExcludeFilter, getMxcExcludeFilter, getRipgrepExcludeFilter, prepareBuiltInCopilotRipgrepShim } from './lib/copilot.ts';
 import { readAgentSdkResults } from './agent-sdk/common.ts';
+import webBundleNodeModules from './fumie/webBundleNodeModules.json' with { type: 'json' };
 
 
 const rcedit = promisify(rceditCallback);
@@ -464,6 +465,7 @@ function packageTask(type: string, platform: string, arch: string, sourceFolderN
 				'resources/server/code-512.png',
 				'resources/server/manifest.json'
 			].map(resource => gulp.src(resource, { base: '.' }).pipe(rename(resource)));
+			web.push(...fumieWebBundleStreams());
 		}
 
 		const all = es.merge(
@@ -531,6 +533,46 @@ function packageTask(type: string, platform: string, arch: string, sourceFolderN
 
 		return result.pipe(vfs.dest(destination));
 	};
+}
+
+/**
+ * The Fumie Agents client the headless server serves under `/fumie`.
+ *
+ * `node build/next/index.ts bundle --target web --out out-fumie-web` writes it,
+ * the same artifact the desktop package carries for the phone, and it is
+ * packaged into the product root as `web-bundle` — beside `out/`, which is
+ * where `ServerFumieWebShellServer` looks for it.
+ *
+ * A build that skipped that step is packaged without it rather than failed:
+ * the server still comes up, serves the upstream workbench and says in its log
+ * that it has no shell to serve. Every existing reh-web build predates this
+ * step, so refusing them would be the more disruptive answer, not the safer
+ * one.
+ */
+function fumieWebBundleStreams(): NodeJS.ReadWriteStream[] {
+	const bundleRoot = path.join(REPO_ROOT, 'out-fumie-web');
+	if (!fs.existsSync(bundleRoot)) {
+		log(`[reh-web] out-fumie-web is missing; packaging without the Fumie web shell. Run \`node build/next/index.ts bundle --target web --out out-fumie-web\` first.`);
+		return [];
+	}
+
+	const intoWebBundle = () => rename((file: { dirname?: string }) => {
+		file.dirname = path.join('web-bundle', file.dirname ?? '');
+	});
+
+	// The bundle is not self-contained. `importAMDNodeModule` builds its script
+	// URLs at runtime, so esbuild cannot see them and inlines nothing; the
+	// client asks for them under `node_modules/` beside the bundle. Named one
+	// file at a time because these packages carry tens of megabytes of sources,
+	// maps and docs that no browser ever asks for — and tree-sitter's 21MB of
+	// grammars, which the workbench only reaches for behind an opt-in setting,
+	// is deliberately not among them.
+	const lazyModules = webBundleNodeModules.flatMap(asset => [`node_modules/${asset}`, `node_modules/${asset}/**`]);
+
+	return [
+		gulp.src(`${bundleRoot}/**`, { base: bundleRoot, dot: true }).pipe(intoWebBundle()),
+		gulp.src(lazyModules, { base: '.', dot: true, allowEmpty: true }).pipe(intoWebBundle()),
+	];
 }
 
 function hasAuthenticodeSignature(filePath: string): Promise<boolean> {

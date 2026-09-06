@@ -1,0 +1,9 @@
+{
+	"name": "agent-sdk-deepseek",
+	"private": true,
+	"comment": "Pinned dependency set for the build/agent-sdk deepseek tarball. The package-lock.json alongside is the source of truth for transitive deps — produce.ts runs `npm ci` against this directory to get byte-deterministic output across pipeline runs. `@deepseek-ai/dsh-base` is the self-contained DeepSeek Harness coding-agent core (agent loop, tools, sandbox, session, and LLM providers) with its own `./cordis.patch.yml` composition. `@deepseek-ai/dsh-app-boot` is the in-process boot glue (`boot()` / `loadOptionalPatches()`) that mounts that composition onto a Cordis Loader; it is a separate package, not a dsh-base dependency. Fumie boots that core in-process and drives its `ctx.agents` registry, mirroring how Kimi embeds `@moonshot-ai/kimi-code-sdk`.",
+	"dependencies": {
+		"@deepseek-ai/dsh-base": "0.1.0-rc.6",
+		"@deepseek-ai/dsh-app-boot": "0.1.0-rc.6"
+	}
+}

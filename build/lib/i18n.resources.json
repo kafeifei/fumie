@@ -693,6 +693,10 @@
 			"project": "vscode-sessions"
 		},
 		{
+			"name": "vs/sessions/contrib/startupGate",
+			"project": "vscode-sessions"
+		},
+		{
 			"name": "vs/sessions/contrib/providers/copilotChatSessions",
 			"project": "vscode-sessions"
 		},
@@ -718,6 +722,10 @@
 		},
 		{
 			"name": "vs/sessions/contrib/search",
+			"project": "vscode-sessions"
+		},
+		{
+			"name": "vs/sessions/contrib/settings",
 			"project": "vscode-sessions"
 		},
 		{

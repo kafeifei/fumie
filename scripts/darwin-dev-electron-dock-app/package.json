@@ -1,0 +1,6 @@
+{
+	"name": "fumie-dev-dock",
+	"private": true,
+	"main": "main.js",
+	"type": "module"
+}

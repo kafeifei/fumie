@@ -89,7 +89,7 @@ function Get-SourceSharedDataDir([string]$repoPath) {
 		return Join-Path $env:VSCODE_PORTABLE 'shared-data'
 	}
 
-	$folderName = '.vscode-oss-shared'
+	$folderName = '.fumie-shared'
 	$productJson = Join-Path $repoPath 'product.json'
 	if (Test-Path -LiteralPath $productJson -PathType Leaf) {
 		$product = Get-Content -LiteralPath $productJson -Raw | ConvertFrom-Json
@@ -324,8 +324,7 @@ function Get-JsoncCodeMask([string]$text) {
 	return (-join $masked)
 }
 
-function Ensure-SimpleDialogSetting([string]$settingsFile) {
-	$key = 'files.simpleDialog.enable'
+function Set-LaunchJsoncSetting([string]$settingsFile, [string]$key, [string]$literalValue) {
 	$settingsDirectory = Split-Path -Parent $settingsFile
 	New-Item -ItemType Directory -Force -Path $settingsDirectory | Out-Null
 
@@ -336,21 +335,17 @@ function Ensure-SimpleDialogSetting([string]$settingsFile) {
 	}
 
 	if ([string]::IsNullOrWhiteSpace($text)) {
-		[IO.File]::WriteAllText($settingsFile, "{`n  `"$key`": true`n}`n", [Text.UTF8Encoding]::new($false))
+		[IO.File]::WriteAllText($settingsFile, "{`n  `"$key`": $literalValue`n}`n", [Text.UTF8Encoding]::new($false))
 		return
 	}
 
-	# Match against a comment-masked copy so a commented-out occurrence such as
-	# `// "files.simpleDialog.enable": false` is not mistaken for the real
-	# setting. Offsets line up with the original, so the value is rewritten in
-	# place without disturbing comments.
 	$maskedText = Get-JsoncCodeMask $text
 	$keyPattern = [regex]::Escape($key)
 	$keyValueRegex = [regex]::new("(`"$keyPattern`"\s*:\s*)(true|false|null|`"[^`"`r`n]*`"|-?\d+(?:\.\d+)?)")
 	$keyMatch = $keyValueRegex.Match($maskedText)
 	if ($keyMatch.Success) {
 		$valueGroup = $keyMatch.Groups[2]
-		$updated = $text.Substring(0, $valueGroup.Index) + 'true' + $text.Substring($valueGroup.Index + $valueGroup.Length)
+		$updated = $text.Substring(0, $valueGroup.Index) + $literalValue + $text.Substring($valueGroup.Index + $valueGroup.Length)
 		[IO.File]::WriteAllText($settingsFile, $updated, [Text.UTF8Encoding]::new($false))
 		return
 	}
@@ -364,13 +359,34 @@ function Ensure-SimpleDialogSetting([string]$settingsFile) {
 		throw "settings.json has no opening brace - refusing to clobber it: $settingsFile"
 	}
 
-	# Whether a leading comma is needed depends only on real content, so decide
-	# it from the masked copy too.
 	$between = $maskedText.Substring($firstBrace + 1, $lastBrace - $firstBrace - 1).Trim()
 	$separator = if ($between.Length -eq 0 -or $between.EndsWith(',')) { '' } else { ',' }
-	$insertion = "$separator`n  `"$key`": true`n"
+	$insertion = "$separator`n  `"$key`": $literalValue`n"
 	$updated = $text.Substring(0, $lastBrace) + $insertion + $text.Substring($lastBrace)
 	[IO.File]::WriteAllText($settingsFile, $updated, [Text.UTF8Encoding]::new($false))
+}
+
+function Ensure-SimpleDialogSetting([string]$settingsFile) {
+	Set-LaunchJsoncSetting $settingsFile 'files.simpleDialog.enable' 'true'
+}
+
+function ConvertTo-LaunchJsoncLiteral($value) {
+	if ($value -is [bool]) {
+		if ($value) { return 'true' } else { return 'false' }
+	}
+	if ($null -eq $value) { return 'null' }
+	return (($value | ConvertTo-Json -Compress))
+}
+
+function Merge-FumieAgentSettings([string]$settingsFile) {
+	if ([string]::IsNullOrWhiteSpace($env:LAUNCH_EXTRA_SETTINGS_JSON)) {
+		return
+	}
+	$extra = $env:LAUNCH_EXTRA_SETTINGS_JSON | ConvertFrom-Json
+	foreach ($item in @($extra)) {
+		Set-LaunchJsoncSetting $settingsFile ([string]$item.key) (ConvertTo-LaunchJsoncLiteral $item.value)
+	}
+	Write-LaunchError "[launch.ps1] merged Agent Host settings into $settingsFile"
 }
 
 function Write-LogTail([string]$logFile) {
@@ -503,7 +519,7 @@ try {
 		$sourceUserDataDir = if ($env:CODE_OSS_DEV_AUTHED_USER_DATA_DIR) {
 			$env:CODE_OSS_DEV_AUTHED_USER_DATA_DIR
 		} else {
-			Join-Path $env:USERPROFILE '.vscode-oss-dev'
+			Join-Path $env:USERPROFILE '.vsfumie-dev'
 		}
 	}
 	if (-not (Test-Path -LiteralPath $sourceUserDataDir -PathType Container)) {
@@ -520,11 +536,14 @@ try {
 	$agentHostPort = $ports[3]
 
 	$stamp = '{0:yyyyMMdd-HHmmss}-{1}' -f (Get-Date), $PID
-	$runDir = Join-Path (Join-Path $env:TEMP 'code-oss-dev') $stamp
+	$runDir = Join-Path (Join-Path $env:TEMP 'fumie-dev') $stamp
 	$destinationUdd = Join-Path $runDir 'user-data'
 	$extensionsDir = Join-Path $destinationUdd 'extensions'
 	$sharedDataDir = Join-Path $runDir 'shared-data'
 	$logFile = Join-Path $runDir 'code.log'
+	# Isolate editor profile/cache state only. The product owns Fumie's durable
+	# home and resolves its default to ~/.fumie.
+	Remove-Item Env:FUMIE_HOME -ErrorAction SilentlyContinue
 	New-Item -ItemType Directory -Force -Path $runDir, $sharedDataDir | Out-Null
 	[IO.File]::WriteAllText($logFile, '', [Text.UTF8Encoding]::new($false))
 	$sourceSharedDataDir = Get-SourceSharedDataDir $repo
@@ -566,8 +585,22 @@ try {
 		Copy-ProfileDirectory $sourceExtensions $extensionsDir $false
 	}
 
+	$injectPs1 = Join-Path $repo 'scripts\fumie-configure-agents.ps1'
+	if (-not (Test-Path -LiteralPath $injectPs1 -PathType Leaf)) {
+		if ($agents) {
+			throw "REFUSING to launch Agents: missing $injectPs1"
+		}
+	} else {
+		. $injectPs1
+		Initialize-FumieAgentsRuntime
+		if ($agents) {
+			Assert-FumieAgentsRuntime
+		}
+	}
+
 	$settingsFile = Join-Path $destinationUdd 'User\settings.json'
 	Ensure-SimpleDialogSetting $settingsFile
+	Merge-FumieAgentSettings $settingsFile
 	Write-LaunchError "[launch.ps1] ensured files.simpleDialog.enable=true in $settingsFile"
 	$profileReadyMs = $launchStopwatch.ElapsedMilliseconds
 
@@ -582,6 +615,8 @@ try {
 	$launchArgs.Add("--inspect-extensions=$extHostPort")
 	$launchArgs.Add("--inspect=$mainPort")
 	$launchArgs.Add("--inspect-agenthost=$agentHostPort")
+	# Fresh user-data + shared-data => empty workspace trust every launch.
+	$launchArgs.Add("--disable-workspace-trust")
 	foreach ($argument in $extraArgs) {
 		$launchArgs.Add($argument)
 	}

@@ -1,10 +1,15 @@
 .DS_Store
+/.env.local
+/.vercel/
 .cache
 npm-debug.log
 Thumbs.db
 node_modules/
 .tmp/
 .build/
+# Agent SDK installs live next to their pin descriptors under
+# build/agent-sdk/agents/<id>/ (node_modules is ignored globally above).
+build/agent-sdk/agents/*/.fumie-*-pin.json
 /extensionsCG/
 .vscode/extensions/**/out/
 extensions/**/dist/
@@ -50,7 +55,21 @@ dist
 .agents/skills/.local/
 .github/skills/.local/
 
+# Local capture / agent worktrees — do not ship
+screenshots/
+/*.log
+*.vsix
 # Throwaway Code OSS dev profiles created by the launch skill
 .v[0-9]*/
 # Local agent validation evidence
 .agent-validation/
+
+# Hand-kept backup of the built OSS tunnel CLI
+/cli-code-tunnel-oss-backup
+
+# Local secrets and research artifacts
+/.env
+/.env.*
+!/.env.example
+/.agent-validation/
+/private/

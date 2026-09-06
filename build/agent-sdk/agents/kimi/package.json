@@ -1,0 +1,12 @@
+{
+	"name": "fumie-kimi-code-sdk-source",
+	"version": "0.16.0",
+	"private": true,
+	"agentSdkSource": {
+		"name": "@moonshot-ai/kimi-code-sdk",
+		"repository": "https://github.com/MoonshotAI/kimi-code.git",
+		"commit": "3b0936d8e025c5a944759c40593d5f21bfb3e621",
+		"packageManager": "pnpm@10.33.0",
+		"target": "node20"
+	}
+}

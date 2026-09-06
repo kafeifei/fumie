@@ -413,6 +413,10 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 				'**/@microsoft/mxc-sdk/bin/**',
 				'**/node-pty/build/Release/*',
 				'**/node-pty/build/Release/conpty/*',
+				// node-pty's prebuilds layout (no local build/Release) keeps the darwin
+				// `spawn-helper` next to `pty.node`; it is posix_spawn'ed as a real file,
+				// so it must live outside the archive. `**/*.node` does not match it.
+				'**/node-pty/prebuilds/*/spawn-helper',
 				'**/node-pty/lib/worker/conoutSocketWorker.js',
 				'**/node-pty/lib/shared/conout.js',
 				// node-pty spawns `conoutSocketWorker.js` as a Worker from the unpacked
