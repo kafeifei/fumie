@@ -254,7 +254,7 @@ import './contrib/providers/agentHost/browser/agentHostSkillButtons.js';
 import './contrib/providers/agentHost/browser/openSubagentChat.js';
 import './contrib/providers/agentHost/electron-browser/agentHost.contribution.js';
 
-// Claude / Codex subscriptions as providers the user can add in Manage Models.
+// Claude / Codex subscriptions as default providers in Manage Models.
 // Local-only, like the agent host whose published catalog they read from.
 import './contrib/providers/subscriptionModels/browser/subscriptionModels.contribution.js';
 // Custom model endpoints use the BYOK provider catalog

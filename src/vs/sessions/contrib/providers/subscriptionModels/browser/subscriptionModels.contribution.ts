@@ -3,11 +3,15 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Disposable, toDisposable } from '../../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { IAgentHostService } from '../../../../../platform/agentHost/common/agentService.js';
 import { AgentInfo } from '../../../../../platform/agentHost/common/state/sessionState.js';
+import { IFileService } from '../../../../../platform/files/common/files.js';
+import { ILogService } from '../../../../../platform/log/common/log.js';
+import { IStorageService } from '../../../../../platform/storage/common/storage.js';
 import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../../../workbench/common/contributions.js';
 import { ILanguageModelsService } from '../../../../../workbench/contrib/chat/common/languageModels.js';
+import { ILanguageModelsConfigurationService } from '../../../../../workbench/contrib/chat/common/languageModelsConfiguration.js';
 import { IAgentSdkSetupService } from '../../../../../workbench/services/agentHost/browser/agentSdkSetupService.js';
 import { IClaudeAccountService } from '../../../../../workbench/services/agentHost/browser/claudeAccountService.js';
 import { ICodexAccountService } from '../../../../../workbench/services/agentHost/browser/codexAccountService.js';
@@ -15,11 +19,11 @@ import { IAgentHostModelProviderPresentation } from '../../../../../workbench/se
 import { registerAgentHostModelSourcePresentations } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostModelSourcePresentations.js';
 import { createClaudeSubscriptionPresentation, createCodexSubscriptionPresentation } from './subscriptionModelPresentations.js';
 import { CLAUDE_SUBSCRIPTION_VENDOR, ISubscriptionProviderDefinition, SUBSCRIPTION_PROVIDER_DEFINITIONS, SubscriptionLanguageModelProvider, createSubscriptionVendorDescriptor, subscriptionModelsFrom } from './subscriptionModelProviders.js';
+import { initializeDefaultSubscriptionProviders } from './subscriptionModelDefaults.js';
 
 /**
- * Offers the user's Claude and Codex subscriptions as providers they can add in
- * Manage Models, each showing its own catalog, who is signed in, and the way in
- * and out of that account.
+ * Adds Claude and Codex subscription providers to each profile by default,
+ * showing their catalogs, account status, and sign-in controls in Manage Models.
  *
  * The vendors are registered for the life of the window whether or not an entry
  * exists — a vendor absent from the registry is a vendor absent from the **Add
@@ -28,7 +32,7 @@ import { CLAUDE_SUBSCRIPTION_VENDOR, ISubscriptionProviderDefinition, SUBSCRIPTI
  * only the per-group resolution, so deleting the entry takes the subscription's
  * models out of the picker and leaves the CLI's credential exactly where it was.
  */
-class SubscriptionModelProvidersContribution extends Disposable implements IWorkbenchContribution {
+export class SubscriptionModelProvidersContribution extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'sessions.contrib.subscriptionModelProviders';
 
@@ -40,6 +44,10 @@ class SubscriptionModelProvidersContribution extends Disposable implements IWork
 		@IAgentSdkSetupService private readonly _agentSdkSetupService: IAgentSdkSetupService,
 		@IClaudeAccountService private readonly _claudeAccountService: IClaudeAccountService,
 		@ICodexAccountService private readonly _codexAccountService: ICodexAccountService,
+		@ILanguageModelsConfigurationService configurationService: ILanguageModelsConfigurationService,
+		@IStorageService storageService: IStorageService,
+		@IFileService fileService: IFileService,
+		@ILogService logService: ILogService,
 	) {
 		super();
 
@@ -47,9 +55,22 @@ class SubscriptionModelProvidersContribution extends Disposable implements IWork
 			this._register(this._registerSubscription(definition));
 		}
 
-		const initialState = this._agentHostService.rootState.value;
-		this._updateModels(initialState instanceof Error || !initialState ? [] : initialState.agents);
-		this._register(this._agentHostService.rootState.onDidChange(state => this._updateModels(state.agents)));
+		// A delayed start replaces the placeholder subscription with the host's
+		// real root. Follow that replacement as well as later catalog changes.
+		const rootStateListeners = this._register(new DisposableStore());
+		const bindRootState = () => {
+			rootStateListeners.clear();
+			const rootState = this._agentHostService.rootState;
+			const initialState = rootState.value;
+			this._updateModels(initialState instanceof Error || !initialState ? [] : initialState.agents);
+			rootStateListeners.add(rootState.onDidChange(state => this._updateModels(state.agents)));
+		};
+		bindRootState();
+		this._register(this._agentHostService.onAgentHostStart(bindRootState));
+
+		initializeDefaultSubscriptionProviders(configurationService, storageService, fileService).catch(error => {
+			logService.error('[Subscription Models] Failed to initialize default providers', error);
+		});
 	}
 
 	private _registerSubscription(definition: ISubscriptionProviderDefinition) {

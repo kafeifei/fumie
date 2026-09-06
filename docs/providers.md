@@ -5,6 +5,12 @@ agent first; the model list is then filtered to models compatible with that
 agent. After the first message creates a session, the agent remains fixed while
 the model or reasoning effort can follow the provider's capabilities.
 
+Claude Subscription and Codex Subscription are added to each profile by default.
+Sign in through their provider rows in **Settings → Models**; their models appear
+when the native agent publishes its account-backed catalog. Existing provider
+names and settings are preserved. Removing either subscription provider keeps it
+removed across restarts; it can be added again through **Add Models**.
+
 Provider configuration belongs to the upstream language-model catalog and the
 user's settings and secret storage. A provider may be a local service, a
 custom endpoint, or an account-backed integration. Fumie should project that
