@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+	<meta name="apple-mobile-web-app-capable" content="yes" />
+	<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+	<meta name="theme-color" content="#1f1f1f" />
+	<link rel="manifest" href="./manifest.webmanifest" />
+	<link rel="icon" href="./icon.svg" type="image/svg+xml" />
+	<title>Fumie</title>
+	<style>
+		:root { color-scheme: light dark; }
+		html, body { margin: 0; min-height: 100vh; }
+		body {
+			font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+			color: #59636e;
+			background: #ffffff;
+		}
+		@media (prefers-color-scheme: dark) {
+			body { color: #9aa4af; background: #1f1f1f; }
+		}
+		.entry-screen {
+			box-sizing: border-box;
+			min-height: 100vh;
+			padding: 32px 24px calc(32px + env(safe-area-inset-bottom));
+			display: grid;
+			place-items: center;
+			text-align: center;
+		}
+		.entry-card { max-width: 420px; }
+		.entry-card h1 { font-size: 22px; font-weight: 600; color: #24292f; margin: 0 0 8px; }
+		@media (prefers-color-scheme: dark) { .entry-card h1 { color: #e6edf3; } }
+		.entry-card p { margin: 0 0 24px; white-space: pre-wrap; }
+		.entry-button {
+			display: inline-block;
+			padding: 12px 28px;
+			border: 0;
+			border-radius: 8px;
+			background: #1f883d;
+			color: #ffffff;
+			font: inherit;
+			font-weight: 600;
+			cursor: pointer;
+		}
+		.entry-button.secondary { background: transparent; color: inherit; border: 1px solid currentColor; }
+		.entry-error { color: #b42318; white-space: pre-wrap; }
+		.entry-steps { text-align: left; margin: 0 0 24px; padding-left: 20px; }
+		.entry-steps li { margin-bottom: 8px; }
+	</style>
+	<script>
+		globalThis._VSCODE_FILE_ROOT = location.origin + '/bundle';
+	</script>
+	<link rel="stylesheet" href="./bundle/vs/sessions/sessions.web.main.internal.css" />
+</head>
+<body aria-label="">
+	<div id="entry-root"></div>
+	<script type="module" src="./main.js"></script>
+</body>
+</html>

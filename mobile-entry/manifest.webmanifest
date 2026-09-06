@@ -1,0 +1,16 @@
+{
+	"name": "Fumie",
+	"short_name": "Fumie",
+	"start_url": "/",
+	"display": "standalone",
+	"theme_color": "#1f1f1f",
+	"background_color": "#1f1f1f",
+	"icons": [
+		{
+			"src": "/icon.svg",
+			"sizes": "any",
+			"type": "image/svg+xml",
+			"purpose": "any"
+		}
+	]
+}

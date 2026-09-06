@@ -1,0 +1,5 @@
+{
+	"rewrites": [
+		{ "source": "/api/tunnels/:path*", "destination": "/api/tunnels-proxy?path=:path*" }
+	]
+}
