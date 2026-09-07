@@ -22,7 +22,8 @@ if hash update-mime-database 2>/dev/null; then
 	update-mime-database /usr/share/mime
 fi
 
-if [ "@@NAME@@" != "code-oss" ]; then
+case "@@NAME@@" in
+code|code-insiders|code-exploration)
 	# Remove the legacy bin command if this is the stable build
 	if [ "@@NAME@@" = "code" ]; then
 		rm -f /usr/local/bin/code
@@ -165,4 +166,5 @@ xfn5JwgySBIdWWvtOI05gw==
 			fi
 		fi
 	fi
-fi
+	;;
+esac

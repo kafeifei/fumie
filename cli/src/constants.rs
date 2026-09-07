@@ -59,6 +59,12 @@ pub const APPLICATION_NAME: &str = match option_env!("VSCODE_CLI_APPLICATION_NAM
 	None => "code",
 };
 
+/// Server executable name, matching `serverApplicationName` in product.json.
+pub const SERVER_APPLICATION_NAME: &str = match option_env!("VSCODE_CLI_SERVER_APPLICATION_NAME") {
+	Some(n) => n,
+	None => "code-server-oss",
+};
+
 /// Full name of the product with its version.
 pub const PRODUCT_NAME_LONG: &str = match option_env!("VSCODE_CLI_NAME_LONG") {
 	Some(n) => n,

@@ -7,7 +7,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::constants::SERVER_NAME_MAP;
+use crate::constants::{SERVER_APPLICATION_NAME, SERVER_NAME_MAP};
 
 #[derive(clap::ValueEnum, Copy, Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Quality {
@@ -44,7 +44,7 @@ impl Quality {
 			.as_ref()
 			.and_then(|m| m.get(self))
 			.map(|s| s.server_application_name.as_str())
-			.unwrap_or("code-server-oss")
+			.unwrap_or(SERVER_APPLICATION_NAME)
 			.to_string();
 
 		if cfg!(windows) {

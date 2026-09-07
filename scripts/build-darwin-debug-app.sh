@@ -554,13 +554,22 @@ else
 fi
 
 TUNNEL_CLI_SRC="$ROOT/cli/target/release/code"
-TUNNEL_CLI_DEST="$RUNTIME_APP/Contents/Resources/app/bin/code-tunnel-oss"
+TUNNEL_CLI_NAME="$("$NODE_BINARY" -e '
+const fs = require("fs");
+const name = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).tunnelApplicationName;
+if (typeof name !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) {
+	throw new Error("Invalid tunnelApplicationName in packaged product.json");
+}
+process.stdout.write(name);
+' "$RUNTIME_APP/Contents/Resources/app/product.json")"
+TUNNEL_CLI_DEST="$RUNTIME_APP/Contents/Resources/app/bin/$TUNNEL_CLI_NAME"
 if [[ -f "$TUNNEL_CLI_SRC" ]]; then
 	mkdir -p "$(dirname "$TUNNEL_CLI_DEST")"
 	cp "$TUNNEL_CLI_SRC" "$TUNNEL_CLI_DEST"
 	chmod 0755 "$TUNNEL_CLI_DEST"
 else
-	echo "[fumie-debug] warning: tunnel CLI not found at $TUNNEL_CLI_SRC; remote connections will be unavailable" >&2
+	echo "[fumie-debug] tunnel CLI not found at $TUNNEL_CLI_SRC; refusing to package broken remote connections" >&2
+	exit 1
 fi
 
 # Trim the staged copy only. The packaged runtime under VSCode-darwin-$ARCH stays
