@@ -72,7 +72,7 @@ export function createCodexAccountMenuActions(service: ICodexAccountService, vis
 		return [new Action('codex.downloadingAgent', localize('downloadingCodexAgent', "Downloading Codex agent…"), undefined, false)];
 	}
 	if (account.status === 'unknown' || account.status === 'signedOut' || account.status === 'error') {
-		return [new Action('codex.signInToChatGPT', localize('signInToChatGPT', "Sign in to ChatGPT"), undefined, true, () => service.signIn())];
+		return [new Action('codex.signInToChatGPT', localize('signInForOpenAIModels', "Sign in to ChatGPT to access OpenAI models"), undefined, true, () => service.signIn())];
 	}
 	return [];
 }

@@ -18,7 +18,8 @@ import { AgentHostFumieHomeEnvVar } from '../../common/agentHostProductEnv.js';
 import { composeSessionHostContext } from '../../common/sessionHostContext.js';
 import { IAgentSdkDownloader, type IAgentSdkPackage } from '../agentSdkDownloader.js';
 import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
-import { INativeModelProviderProxyService, type INativeModelProviderProxyHandle } from '../nativeModelProviderProxyService.js';
+import { CHATGPT_SUBSCRIPTION_MODELS, chatGptSubscriptionMaxOutputTokens, parseChatGptSubscriptionModelId } from '../chatGptSubscription.js';
+import { INativeModelProviderProxyService, type INativeModelProviderProxyHandle, type NativeModelWireProtocol } from '../nativeModelProviderProxyService.js';
 
 export const KimiSdkPackage: IAgentSdkPackage = {
 	id: 'kimi',
@@ -29,6 +30,8 @@ export const KimiSdkPackage: IAgentSdkPackage = {
 
 /** Fumie-owned Kimi provider entry backed by the loopback provider proxy. */
 export const KimiSdkProviderId = 'fumie-provider';
+/** Kimi SDK provider entry using its native OpenAI Responses adapter. */
+export const KimiSdkResponsesProviderId = 'fumie-provider-responses';
 
 const KimiHostContextStart = '<!-- fumie-host-context:start -->';
 const KimiHostContextEnd = '<!-- fumie-host-context:end -->';
@@ -102,14 +105,18 @@ export function syncKimiHostInstructions(homeDir: string, hostContext: string | 
 }
 
 /**
- * Everything the harness needs to point the SDK at a BYOK model: the shared
- * loopback bind (route per vendor, one token) plus a read of the renderer
- * catalog for the non-routing facts the provider published.
+ * Everything the harness needs to point the SDK at a host-routed model: the
+ * shared loopback bind (route per vendor or subscription, one token) plus the
+ * non-routing model facts needed by the SDK config overlay.
  */
 export interface IKimiByokEndpoint {
 	readonly token: string;
-	readonly providerBaseUrl: () => string;
-	readonly lookupModel: (agentModelId: string) => IByokLmModelInfo | undefined;
+	readonly providerBaseUrl: (wire: NativeModelWireProtocol) => string;
+	readonly resolveModel: (agentModelId: string) => IKimiEndpointModel | undefined;
+}
+
+export interface IKimiEndpointModel extends Pick<IByokLmModelInfo, 'name' | 'maxContextWindowTokens' | 'maxOutputTokens' | 'supportsVision' | 'supportedReasoningEfforts' | 'defaultReasoningEffort'> {
+	readonly wire: 'responses' | 'chat-completions';
 }
 
 export interface IKimiSessionSummary {
@@ -269,14 +276,14 @@ export interface IKimiCodeSdkService {
 }
 
 /**
- * Kimi is configured through its public config API. The selected renderer
- * Provider model is installed before sessions are created, resumed, or change
- * models, and those config-sensitive operations are serialized.
+ * Kimi is configured through its public config API. The selected model is
+ * installed before sessions are created, resumed, or change models, and those
+ * config-sensitive operations are serialized.
  *
- * The overlay is derived from the *selected* model: a Kimi row reaches the
- * picker from the renderer BYOK catalog as `<vendor>/<provider-local id>`, so
- * the complete model id is handed to the wire-transparent provider proxy. The
- * harness therefore holds no gateway URL and no gateway credential of its own.
+ * The overlay is derived from the *selected* model. A BYOK row reaches the
+ * picker as `<vendor>/<provider-local id>` and a ChatGPT subscription row uses
+ * a host-qualified id; either complete id is handed to the wire-transparent
+ * provider proxy. The harness therefore holds no upstream URL or credential.
  *
  * No model endpoint or credential is written to `process.env`; shell tools
  * therefore cannot inherit provider configuration.
@@ -285,6 +292,7 @@ class KimiByokHarness implements IKimiHarness {
 	private readonly _sessions = new Map<string, IKimiSession>();
 	private readonly _configurationSequencer = new Sequencer();
 	private readonly _configuredModels = new Map<string, IKimiModelConfig>();
+	private readonly _configuredProviders = new Map<string, Readonly<Record<string, unknown>>>();
 
 	/**
 	 * The last model an operation named, reused by operations that carry none
@@ -357,23 +365,29 @@ class KimiByokHarness implements IKimiHarness {
 	}
 
 	private async _configureModel(agentModelId: string): Promise<void> {
-		const info = this._endpoint.lookupModel(agentModelId);
+		const info = this._endpoint.resolveModel(agentModelId);
+		if (parseChatGptSubscriptionModelId(agentModelId) && !info) {
+			throw new Error(`Kimi cannot run unknown ChatGPT subscription model '${agentModelId}'.`);
+		}
+		const wire = info?.wire ?? 'chat-completions';
+		const providerId = wire === 'responses' ? KimiSdkResponsesProviderId : KimiSdkProviderId;
+		this._configuredProviders.set(providerId, {
+			type: wire === 'responses' ? 'openai_responses' : 'kimi',
+			baseUrl: this._endpoint.providerBaseUrl(wire),
+			apiKey: this._endpoint.token,
+		});
 		this._configuredModels.set(agentModelId, {
-			provider: KimiSdkProviderId,
+			provider: providerId,
 			model: agentModelId,
 			maxContextSize: info?.maxContextWindowTokens ?? 128_000,
 			...(info?.maxOutputTokens !== undefined ? { maxOutputSize: info.maxOutputTokens } : {}),
 			capabilities: info?.supportsVision ? ['image_in', 'thinking'] : ['thinking'],
 			displayName: info?.name,
+			...(info?.supportedReasoningEfforts?.length ? { supportEfforts: info.supportedReasoningEfforts } : {}),
+			...(info?.defaultReasoningEffort ? { defaultEffort: info.defaultReasoningEffort } : {}),
 		});
 		await this._harness.replaceConfigSections({
-			providers: {
-				[KimiSdkProviderId]: {
-					type: 'kimi',
-					baseUrl: this._endpoint.providerBaseUrl(),
-					apiKey: this._endpoint.token,
-				},
-			},
+			providers: Object.fromEntries(this._configuredProviders),
 			models: Object.fromEntries(this._configuredModels),
 			defaultModel: agentModelId,
 		});
@@ -495,8 +509,24 @@ export class KimiCodeSdkService implements IKimiCodeSdkService {
 			// The SDK runs in this process and serves every session, so the token
 			// cannot be session-scoped; the proxy only requires a non-empty id.
 			token: `${handle.nonce}.kimi`,
-			providerBaseUrl: () => handle.providerBaseUrl('chat-completions'),
-			lookupModel: agentModelId => this._byokBridgeRegistry.getModels().find(m => getByokLmAgentModelId(m) === agentModelId),
+			providerBaseUrl: wire => handle.providerBaseUrl(wire),
+			resolveModel: agentModelId => {
+				const subscription = parseChatGptSubscriptionModelId(agentModelId);
+				if (subscription) {
+					const model = CHATGPT_SUBSCRIPTION_MODELS.find(candidate => candidate.id === subscription.modelId);
+					return model ? {
+						wire: 'responses',
+						name: model.name,
+						maxContextWindowTokens: model.maxContextWindowTokens,
+						maxOutputTokens: chatGptSubscriptionMaxOutputTokens(model),
+						supportsVision: model.supportsVision,
+						supportedReasoningEfforts: model.supportedReasoningEfforts,
+						defaultReasoningEffort: model.defaultReasoningEffort,
+					} : undefined;
+				}
+				const model = this._byokBridgeRegistry.getModels().find(candidate => getByokLmAgentModelId(candidate) === agentModelId);
+				return model ? { wire: 'chat-completions', ...model } : undefined;
+			},
 		});
 	}
 

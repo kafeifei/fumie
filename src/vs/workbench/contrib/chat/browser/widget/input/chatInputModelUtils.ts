@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ChatAgentLocation, ChatModeKind } from '../../../common/constants.js';
-import { ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, isLanguageModelVendorAbsenceConclusive } from '../../../common/languageModels.js';
+import { ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, isLanguageModelVendorAbsenceConclusive, isLanguageModelVisibleInPicker } from '../../../common/languageModels.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { localChatSessionType } from '../../../common/chatSessionsService.js';
 import { getChatSessionType, isUntitledChatSession } from '../../../common/model/chatUri.js';
@@ -123,12 +123,9 @@ export const getAgentHostByokManageModelsIdentifier = ILanguageModelChatMetadata
 export function isModelHiddenInPicker(
 	model: ILanguageModelChatMetadataAndIdentifier,
 	isModelHidden: (identifier: string) => boolean,
+	allModels: readonly ILanguageModelChatMetadataAndIdentifier[] = [model],
 ): boolean {
-	if (model.metadata.byokModelHidden || isModelHidden(model.identifier)) {
-		return true;
-	}
-	const manageModelsIdentifier = getAgentHostByokManageModelsIdentifier(model.metadata);
-	return manageModelsIdentifier !== undefined && isModelHidden(manageModelsIdentifier);
+	return !isLanguageModelVisibleInPicker(model, allModels, isModelHidden);
 }
 
 /**

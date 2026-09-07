@@ -194,6 +194,7 @@ function createConfigurationService(defaultModel?: string): IConfigurationServic
 
 interface ITestLanguageModelsService extends ILanguageModelsService {
 	setModelHidden(identifier: string, hidden: boolean): void;
+	setModels(models: readonly ILanguageModelChatMetadataAndIdentifier[]): void;
 	dispose(): void;
 }
 
@@ -204,13 +205,14 @@ function createLanguageModelsService(
 	const byIdentifier = new Map(models.map(candidate => [candidate.identifier, candidate.metadata]));
 	const hidden = new Set(hiddenModelIds);
 	const visibilityChanges = new Emitter<void>();
+	const languageModelChanges = new Emitter<void>();
 	return {
 		getLanguageModelIds: () => [...byIdentifier.keys()],
-		lookupLanguageModel: identifier => byIdentifier.get(identifier),
-		isModelHidden: identifier => hidden.has(identifier),
+		lookupLanguageModel: (identifier: string) => byIdentifier.get(identifier),
+		isModelHidden: (identifier: string) => hidden.has(identifier),
 		onDidChangeModelVisibility: visibilityChanges.event,
-		onDidChangeLanguageModels: Event.None,
-		setModelHidden(identifier, value) {
+		onDidChangeLanguageModels: languageModelChanges.event,
+		setModelHidden(identifier: string, value: boolean) {
 			const changed = value ? !hidden.has(identifier) : hidden.has(identifier);
 			if (!changed) {
 				return;
@@ -222,8 +224,18 @@ function createLanguageModelsService(
 			}
 			visibilityChanges.fire();
 		},
-		dispose: () => visibilityChanges.dispose(),
-	} as ITestLanguageModelsService;
+		setModels(nextModels: readonly ILanguageModelChatMetadataAndIdentifier[]) {
+			byIdentifier.clear();
+			for (const model of nextModels) {
+				byIdentifier.set(model.identifier, model.metadata);
+			}
+			languageModelChanges.fire();
+		},
+		dispose: () => {
+			visibilityChanges.dispose();
+			languageModelChanges.dispose();
+		},
+	} as unknown as ITestLanguageModelsService;
 }
 
 function createSessionsManagementService(types: readonly IProviderSessionType[]): ISessionsManagementService {
@@ -406,6 +418,86 @@ suite('SessionModelSelection', () => {
 
 		languageModelsService.setModelHidden(copilot.identifier, false);
 		assert.deepStrictEqual(selection.state.get().models.map(candidate => candidate.identifier), [custom.identifier, anthropic.identifier, copilot.identifier]);
+	});
+
+	test('withdraws an unavailable managed projection without rewriting an existing conversation', () => {
+		const projectionBase = model('agent-host-kimi:@provider=openai:gpt-test');
+		const projection = {
+			...projectionBase,
+			metadata: {
+				...projectionBase.metadata,
+				id: '@provider=openai:gpt-test',
+				underlyingModelId: 'gpt-test',
+				targetChatSessionType: 'agent-host-kimi',
+				sourceModel: {
+					sourceId: 'chatgptSubscription', modelId: 'gpt-test', visibilityNamespace: 'local', visibilityOwner: false,
+				},
+			},
+		};
+		const ownerBase = model('codex-subscription:@provider=openai:gpt-test');
+		const owner = {
+			...ownerBase,
+			metadata: {
+				...ownerBase.metadata,
+				id: '@provider=openai:gpt-test',
+				underlyingModelId: 'gpt-test',
+				targetChatSessionType: 'agent-host-codex',
+				sourceModel: {
+					sourceId: 'chatgptSubscription', modelId: 'gpt-test', visibilityNamespace: 'local', visibilityOwner: true,
+				},
+			},
+		};
+		const testSession = createSession('provider', SessionStatus.Completed, projection.identifier, 'kimi-session', 'kimi');
+		const provider = disposables.add(createProvider('provider'));
+		provider.modelTarget = 'agent-host-kimi';
+		provider.models = [projection];
+		const languageModelsService = disposables.add(createLanguageModelsService([projection, owner]));
+		const selection = disposables.add(new SessionModelSelection(
+			observableValue<IActiveSession | undefined>('session', testSession.session),
+			createProvidersService([provider]),
+			disposables.add(new InMemoryStorageService()),
+			createConfigurationService(),
+			disposables.add(new NullLogService()),
+			languageModelsService,
+		));
+
+		assert.deepStrictEqual({ models: selection.state.get().models.map(model => model.identifier), current: selection.state.get().currentModel?.identifier, writes: provider.writes }, {
+			models: [projection.identifier], current: projection.identifier, writes: [],
+		});
+
+		provider.models = [];
+		languageModelsService.setModelHidden(owner.identifier, true);
+		assert.deepStrictEqual({ models: selection.state.get().models, current: selection.state.get().currentModel, selected: testSession.modelId.get(), writes: provider.writes }, {
+			models: [], current: undefined, selected: projection.identifier, writes: [],
+		});
+
+		provider.models = [projection];
+		languageModelsService.setModelHidden(owner.identifier, false);
+		assert.deepStrictEqual({ models: selection.state.get().models.map(model => model.identifier), current: selection.state.get().currentModel?.identifier, selected: testSession.modelId.get(), writes: provider.writes }, {
+			models: [projection.identifier], current: projection.identifier, selected: projection.identifier, writes: [],
+		});
+
+		provider.models = [];
+		languageModelsService.setModels([]);
+		provider.modelChanges.fire();
+		assert.deepStrictEqual({ models: selection.state.get().models, current: selection.state.get().currentModel, selected: testSession.modelId.get(), writes: provider.writes }, {
+			models: [], current: undefined, selected: projection.identifier, writes: [],
+		});
+
+		// The canonical row can return before the host republishes its projection.
+		// That intermediate state must keep the same non-mutating hold.
+		languageModelsService.setModels([owner]);
+		provider.modelChanges.fire();
+		assert.deepStrictEqual({ models: selection.state.get().models, selected: testSession.modelId.get(), writes: provider.writes }, {
+			models: [], selected: projection.identifier, writes: [],
+		});
+
+		provider.models = [projection];
+		languageModelsService.setModels([projection, owner]);
+		provider.modelChanges.fire();
+		assert.deepStrictEqual({ models: selection.state.get().models.map(model => model.identifier), current: selection.state.get().currentModel?.identifier, selected: testSession.modelId.get(), writes: provider.writes }, {
+			models: [projection.identifier], current: projection.identifier, selected: projection.identifier, writes: [],
+		});
 	});
 
 	test('requests a typed harness switch and applies the pending model on the replacement draft', () => {
@@ -1830,6 +1922,30 @@ suite('SessionModelSelection', () => {
 				poolResolved: false,
 				models: [],
 				hasSelectableModel: false,
+			});
+		});
+
+		test('offers a managed projection to a new session only while its canonical owner exists', () => {
+			const sourceModel = { sourceId: 'chatgptSubscription', modelId: 'gpt-test', visibilityNamespace: 'local' };
+			const projectionBase = targetedModel('agent-host-mock:gpt-test', mockTarget);
+			const projection = {
+				...projectionBase,
+				metadata: { ...projectionBase.metadata, sourceModel: { ...sourceModel, visibilityOwner: false } },
+			};
+			const ownerBase = targetedModel('codex-subscription:gpt-test', 'agent-host-codex');
+			const owner = {
+				...ownerBase,
+				metadata: { ...ownerBase.metadata, sourceModel: { ...sourceModel, visibilityOwner: true } },
+			};
+
+			const withoutOwner = createLandingSelection({ models: [projection] }).state.get();
+			const withOwner = createLandingSelection({ models: [projection, owner] }).state.get();
+			assert.deepStrictEqual({
+				withoutOwner: withoutOwner.models.map(model => model.identifier),
+				withOwner: withOwner.models.map(model => model.identifier),
+			}, {
+				withoutOwner: [],
+				withOwner: [projection.identifier],
 			});
 		});
 

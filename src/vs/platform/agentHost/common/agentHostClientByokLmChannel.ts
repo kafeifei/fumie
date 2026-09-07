@@ -16,6 +16,7 @@ import {
 	IByokLmChatResult,
 	IByokLmModelInfo,
 	IByokLmProviderConfiguration,
+	IManagedChatGptModelInfo,
 } from './agentHostByokLm.js';
 
 /**
@@ -40,6 +41,7 @@ export function createAgentHostClientByokLmConnection(channel: IChannel): IByokL
 		chat: (request) => channel.call('chat', request) as Promise<IByokLmChatResult>,
 		resolveProviderConfiguration: modelIdentifier => channel.call('resolveProviderConfiguration', modelIdentifier) as Promise<IByokLmProviderConfiguration | undefined>,
 		onDidChangeModels: channel.listen<IByokLmModelInfo[]>('models'),
+		onDidChangeChatGptModels: channel.listen<IManagedChatGptModelInfo[]>('chatGptModels'),
 	};
 }
 
@@ -59,7 +61,10 @@ export class AgentHostClientByokLmChannel implements IServerChannel {
 
 	listen<T>(_ctx: unknown, event: string): Event<T> {
 		if (event === 'models') {
-			return this._modelsSnapshotEvent() as Event<T>;
+			return this._modelsSnapshotEvent(() => this._handler.listModels(CancellationToken.None)) as Event<T>;
+		}
+		if (event === 'chatGptModels') {
+			return this._modelsSnapshotEvent(() => this._handler.listChatGptModels?.(CancellationToken.None) ?? Promise.resolve([])) as Event<T>;
 		}
 		throw new Error(`No event '${event}' on AgentHostClientByokLmChannel`);
 	}
@@ -72,10 +77,10 @@ export class AgentHostClientByokLmChannel implements IServerChannel {
 	 * A {@link Throttler} serializes overlapping publishes and coalesces bursts,
 	 * so a slow enumeration can't fire a stale snapshot after a newer one.
 	 */
-	private _modelsSnapshotEvent(): Event<IByokLmModelInfo[]> {
+	private _modelsSnapshotEvent<T>(listModels: () => Promise<T[]>): Event<T[]> {
 		const store = new DisposableStore();
 		const throttler = store.add(new Throttler());
-		const emitter = store.add(new Emitter<IByokLmModelInfo[]>({
+		const emitter = store.add(new Emitter<T[]>({
 			onDidAddFirstListener: () => {
 				if (this._handler.onDidChangeModels) {
 					store.add(this._handler.onDidChangeModels(() => void publish()));
@@ -90,7 +95,7 @@ export class AgentHostClientByokLmChannel implements IServerChannel {
 			}
 			throttler.queue(async () => {
 				try {
-					const models = await this._handler.listModels(CancellationToken.None);
+					const models = await listModels();
 					if (!store.isDisposed) {
 						this._logService.trace(`AgentHostClientByokLmChannel: publishing ${models.length} model(s)`);
 						emitter.fire(models);
@@ -123,7 +128,7 @@ export class AgentHostClientByokLmChannel implements IServerChannel {
 export class NullAgentHostClientByokLmChannel implements IServerChannel {
 
 	listen<T>(_ctx: unknown, event: string): Event<T> {
-		if (event === 'models') {
+		if (event === 'models' || event === 'chatGptModels') {
 			return Event.None;
 		}
 		throw new Error(`No event '${event}' on NullAgentHostClientByokLmChannel`);

@@ -258,7 +258,7 @@ function getCopilotPresentation(
 				kind: 'default',
 				icon: Codicon.account,
 				label: localize('agentsSignInOptional', "Sign In"),
-				ariaLabel: localize('agentsSignInOptionalAria', "Sign in to GitHub to use more agents"),
+				ariaLabel: localize('agentsSignInForRemoteControlAria', "Sign in to GitHub to enable remote control"),
 			};
 		}
 		return {

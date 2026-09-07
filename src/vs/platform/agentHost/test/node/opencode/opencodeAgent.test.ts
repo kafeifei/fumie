@@ -6,21 +6,40 @@
 import assert from 'assert';
 import { DeferredPromise } from '../../../../../base/common/async.js';
 import { Emitter } from '../../../../../base/common/event.js';
+import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
 import type { IProductService } from '../../../../product/common/productService.js';
 import { OPENCODE_AGENT_PROVIDER_ID, type AgentSignal, type IAgentModelInfo } from '../../../common/agent.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID, readAgentModelSourceId } from '../../../common/agentModelSource.js';
+import { readAgentModelByokHidden, readAgentModelByokIdentifier } from '../../../common/agentModelByokMeta.js';
+import type { IByokLmModelInfo } from '../../../common/agentHostByokLm.js';
 import type { ModelSelection } from '../../../common/state/protocol/state.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import { MessageKind, type PendingMessage } from '../../../common/state/sessionState.js';
-import { OpencodeAgent, opencodeCatalogModels, opencodeVariant } from '../../../node/opencode/opencodeAgent.js';
-import type { IOpencodeEvent, IOpencodeServer, IOpencodeServerService } from '../../../node/opencode/opencodeServerService.js';
+import { OpencodeAgent, opencodeProviderModels, opencodeVariant } from '../../../node/opencode/opencodeAgent.js';
+import { OPENCODE_BYOK_PROVIDER_ID, type IOpencodeEvent, type IOpencodeServer, type IOpencodeServerService } from '../../../node/opencode/opencodeServerService.js';
+import { CHATGPT_SUBSCRIPTION_PROVIDER_NAME, type IChatGptSubscriptionModel } from '../../../node/chatGptSubscription.js';
+import type { IByokLmBridgeRegistry } from '../../../node/byokLmBridgeRegistry.js';
+import { createTestChatGptSubscriptionService } from '../testChatGptSubscriptionService.js';
 
-type CatalogModel = { name?: string; variants?: Record<string, unknown> };
+function subscriptionModel(id: string, efforts: readonly string[] = []): IChatGptSubscriptionModel {
+	return { id, name: id, maxContextWindowTokens: 128_000, supportsVision: false, supportedReasoningEfforts: efforts, defaultReasoningEffort: efforts[0] ?? 'medium' };
+}
 
-function rowFor(models: Record<string, CatalogModel>): IAgentModelInfo {
-	const rows = opencodeCatalogModels(OPENCODE_AGENT_PROVIDER_ID, { providers: [{ id: 'openai', models }] });
+function byokRegistry(models: readonly IByokLmModelInfo[] = []): IByokLmBridgeRegistry {
+	return {
+		_serviceBrand: undefined,
+		register: () => Disposable.None,
+		getModels: () => models,
+		getServingConnection: () => undefined,
+		onDidChangeModels: () => Disposable.None,
+	};
+}
+
+function rowFor(efforts: readonly string[]): IAgentModelInfo {
+	const rows = opencodeProviderModels(OPENCODE_AGENT_PROVIDER_ID, [], [subscriptionModel('gpt-test', efforts)]);
 	assert.strictEqual(rows.length, 1);
 	return rows[0];
 }
@@ -29,16 +48,11 @@ function thinkingLevel(row: IAgentModelInfo) {
 	return row.configSchema?.properties['thinkingLevel'];
 }
 
-suite('opencodeCatalogModels - thinking level', () => {
+suite('opencodeProviderModels - thinking level', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
 
 	test('projects a model variants map onto a thinkingLevel picker entry', () => {
-		const row = rowFor({
-			'gpt-5.4-mini': {
-				name: 'GPT-5.4 mini',
-				variants: { high: {}, none: {}, medium: {}, low: {}, xhigh: {} },
-			},
-		});
+		const row = rowFor(['high', 'none', 'medium', 'low', 'xhigh']);
 		const property = thinkingLevel(row);
 		assert.ok(property);
 		assert.strictEqual(property.type, 'string');
@@ -51,69 +65,76 @@ suite('opencodeCatalogModels - thinking level', () => {
 	});
 
 	test('keeps a model without variants free of a config schema', () => {
-		assert.strictEqual(rowFor({ 'gpt-5.4-mini': { name: 'GPT-5.4 mini' } }).configSchema, undefined);
-		assert.strictEqual(rowFor({ 'gpt-5.4-mini': { name: 'GPT-5.4 mini', variants: {} } }).configSchema, undefined);
+		assert.strictEqual(rowFor([]).configSchema, undefined);
 	});
 
 	test('orders every tier opencode actually publishes', () => {
-		// The `opencode` provider's own models really do carry `minimal`, which
-		// belongs between `none` and `low` rather than after `xhigh`.
-		const property = thinkingLevel(rowFor({
-			'muse-spark-1.3': { variants: { high: {}, minimal: {}, xhigh: {}, low: {}, medium: {} } },
-		}));
+		// Provider variants may carry `minimal`, which belongs between `none`
+		// and `low` rather than after `xhigh`.
+		const property = thinkingLevel(rowFor(['high', 'minimal', 'xhigh', 'low', 'medium']));
 		assert.deepStrictEqual(property?.enum, ['minimal', 'low', 'medium', 'high', 'xhigh']);
 	});
 
 	test('appends variant keys it does not know after the ordered ones', () => {
-		const property = thinkingLevel(rowFor({
-			'gpt-5.6': { variants: { max: {}, turbo: {}, low: {}, glacial: {} } },
-		}));
+		const property = thinkingLevel(rowFor(['max', 'turbo', 'low', 'glacial']));
 		assert.deepStrictEqual(property?.enum, ['low', 'max', 'turbo', 'glacial']);
 		// An unknown key still gets a presentable label rather than surfacing raw.
 		assert.deepStrictEqual(property?.enumLabels, ['Low', 'Max', 'Turbo', 'Glacial']);
+	});
+
+	test('projects only compatible BYOK rows and the managed subscription rows', () => {
+		const byok: IByokLmModelInfo[] = [
+			{ vendor: 'customendpoint', id: 'claude-test', modelIdentifier: 'customendpoint/Test/claude-test', supportedHarnesses: ['opencode'], hidden: true },
+			{ vendor: 'other', id: 'not-compatible', modelIdentifier: 'other/not-compatible', supportedHarnesses: ['pi'] },
+		];
+		const rows = opencodeProviderModels(OPENCODE_AGENT_PROVIDER_ID, byok, [subscriptionModel('gpt-test')]);
+		assert.deepStrictEqual(rows.map(row => row.id), [`${OPENCODE_BYOK_PROVIDER_ID}/customendpoint/Test/claude-test`, `${CHATGPT_SUBSCRIPTION_PROVIDER_NAME}/gpt-test`]);
+		assert.strictEqual(readAgentModelByokIdentifier(rows[0]), 'customendpoint/Test/claude-test');
+		assert.strictEqual(readAgentModelByokHidden(rows[0]), true);
+		assert.strictEqual(readAgentModelSourceId(rows[1]), CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID);
 	});
 });
 
 suite('opencodeVariant', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
 
-	const catalog = opencodeCatalogModels(OPENCODE_AGENT_PROVIDER_ID, {
-		providers: [
-			{ id: 'openai', models: { 'gpt-5.4-mini': { variants: { low: {}, medium: {}, high: {}, max: {} } }, 'gpt-4.1': {} } },
-			{ id: 'opencode', models: { 'muse-spark-1.3': { variants: { minimal: {}, low: {}, high: {} } } } },
-		],
-	});
+	const catalog = opencodeProviderModels(OPENCODE_AGENT_PROVIDER_ID, [], [
+		subscriptionModel('gpt-5.4-mini', ['low', 'medium', 'high', 'max']),
+		subscriptionModel('gpt-4.1'),
+		subscriptionModel('gpt-minimal', ['minimal', 'low', 'high']),
+	]);
+	const qualified = (id: string) => `${CHATGPT_SUBSCRIPTION_PROVIDER_NAME}/${id}`;
 
 	function selection(id: string, config?: ModelSelection['config']): ModelSelection {
 		return { id, ...(config ? { config } : {}) };
 	}
 
 	test('reads the picked level off the model selection', () => {
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-5.4-mini', { thinkingLevel: 'low' }), catalog), 'low');
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-5.4-mini', { thinkingLevel: 'max' }), catalog), 'max');
-		assert.strictEqual(opencodeVariant(selection('opencode/muse-spark-1.3', { thinkingLevel: 'minimal' }), catalog), 'minimal');
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-5.4-mini'), { thinkingLevel: 'low' }), catalog), 'low');
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-5.4-mini'), { thinkingLevel: 'max' }), catalog), 'max');
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-minimal'), { thinkingLevel: 'minimal' }), catalog), 'minimal');
 	});
 
 	test('sends nothing when no level is picked', () => {
 		assert.strictEqual(opencodeVariant(undefined, catalog), undefined);
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-5.4-mini'), catalog), undefined);
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-5.4-mini', { thinkingLevel: '' }), catalog), undefined);
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-5.4-mini', { thinkingLevel: 3 }), catalog), undefined);
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-5.4-mini')), catalog), undefined);
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-5.4-mini'), { thinkingLevel: '' }), catalog), undefined);
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-5.4-mini'), { thinkingLevel: 3 }), catalog), undefined);
 	});
 
 	test('drops a level the picked model does not publish', () => {
 		// A pick carried over from a model whose variant set is a different one:
-		// `minimal` is opencode-zen's, `max` is OpenAI's, and neither model has
-		// the other's.
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-5.4-mini', { thinkingLevel: 'minimal' }), catalog), undefined);
-		assert.strictEqual(opencodeVariant(selection('opencode/muse-spark-1.3', { thinkingLevel: 'max' }), catalog), undefined);
+		// The two models publish different variant sets and cannot inherit each
+		// other's selection.
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-5.4-mini'), { thinkingLevel: 'minimal' }), catalog), undefined);
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-minimal'), { thinkingLevel: 'max' }), catalog), undefined);
 		// A model with no variants at all takes no level either.
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-4.1', { thinkingLevel: 'low' }), catalog), undefined);
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-4.1'), { thinkingLevel: 'low' }), catalog), undefined);
 	});
 
 	test('drops a level when the model is not in the catalog', () => {
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-9', { thinkingLevel: 'low' }), catalog), undefined);
-		assert.strictEqual(opencodeVariant(selection('openai/gpt-5.4-mini', { thinkingLevel: 'low' }), []), undefined);
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-9'), { thinkingLevel: 'low' }), catalog), undefined);
+		assert.strictEqual(opencodeVariant(selection(qualified('gpt-5.4-mini'), { thinkingLevel: 'low' }), []), undefined);
 	});
 });
 
@@ -128,6 +149,12 @@ suite('OpencodeAgent native turn lifecycle', () => {
 	let prompts: { sessionID: string; messageID: string; result: DeferredPromise<unknown> }[];
 	let sessions: number;
 	let sessionCreation: DeferredPromise<{ id: string }> | undefined;
+	let server: IOpencodeServer;
+	let currentServer: IOpencodeServer;
+	let releasedServers: IOpencodeServer[];
+	let providerModels: IByokLmModelInfo[];
+	let providerChanges: Emitter<void>;
+	let generationModels: Map<IOpencodeServer, ReadonlySet<string>>;
 
 	teardown(async () => {
 		await agent.shutdown();
@@ -181,7 +208,10 @@ suite('OpencodeAgent native turn lifecycle', () => {
 		prompts = [];
 		sessions = 0;
 		sessionCreation = undefined;
-		const server: IOpencodeServer = {
+		providerModels = [{ vendor: 'customendpoint', id: 'test-model', modelIdentifier: 'customendpoint/Test/test-model', supportedHarnesses: ['opencode'] }];
+		providerChanges = store.add(new Emitter<void>());
+		generationModels = new Map();
+		server = {
 			cwd: cwd.fsPath, baseUrl: 'http://fake-opencode', onDidReceiveEvent: events.event, onDidClose: close.event,
 			dispose() { },
 			async request<T>(_method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
@@ -194,6 +224,9 @@ suite('OpencodeAgent native turn lifecycle', () => {
 						return await sessionCreation.p as T;
 					}
 					return { id: `ses_${++sessions}` } as T;
+				}
+				if (_method === 'GET' && path.endsWith('/message')) {
+					return [] as T;
 				}
 				if (path.endsWith('/message')) {
 					const sessionID = path.split('/')[2];
@@ -209,10 +242,39 @@ suite('OpencodeAgent native turn lifecycle', () => {
 				return undefined as T;
 			},
 		};
-		const service: IOpencodeServerService = { _serviceBrand: undefined, acquire: async () => server, close: async () => { } };
-		agent = store.add(new OpencodeAgent(service, new NullLogService(), {} as IProductService));
+		currentServer = server;
+		generationModels.set(server, new Set([`${OPENCODE_BYOK_PROVIDER_ID}/customendpoint/Test/test-model`]));
+		releasedServers = [];
+		const service: IOpencodeServerService = {
+			_serviceBrand: undefined,
+			acquire: async () => currentServer,
+			release: released => releasedServers.push(released),
+			isModelAvailable: (generation, modelId) => {
+				const models = generationModels.get(generation);
+				return !!models && (modelId ? models.has(modelId) : models.size > 0);
+			},
+			close: async () => { },
+		};
+		const registry: IByokLmBridgeRegistry = {
+			...byokRegistry(),
+			getModels: () => providerModels,
+			onDidChangeModels: providerChanges.event,
+		};
+		agent = store.add(new OpencodeAgent(service, new NullLogService(), {} as IProductService, registry, createTestChatGptSubscriptionService()));
 		store.add(agent.onDidChatProgress(signal => signals.push(signal)));
 		await agent.chats.createChat(chat, chat, { workingDirectories: [cwd] });
+	});
+
+	test('reads an existing transcript after every Provider model is hidden but rejects a new turn', async () => {
+		const first = await start();
+		await first.prompt.result.complete({});
+		await first.done;
+
+		providerModels = providerModels.map(model => ({ ...model, hidden: true }));
+		providerChanges.fire();
+		assert.deepStrictEqual(await agent.chats.getMessages(chat, chat), []);
+		assert.ok(requests.some(request => request.path === '/session/ses_1/message'));
+		await assert.rejects(agent.chats.sendMessage(chat, 'Blocked', [cwd], undefined, 'blocked-turn'), /no visible compatible model/);
 	});
 
 	test('steers without waiting for send or aborting; acknowledges only correlated model activity and leaves FIFO alone', async () => {
@@ -268,6 +330,73 @@ suite('OpencodeAgent native turn lifecycle', () => {
 		assert.strictEqual(signals.filter(signal => signal.kind === 'subagent_completed').length, 1);
 		await second.prompt.result.complete({});
 		await second.done;
+	});
+
+	test('rejects the new default and an explicit new model while background work retains an older server generation', async () => {
+		const first = await start();
+		task();
+		await first.prompt.result.complete({});
+		await first.done;
+
+		const modelId = `${OPENCODE_BYOK_PROVIDER_ID}/customendpoint/Test/new-model`;
+		providerModels = [{ vendor: 'customendpoint', id: 'new-model', modelIdentifier: 'customendpoint/Test/new-model', supportedHarnesses: ['opencode'] }];
+		providerChanges.fire();
+		const promptCount = prompts.length;
+		await assert.rejects(
+			agent.chats.sendMessage(chat, 'Use the new default', [cwd], undefined, 'new-default-turn'),
+			/not available in this chat's active OpenCode process.*background work to finish/,
+		);
+		await agent.chats.changeModel(chat, { id: modelId }, chat);
+		await assert.rejects(
+			agent.chats.sendMessage(chat, 'Use the explicitly selected new model', [cwd], undefined, 'new-model-turn'),
+			/not available in this chat's active OpenCode process.*background work to finish/,
+		);
+		assert.strictEqual(prompts.length, promptCount, 'neither new model route may be sent to the retained generation');
+	});
+
+	test('an idle chat adopts a new server generation while a chat with a native child keeps the old one', async () => {
+		const first = await start();
+		task();
+		await first.prompt.result.complete({});
+		await first.done;
+
+		const other = URI.parse('ahp-chat:/opencode-other');
+		await agent.chats.createChat(other, other, { workingDirectories: [cwd] });
+		const otherFirstDone = agent.chats.sendMessage(other, 'First', [cwd], undefined, 'other-1');
+		await flush();
+		const otherFirst = prompts.at(-1)!;
+		message(otherFirst.sessionID, 'other-assistant-1', 'assistant', otherFirst.messageID);
+		await otherFirst.result.complete({});
+		await otherFirstDone;
+		assert.deepStrictEqual(releasedServers, [server], 'only the idle chat releases its old-generation lease');
+
+		const nextRequests: { path: string; body?: unknown }[] = [];
+		const nextServer: IOpencodeServer = {
+			...server,
+			baseUrl: 'http://fake-opencode-next',
+			request: async <T>(method: 'GET' | 'POST', path: string, body?: unknown) => {
+				nextRequests.push({ path, body });
+				return server.request<T>(method, path, body);
+			},
+		};
+		currentServer = nextServer;
+		generationModels.set(nextServer, new Set([`${OPENCODE_BYOK_PROVIDER_ID}/customendpoint/Test/test-model`]));
+
+		const otherSecondDone = agent.chats.sendMessage(other, 'Second', [cwd], undefined, 'other-2');
+		await flush();
+		const otherSecond = prompts.at(-1)!;
+		assert.strictEqual(otherSecond.sessionID, otherFirst.sessionID, 'native session id survives the generation switch');
+		assert.ok(nextRequests.some(request => request.path === `/session/${otherFirst.sessionID}/message`));
+		message(otherSecond.sessionID, 'other-assistant-2', 'assistant', otherSecond.messageID);
+		await otherSecond.result.complete({});
+		await otherSecondDone;
+
+		const oldRequestCount = requests.length;
+		const parentSecond = await start(chat, 'turn-2');
+		assert.ok(requests.length > oldRequestCount, 'the chat with a live native child stays on its retained server');
+		assert.ok(!nextRequests.some(request => request.path === `/session/${first.prompt.sessionID}/message`));
+		await parentSecond.prompt.result.complete({});
+		await parentSecond.done;
 	});
 
 	test('follow-up before the original HTTP response stays in its active host turn until native idle', async () => {

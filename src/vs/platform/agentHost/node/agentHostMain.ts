@@ -194,8 +194,7 @@ async function startAgentHost(): Promise<void> {
 		}
 		// Claude and Codex providers are gated on two things:
 		//  1. The user-facing enable toggle (`chat.agentHost.<x>Agent.enabled`,
-		//     forwarded as an env var by the starters). Claude defaults to on,
-		//     Codex defaults to off.
+		//     forwarded as an env var by the starters). Built-in agents default on.
 		//  2. The SDK being reachable. Claude is a devDependency of this repo
 		//     so the bare-import path in `ClaudeAgentSdkService._loadSdk`
 		//     always succeeds in dev; in built products the SDK ships via
@@ -218,7 +217,12 @@ async function startAgentHost(): Promise<void> {
 			register: () => void,
 			enabledByDefault?: boolean,
 		): void => {
-			disposables.add(registerProviderWhenEnabled(agentConfigurationService, { enabledEnvVar, rootConfigKey, enabledByDefault }, register));
+			disposables.add(registerProviderWhenEnabled(agentConfigurationService, {
+				enabledEnvVar,
+				rootConfigKey,
+				enabledByDefault,
+				onRegistrationError: error => logService.error(`[AgentHost] Failed to register provider enabled by ${rootConfigKey}`, error),
+			}, register));
 		};
 		if ((!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes('claude')) && (!environmentService.isBuilt || agentSdkDownloader.isAvailable(ClaudeSdkPackage))) {
 			registerWhenEnabled(AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeEnabledConfigKey, () => {
@@ -273,7 +277,7 @@ async function startAgentHost(): Promise<void> {
 		// The ACP providers have no SDK to download and no model catalog to wait
 		// for: the protocol client ships with the product and the agents are
 		// user-installed command-line tools. So they register directly, gated only
-		// on the enable toggle (default off) and the product allowlist. An agent
+		// on the enable toggle and the product allowlist. An agent
 		// that turns out not to be installed reports that on first send, which is
 		// the only moment the process would have been started anyway.
 		//

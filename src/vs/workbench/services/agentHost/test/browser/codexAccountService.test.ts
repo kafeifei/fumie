@@ -66,7 +66,7 @@ suite('CodexAccountService', () => {
 		const actions = createCodexAccountMenuActions(accountService);
 		assert.ok(actions[0] instanceof Action);
 		disposables.add(actions[0] as Action);
-		assert.strictEqual(actions[0].label, 'Sign in to ChatGPT');
+		assert.strictEqual(actions[0].label, 'Sign in to ChatGPT to access OpenAI models');
 		await actions[0].run();
 		assert.strictEqual(accountService.signInCalls, 1);
 	});

@@ -266,7 +266,7 @@ async function main(): Promise<void> {
 		//  1. The user-facing enable toggle (`chat.agentHost.<x>Agent.enabled`,
 		//     forwarded as an env var by the renderer-side starters; the remote
 		//     server reads the env directly). Claude defaults to on, Codex
-		//     defaults to off.
+		//     defaults to on.
 		//  2. The SDK being reachable. Claude is a devDependency of this repo
 		//     so the bare-import path in `ClaudeAgentSdkService._loadSdk`
 		//     always succeeds in dev; in built/shipped server installs the
@@ -288,7 +288,12 @@ async function main(): Promise<void> {
 			register: () => void,
 			enabledByDefault?: boolean,
 		): void => {
-			disposables.add(registerProviderWhenEnabled(agentConfigurationService, { enabledEnvVar, rootConfigKey, enabledByDefault }, register));
+			disposables.add(registerProviderWhenEnabled(agentConfigurationService, {
+				enabledEnvVar,
+				rootConfigKey,
+				enabledByDefault,
+				onRegistrationError: error => logService.error(`[AgentHost] Failed to register provider enabled by ${rootConfigKey}`, error),
+			}, register));
 		};
 		if ((!product.sessionsAllowedAgentHostProviders || product.sessionsAllowedAgentHostProviders.includes('claude')) && (!environmentService.isBuilt || agentSdkDownloader.isAvailable(ClaudeSdkPackage))) {
 			registerWhenEnabled(AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeEnabledConfigKey, () => {

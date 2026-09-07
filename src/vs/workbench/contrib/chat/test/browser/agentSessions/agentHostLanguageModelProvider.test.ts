@@ -263,6 +263,22 @@ suite('AgentHostLanguageModelProvider', () => {
 		]);
 	});
 
+	test('stamps explicit canonical visibility ownership with the bare source model id', async () => {
+		const projection = store.add(new AgentHostLanguageModelProvider('agent-host-kimi', 'kimi', 'owned', undefined, {
+			namespace: 'local', sourceId: 'chatgptSubscription', owner: false,
+		}));
+		projection.updateModels([
+			{ id: '@provider=openai:gpt-test', underlyingModelId: 'gpt-test', provider: 'kimi', name: 'GPT Test', _meta: { modelSourceId: 'chatgptSubscription' } },
+			{ id: 'custom/gpt-test', underlyingModelId: 'gpt-test', provider: 'kimi', name: 'Custom GPT' },
+		]);
+
+		const infos = await projection.provideLanguageModelChatInfo(undefined, CancellationToken.None);
+		assert.deepStrictEqual(infos.map(info => info.metadata.sourceModel), [
+			{ sourceId: 'chatgptSubscription', modelId: 'gpt-test', visibilityNamespace: 'local', visibilityOwner: false },
+			undefined,
+		]);
+	});
+
 	test('omits the model group when the provider is empty', async () => {
 		const provider = createProvider();
 		provider.updateModels([{ id: 'x', provider: '', name: 'X' }]);

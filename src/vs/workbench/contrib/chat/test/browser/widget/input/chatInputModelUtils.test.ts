@@ -1646,6 +1646,43 @@ suite('ChatInputModelUtils', () => {
 		});
 	});
 
+	suite('canonical source model visibility', () => {
+		function sourceModel(identifier: string, namespace: string, owner: boolean): ILanguageModelChatMetadataAndIdentifier {
+			const result = createModel(identifier, identifier);
+			return {
+				...result,
+				metadata: {
+					...result.metadata,
+					sourceModel: {
+						sourceId: 'chatgptSubscription',
+						modelId: 'gpt-test',
+						visibilityNamespace: namespace,
+						visibilityOwner: owner,
+					},
+				},
+			};
+		}
+
+		test('projection follows canonical owner removal, visibility, and restoration', () => {
+			const projection = sourceModel('agent-host-kimi:@provider=openai:gpt-test', 'local', false);
+			const owner = sourceModel('codex-subscription:@provider=openai:gpt-test', 'local', true);
+
+			assert.strictEqual(isModelHiddenInPicker(projection, () => false, [projection, owner]), false);
+			assert.strictEqual(isModelHiddenInPicker(projection, () => false, [projection]), true);
+			assert.strictEqual(isModelHiddenInPicker(projection, id => id === owner.identifier, [projection, owner]), true);
+			assert.strictEqual(isModelHiddenInPicker(projection, () => false, [projection, owner]), false);
+		});
+
+		test('same source and model from another host cannot own a local projection', () => {
+			const projection = sourceModel('agent-host-kimi:@provider=openai:gpt-test', 'local', false);
+			const remoteOwner = sourceModel('remote-codex-subscription:gpt-test', 'remote-account', true);
+			const independentRemote = createModel('remote-agent-host-kimi:gpt-test', 'GPT Test');
+
+			assert.strictEqual(isModelHiddenInPicker(projection, () => false, [projection, remoteOwner]), true);
+			assert.strictEqual(isModelHiddenInPicker(independentRemote, () => false, [independentRemote]), false);
+		});
+	});
+
 	suite('resolveEditedRequestSelection', () => {
 
 		test('a resubmit uses the inline editor\'s selection, not the composer\'s', () => {

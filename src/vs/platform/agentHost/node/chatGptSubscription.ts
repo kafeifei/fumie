@@ -6,6 +6,7 @@
 import { Emitter, Event } from '../../../base/common/event.js';
 import { Disposable, IDisposable, MutableDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
+import { IByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
 
 /**
  * Lets a native harness run the user's ChatGPT subscription models.
@@ -23,6 +24,15 @@ import { createDecorator } from '../../instantiation/common/instantiation.js';
  * id space, whose ids are `<vendor>/<model>` and are split on the first `/`.
  */
 export const CHATGPT_SUBSCRIPTION_SOURCE = 'chatgpt-subscription';
+
+/**
+ * Provider name used by harnesses whose own model registry requires a
+ * `provider/model` selection id. The wire model remains the
+ * `@provider=${CHATGPT_SUBSCRIPTION_SOURCE}:...` id produced by
+ * {@link chatGptSubscriptionAgentModelId}; this name exists only inside those
+ * harness registries.
+ */
+export const CHATGPT_SUBSCRIPTION_PROVIDER_NAME = 'fumie-chatgpt-subscription';
 
 /**
  * Inference endpoint for a ChatGPT subscription. Note this is the ChatGPT
@@ -57,6 +67,7 @@ export interface IChatGptSubscriptionModel {
 	readonly id: string;
 	readonly name: string;
 	readonly maxContextWindowTokens: number;
+	readonly maxOutputTokens?: number;
 	readonly supportsVision: boolean;
 	/**
 	 * Reasoning efforts upstream accepts. A harness narrows this to the levels
@@ -87,7 +98,7 @@ const CHATGPT_SUBSCRIPTION_MAX_OUTPUT_TOKENS = 128_000;
 
 /** {@link CHATGPT_SUBSCRIPTION_MAX_OUTPUT_TOKENS} kept inside `model`'s window. */
 export function chatGptSubscriptionMaxOutputTokens(model: IChatGptSubscriptionModel): number {
-	return Math.min(CHATGPT_SUBSCRIPTION_MAX_OUTPUT_TOKENS, model.maxContextWindowTokens);
+	return Math.min(model.maxOutputTokens ?? CHATGPT_SUBSCRIPTION_MAX_OUTPUT_TOKENS, model.maxContextWindowTokens);
 }
 
 /**
@@ -337,12 +348,14 @@ export const IChatGptSubscriptionService = createDecorator<IChatGptSubscriptionS
 
 export interface IChatGptSubscriptionService {
 	readonly _serviceBrand: undefined;
-	/** Fires when {@link isSignedIn} may have changed, including on (de)registration. */
+	/** Fires when subscription access or its managed model catalog may have changed. */
 	readonly onDidChangeSignedIn: Event<void>;
 	/** Registers the credential owner. Disposing the result removes it. */
 	registerSource(source: IChatGptSubscriptionSource): IDisposable;
 	/** Whether a ChatGPT subscription is signed in and can serve inference. */
 	isSignedIn(): boolean;
+	/** Models that the configured Fumie Provider currently offers for selection. */
+	getModels(): readonly IChatGptSubscriptionModel[];
 	/** The credentials for the next upstream request. Rejects when there are none. */
 	readCredentials(): Promise<IChatGptSubscriptionCredentials>;
 }
@@ -356,6 +369,11 @@ export class ChatGptSubscriptionService extends Disposable implements IChatGptSu
 
 	private readonly _sourceListener = this._register(new MutableDisposable());
 	private _source: IChatGptSubscriptionSource | undefined;
+
+	constructor(@IByokLmBridgeRegistry private readonly _bridgeRegistry: IByokLmBridgeRegistry) {
+		super();
+		this._register(this._bridgeRegistry.onDidChangeModels(() => this._onDidChangeSignedIn.fire()));
+	}
 
 	registerSource(source: IChatGptSubscriptionSource): IDisposable {
 		this._source = source;
@@ -372,6 +390,34 @@ export class ChatGptSubscriptionService extends Disposable implements IChatGptSu
 
 	isSignedIn(): boolean {
 		return this._source?.isSignedIn() === true;
+	}
+
+	getModels(): readonly IChatGptSubscriptionModel[] {
+		if (!this.isSignedIn()) {
+			return [];
+		}
+		const supported = new Map(CHATGPT_SUBSCRIPTION_MODELS.map(model => [model.id, model]));
+		const result = new Map<string, IChatGptSubscriptionModel>();
+		for (const model of this._bridgeRegistry.getChatGptModels?.() ?? []) {
+			const capability = supported.get(model.id);
+			if (!capability) {
+				continue;
+			}
+			const efforts = model.supportedReasoningEfforts
+				? capability.supportedReasoningEfforts.filter(effort => model.supportedReasoningEfforts!.includes(effort))
+				: capability.supportedReasoningEfforts;
+			const preferred = model.defaultReasoningEffort ?? capability.defaultReasoningEffort;
+			result.set(model.id, {
+				...capability,
+				name: model.name,
+				...(model.maxContextWindowTokens && model.maxContextWindowTokens > 0 ? { maxContextWindowTokens: model.maxContextWindowTokens } : {}),
+				...(model.maxOutputTokens && model.maxOutputTokens > 0 ? { maxOutputTokens: model.maxOutputTokens } : {}),
+				...(model.supportsVision !== undefined ? { supportsVision: model.supportsVision } : {}),
+				supportedReasoningEfforts: efforts,
+				defaultReasoningEffort: efforts.includes(preferred) ? preferred : efforts[0] ?? capability.defaultReasoningEffort,
+			});
+		}
+		return [...result.values()];
 	}
 
 	async readCredentials(): Promise<IChatGptSubscriptionCredentials> {

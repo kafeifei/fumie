@@ -50,6 +50,17 @@ export interface IAgentVendorModel extends SessionModelInfo {
 }
 
 /**
+ * Explicit ownership relationship for source-backed models published by this
+ * provider. A provider without this option keeps the legacy independent
+ * visibility behavior, which is required for remote hosts and older catalogs.
+ */
+export interface IAgentHostModelVisibilitySource {
+	readonly namespace: string;
+	readonly sourceId: string;
+	readonly owner: boolean;
+}
+
+/**
  * The models an agent's own vendor publishes: everything it advertises, with
  * the rows that belong to a first-party subscription marked unselectable.
  *
@@ -90,6 +101,7 @@ export class AgentHostLanguageModelProvider extends Disposable implements ILangu
 		private readonly _vendor: string,
 		private readonly _modelCatalog: NonNullable<AgentCapabilities['modelCatalog']> = 'owned',
 		private readonly _presentation?: IAgentHostModelProviderPresentation,
+		private readonly _visibilitySource?: IAgentHostModelVisibilitySource,
 	) {
 		super();
 		if (this._presentation) {
@@ -148,6 +160,7 @@ export class AgentHostLanguageModelProvider extends Disposable implements ILangu
 					? ILanguageModelChatMetadata.getAutoModelDescription(hasDiscount ? discountPercent : undefined)
 					: undefined;
 				const modelGroup = this._modelGroupFor(m);
+				const sourceModel = this._sourceModelFor(m);
 				const byokModelIdentifier = readAgentModelByokIdentifier(m);
 				// The host's own Manage Models visibility, carried so a client that has no
 				// copy of that state can grey the row instead of dropping it.
@@ -197,6 +210,7 @@ export class AgentHostLanguageModelProvider extends Disposable implements ILangu
 						// models share one vendor, so without this they'd render as a single
 						// undifferentiated bucket. Presentation-only; routing stays by vendor.
 						...(modelGroup ? { modelGroup } : {}),
+						...(sourceModel ? { sourceModel } : {}),
 						...(byokModelIdentifier !== undefined && { byokModelIdentifier }),
 						...(byokModelHidden && { byokModelHidden }),
 						capabilities: {
@@ -208,6 +222,20 @@ export class AgentHostLanguageModelProvider extends Disposable implements ILangu
 					},
 				};
 			});
+	}
+
+	private _sourceModelFor(model: SessionModelInfo): ILanguageModelChatMetadata['sourceModel'] {
+		const sourceId = readAgentModelSourceId(model);
+		const visibility = this._visibilitySource;
+		if (!visibility || sourceId !== visibility.sourceId) {
+			return undefined;
+		}
+		return {
+			sourceId,
+			modelId: model.underlyingModelId ?? model.id,
+			visibilityNamespace: visibility.namespace,
+			visibilityOwner: visibility.owner,
+		};
 	}
 
 	private _toLanguageModelConfigurationSchema(schema: ConfigSchema | undefined): ILanguageModelConfigurationSchema | undefined {

@@ -8,7 +8,7 @@ import { Emitter, Event } from '../../../../base/common/event.js';
 import type { IChannel } from '../../../../base/parts/ipc/common/ipc.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import type { IAgentHostByokLmHandler, IByokLmChatRequest, IByokLmChatResult, IByokLmModelInfo } from '../../common/agentHostByokLm.js';
+import type { IAgentHostByokLmHandler, IByokLmChatRequest, IByokLmChatResult, IByokLmModelInfo, IManagedChatGptModelInfo } from '../../common/agentHostByokLm.js';
 import { AgentHostClientByokLmChannel, createAgentHostClientByokLmConnection } from '../../common/agentHostClientByokLmChannel.js';
 
 suite('agentHostClientByokLmChannel', () => {
@@ -130,6 +130,25 @@ suite('agentHostClientByokLmChannel', () => {
 
 		sub.dispose();
 		assert.deepStrictEqual(pushed.at(-1), [{ vendor: 'acme', id: 'v3' }]);
+	});
+
+	test('pushes configured subscription models independently from the BYOK snapshot', async () => {
+		const changed = store.add(new Emitter<void>());
+		let models: IManagedChatGptModelInfo[] = [{ id: 'gpt-example', name: 'Provider model' }];
+		const connection = bridge({
+			...handlerOf(async () => ({ output: [] }), async () => [], changed.event),
+			listChatGptModels: async () => models,
+		});
+		const subscriptionSnapshots: IManagedChatGptModelInfo[][] = [];
+		const byokSnapshots: IByokLmModelInfo[][] = [];
+		store.add(connection.onDidChangeChatGptModels!(snapshot => subscriptionSnapshots.push(snapshot)));
+		store.add(connection.onDidChangeModels(snapshot => byokSnapshots.push(snapshot)));
+		await flush();
+		models = [];
+		changed.fire();
+		await flush();
+		assert.deepStrictEqual(subscriptionSnapshots, [[{ id: 'gpt-example', name: 'Provider model' }], []]);
+		assert.deepStrictEqual(byokSnapshots, [[], []]);
 	});
 
 	test('rejects unknown channel commands', async () => {

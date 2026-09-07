@@ -75,6 +75,8 @@ type ChatSettingChangedEvent = {
 };
 
 export interface IChatStatusDashboardOptions {
+	/** Extension-contributed status entries omitted from this dashboard instance. */
+	excludedStatusItemIds?: readonly string[];
 	/** When true, disables the Inline Suggestions settings section (toggles for all files, language, next edit). */
 	disableInlineSuggestionsSettings?: boolean;
 	/** When true, disables the inline completions model selection section. */
@@ -157,7 +159,8 @@ export class ChatStatusDashboard extends DomWidget {
 			(!this.options?.compactQuotaLayout && completions?.unlimited === false) ||
 			isAnonymousWithSentiment ||
 			isPooledQuotaDepleted;
-		const contributedEntries = [...this.chatStatusItemService.getEntries()];
+		const contributedEntries = [...this.chatStatusItemService.getEntries()]
+			.filter(entry => !this.options?.excludedStatusItemIds?.includes(entry.id));
 		const hasQuickSettingsContent =
 			!this.options?.disableInlineSuggestionsSettings ||
 			!this.options?.disableModelSelection ||

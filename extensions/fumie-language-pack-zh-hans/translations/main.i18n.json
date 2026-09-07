@@ -2373,7 +2373,7 @@
 			"chat.agentHost.deepseekAgent.enabled": "启用后，当 DeepSeek Harness SDK 可访问时，智能体主机会注册实验性的 DeepSeek 提供程序。启用无需重启智能体主机即可生效；禁用要等智能体主机重启后才生效。",
 			"chat.agentHost.piAgent.enabled": "启用后，当编码智能体 SDK 可访问时，智能体主机会注册 Pi。Pi 是为没有官方智能体的模型提供的极简通用智能体。启用无需重启智能体主机即可生效；禁用要等智能体主机重启后才生效。",
 			"chat.agentHost.acpAgent.enabled": "启用后，智能体主机会注册使用智能体客户端协议(ACP)通信的编码智能体。该智能体的命令行工具必须单独安装，并可在 `PATH` 中找到。启用无需重启智能体主机即可生效；禁用要等智能体主机重启后才生效。",
-			"chat.agentHost.opencodeAgent.enabled": "启用后，智能体主机会注册 opencode 提供程序。opencode 必须单独安装并可在 `PATH` 中找到；它使用自己的登录和自己的模型目录。启用无需重启智能体主机即可生效；禁用要等智能体主机重启后才生效。",
+			"chat.agentHost.opencodeAgent.enabled": "启用后，智能体主机会注册 opencode 智能体。opencode 必须单独安装并可在 `PATH` 中找到；模型和凭据统一由 Fumie Provider 提供。启用无需重启智能体主机即可生效；禁用要等智能体主机重启后才生效。",
 			"chat.agentHost.codexAgent.binaryPath": "指向 Codex 可执行文件的可选直接路径。当 `$CODEX_HOME` 中的模型目录需要比产品自带 SDK 更新的应用服务器时使用此选项。"
 		},
 		"vs/platform/agentHost/common/changesetUri": {
@@ -4259,7 +4259,7 @@
 			"signInAria": "登录到您的帐户",
 			"signInLabel": "登录",
 			"agentsSignInOptional": "登录",
-			"agentsSignInOptionalAria": "登录 GitHub 以使用更多智能体"
+			"agentsSignInForRemoteControlAria": "登录 GitHub 以启用远程控制"
 		},
 		"vs/sessions/browser/layoutActions": {
 			"agentPanelCloseIcon": "用于关闭面板的图标。",
@@ -4546,7 +4546,7 @@
 			"loadingAccountHeader": "正在加载帐户...",
 			"sessionsAccountSubscriptionSectionLabel": "订阅",
 			"settings": "设置",
-			"signIn": "登录",
+			"signInForRemoteControl": "登录 GitHub 以启用远程控制",
 			"signOut": "注销",
 			"copilotAccountSectionLabel": "Copilot 账户",
 			"manageCopilotModels": "管理 Copilot 模型",
@@ -4560,7 +4560,8 @@
 			"claudeAccountName": "Claude",
 			"manageClaudeModels": "管理 Claude 模型",
 			"openClaudeAgentCustomizations": "Claude 的智能体自定义项",
-			"signInToClaude": "登录 Claude",
+			"signInToUseClaude": "登录以使用 Claude",
+			"signOutOfClaude": "退出 Claude",
 			"sessionsAccountStatusSectionLabel": "账户状态",
 			"copilotCreditsUsedTotal": "已使用 {0} 个额度",
 			"copilotCreditsUsedPercentageValue": "{0}%",
@@ -27238,7 +27239,10 @@
 		},
 		"vs/platform/agentHost/node/deepseek/deepseekAgent": {
 			"deepseekAgent.displayName": "DeepSeek",
-			"deepseekAgent.description": "DeepSeek 编码智能体，通过公司 LiteLLM 网关，由进程内 DeepSeek Harness 提供支持"
+			"deepseekAgent.description": "DeepSeek 编码智能体，由进程内 DeepSeek Harness 提供支持"
+		},
+		"vs/platform/agentHost/node/deepseek/deepseekSubscription": {
+			"deepseek.thinkingLevel": "推理强度"
 		},
 		"vs/platform/agentHost/node/deepseek/deepseekToolDisplay": {
 			"deepseek.tool.bash": "运行 Shell 命令",
@@ -27311,7 +27315,11 @@
 			"kimiAgent.displayName": "Kimi",
 			"kimiAgent.description": "使用 Kimi Agent 执行编程任务。",
 			"kimi.modelThinkingLevel.title": "思考层级",
-			"kimi.modelThinkingLevel.description": "控制 Kimi 使用的推理工作量。"
+			"kimi.modelThinkingLevel.description": "控制 Kimi 使用的推理工作量。",
+			"kimi.modelServiceTier.title": "速度",
+			"kimi.modelServiceTier.description": "控制 Kimi 的响应速度和用量。",
+			"kimi.modelServiceTier.standard": "标准",
+			"kimi.modelServiceTier.standardDescription": "标准速度和用量。"
 		},
 		"vs/platform/agentHost/node/kimi/kimiToolDisplay": {
 			"kimi.tool.bash": "运行 Shell 命令",
@@ -29281,7 +29289,7 @@
 			"chatGPTAccountWithProvider": "{0} (ChatGPT)",
 			"chatGPTAccount": "ChatGPT",
 			"downloadingCodexAgent": "正在下载 Codex 智能体...",
-			"signInToChatGPT": "登录到 ChatGPT",
+			"signInForOpenAIModels": "登录 ChatGPT 以访问 OpenAI 模型",
 			"retryChatGPTSignInFromModels": "重试 ChatGPT 登录",
 			"signInToChatGPTFromModels": "登录到 ChatGPT",
 			"codexModels.signIn": "登录到 ChatGPT 以加载 Codex 模型",

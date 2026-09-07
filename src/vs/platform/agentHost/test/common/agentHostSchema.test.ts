@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import type { IConfigurationValue } from '../../../configuration/common/configuration.js';
-import { AgentHostArtifactToolsConfigKey, AgentHostGitHubMcpServerEnabledConfigKey, AgentHostMarkdownPlanRichLinksEnabledConfigKey, createSchema, migrateLegacyAutopilotConfig, normalizeAgentHostTerminalAutoApproveRulesConfig, platformRootSchema, platformSessionSchema, schemaProperty, type AgentHostTerminalAutoApproveRules, type AutoApproveLevel, type IPermissionsValue, type SessionMode } from '../../common/agentHostSchema.js';
+import { AgentHostAcpEnabledConfigKey, AgentHostArtifactToolsConfigKey, AgentHostClaudeEnabledConfigKey, AgentHostCodexEnabledConfigKey, AgentHostDeepSeekEnabledConfigKey, AgentHostGitHubMcpServerEnabledConfigKey, AgentHostKimiEnabledConfigKey, AgentHostMarkdownPlanRichLinksEnabledConfigKey, AgentHostOpencodeEnabledConfigKey, AgentHostPiEnabledConfigKey, createSchema, migrateLegacyAutopilotConfig, normalizeAgentHostTerminalAutoApproveRulesConfig, platformRootSchema, platformSessionSchema, schemaProperty, type AgentHostTerminalAutoApproveRules, type AutoApproveLevel, type IPermissionsValue, type SessionMode } from '../../common/agentHostSchema.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { JsonRpcErrorCodes, ProtocolError } from '../../common/state/sessionProtocol.js';
 
@@ -46,6 +46,21 @@ suite('agentHostSchema', () => {
 		const property = platformRootSchema.toProtocol().properties[AgentHostArtifactToolsConfigKey];
 		assert.strictEqual(property.type, 'boolean');
 		assert.strictEqual(property.default, false);
+	});
+
+	test('built-in agent providers are enabled by default', () => {
+		const properties = platformRootSchema.toProtocol().properties;
+		for (const key of [
+			AgentHostClaudeEnabledConfigKey,
+			AgentHostCodexEnabledConfigKey,
+			AgentHostKimiEnabledConfigKey,
+			AgentHostDeepSeekEnabledConfigKey,
+			AgentHostPiEnabledConfigKey,
+			AgentHostAcpEnabledConfigKey,
+			AgentHostOpencodeEnabledConfigKey,
+		]) {
+			assert.strictEqual(properties[key].default, true, `${key} should default to enabled`);
+		}
 	});
 
 	// ---- schemaProperty / individual validators ---------------------------

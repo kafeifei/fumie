@@ -2161,6 +2161,55 @@ suite('LocalAgentHostSessionsProvider', () => {
 		assert.deepStrictEqual(provider.getModelsSnapshot(session.sessionId).models.map(model => model.identifier), ['matching']);
 	});
 
+	test('getModelsSnapshot follows the canonical owner of a managed projection', () => {
+		const projectionId = 'agent-host-copilotcli:@provider=openai:gpt-test';
+		const ownerId = 'codex-subscription:@provider=openai:gpt-test';
+		const sourceModel = { sourceId: 'chatgptSubscription', modelId: 'gpt-test', visibilityNamespace: 'local' };
+		const projection = {
+			...createTestLanguageModel('@provider=openai:gpt-test'),
+			targetChatSessionType: 'agent-host-copilotcli',
+			sourceModel: { ...sourceModel, visibilityOwner: false },
+		};
+		const owner = {
+			...createTestLanguageModel('@provider=openai:gpt-test'),
+			vendor: 'codex-subscription',
+			targetChatSessionType: 'agent-host-codex',
+			sourceModel: { ...sourceModel, visibilityOwner: true },
+		};
+		const languageModelIds = [projectionId, ownerId];
+		const models = new Map([[projectionId, projection], [ownerId, owner]]);
+		const hidden = new Set<string>();
+		const visibilityChanges = disposables.add(new Emitter<void>());
+		const languageModelChanges = disposables.add(new Emitter<void>());
+		const provider = createProvider(disposables, agentHost, undefined, {
+			languageModelIds,
+			lookupLanguageModel: id => models.get(id),
+			hiddenLanguageModelIds: hidden,
+			languageModelVisibilityChanges: visibilityChanges.event,
+			languageModelChanges: languageModelChanges.event,
+		});
+		fireSessionAdded(agentHost, 'managed-projection', { title: 'Managed Projection Session' });
+		const session = provider.getSessions().find(session => session.title.get() === 'Managed Projection Session');
+		assert.ok(session);
+
+		assert.deepStrictEqual(provider.getModelsSnapshot(session.sessionId).models.map(model => model.identifier), [projectionId]);
+		hidden.add(ownerId);
+		visibilityChanges.fire();
+		assert.deepStrictEqual(provider.getModelsSnapshot(session.sessionId).models, []);
+		hidden.delete(ownerId);
+		visibilityChanges.fire();
+		assert.deepStrictEqual(provider.getModelsSnapshot(session.sessionId).models.map(model => model.identifier), [projectionId]);
+
+		languageModelIds.splice(languageModelIds.indexOf(ownerId), 1);
+		models.delete(ownerId);
+		languageModelChanges.fire();
+		assert.deepStrictEqual(provider.getModelsSnapshot(session.sessionId).models, []);
+		languageModelIds.push(ownerId);
+		models.set(ownerId, owner);
+		languageModelChanges.fire();
+		assert.deepStrictEqual(provider.getModelsSnapshot(session.sessionId).models.map(model => model.identifier), [projectionId]);
+	});
+
 	test('getModelsSnapshot canonicalizes a matching logical-session model identifier', () => {
 		const modelId = 'gpt-5.6-sol';
 		const logicalIdentifier = `copilotcli/${modelId}`;

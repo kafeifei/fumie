@@ -8,7 +8,8 @@ import { Event } from '../../../../../base/common/event.js';
 import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { localize } from '../../../../../nls.js';
 import { CLAUDE_AGENT_PROVIDER_ID, CODEX_AGENT_PROVIDER_ID } from '../../../../../platform/agentHost/common/agent.js';
-import { isSubscriptionCatalogModel } from '../../../../../platform/agentHost/common/agentModelSource.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID, isSubscriptionCatalogModel } from '../../../../../platform/agentHost/common/agentModelSource.js';
+import { LOCAL_AGENT_HOST_AUTHORITY } from '../../../../../platform/agentHost/common/agentHostUri.js';
 import { AgentInfo, SessionModelInfo } from '../../../../../platform/agentHost/common/state/sessionState.js';
 import { AgentHostLanguageModelProvider } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostLanguageModelProvider.js';
 import { IAgentHostModelProviderPresentation } from '../../../../../workbench/services/agentHost/browser/agentHostModelProviderPresentation.js';
@@ -38,6 +39,8 @@ export interface ISubscriptionProviderDefinition {
 	readonly sessionType: string;
 	/** Whether one published model came from this subscription. */
 	isSubscriptionModel(model: SessionModelInfo): boolean;
+	/** Source id whose canonical picker visibility this provider owns. */
+	readonly visibilitySourceId?: string;
 }
 
 export const CLAUDE_SUBSCRIPTION_DEFINITION: ISubscriptionProviderDefinition = {
@@ -54,6 +57,7 @@ export const CODEX_SUBSCRIPTION_DEFINITION: ISubscriptionProviderDefinition = {
 	agentProvider: CODEX_AGENT_PROVIDER_ID,
 	sessionType: `agent-host-${CODEX_AGENT_PROVIDER_ID}`,
 	isSubscriptionModel: model => isSubscriptionCatalogModel(CODEX_AGENT_PROVIDER_ID, model),
+	visibilitySourceId: CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID,
 };
 
 export const SUBSCRIPTION_PROVIDER_DEFINITIONS: readonly ISubscriptionProviderDefinition[] = [
@@ -106,7 +110,17 @@ export class SubscriptionLanguageModelProvider extends Disposable implements ILa
 		super();
 		// `owned`, not `projected`: a subscription is an independently manageable
 		// provider, so an empty catalog is worth reporting as a sign-in prompt.
-		this._inner = this._register(new AgentHostLanguageModelProvider(definition.sessionType, definition.vendor, 'owned', presentation));
+		this._inner = this._register(new AgentHostLanguageModelProvider(
+			definition.sessionType,
+			definition.vendor,
+			'owned',
+			presentation,
+			definition.visibilitySourceId ? {
+				namespace: LOCAL_AGENT_HOST_AUTHORITY,
+				sourceId: definition.visibilitySourceId,
+				owner: true,
+			} : undefined,
+		));
 		this.onDidChange = this._inner.onDidChange;
 	}
 

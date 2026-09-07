@@ -6,7 +6,7 @@
 import { DeferredPromise } from '../../../base/common/async.js';
 import { Disposable, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
-import { IByokLmBridgeConnection, IByokLmModelInfo, IByokLmProviderConfiguration } from '../common/agentHostByokLm.js';
+import { IByokLmBridgeConnection, IByokLmModelInfo, IByokLmProviderConfiguration, IManagedChatGptModelInfo } from '../common/agentHostByokLm.js';
 
 export const IByokLmBridgeRegistry = createDecorator<IByokLmBridgeRegistry>('byokLmBridgeRegistry');
 
@@ -49,6 +49,9 @@ export interface IByokLmBridgeRegistry {
 	 */
 	getModels(): readonly IByokLmModelInfo[];
 
+	/** The same serving window's configured, visible ChatGPT subscription models. */
+	getChatGptModels?(): readonly IManagedChatGptModelInfo[];
+
 	/**
 	 * A connection that can serve BYOK inference, or `undefined` when none can.
 	 * All serving windows expose the same models, so any one is a valid target.
@@ -85,6 +88,7 @@ export interface IByokLmBridgeRegistry {
 interface IConnectionEntry {
 	readonly connection: IByokLmBridgeConnection;
 	models: readonly IByokLmModelInfo[] | undefined;
+	chatGptModels?: readonly IManagedChatGptModelInfo[];
 	readonly initialSnapshot: DeferredPromise<void>;
 	readonly store: DisposableStore;
 }
@@ -148,6 +152,15 @@ export class ByokLmBridgeRegistry implements IByokLmBridgeRegistry {
 				}
 			}
 		}));
+		if (connection.onDidChangeChatGptModels) {
+			store.add(connection.onDidChangeChatGptModels(models => {
+				if (this._entries.get(clientId) !== entry || JSON.stringify(entry.chatGptModels) === JSON.stringify(models)) {
+					return;
+				}
+				entry.chatGptModels = models;
+				this._notifyChanged();
+			}));
+		}
 
 		// The connection set changed (a renderer connected).
 		this._notifyChanged();
@@ -163,6 +176,10 @@ export class ByokLmBridgeRegistry implements IByokLmBridgeRegistry {
 
 	getModels(): readonly IByokLmModelInfo[] {
 		return this._servingEntry()?.models ?? [];
+	}
+
+	getChatGptModels(): readonly IManagedChatGptModelInfo[] {
+		return this._servingEntry()?.chatGptModels ?? [];
 	}
 
 	waitForInitialSnapshot(clientId: string): Promise<void> {

@@ -18,6 +18,7 @@ import { AgentProvider, AgentSession, AgentSignal, IActiveClient, IAgent, IAgent
 import { AutoApproveLevel, createSchema, platformSessionSchema } from '../../common/agentHostSchema.js';
 import { getByokLmAgentModelId, visibleByokLmModels, type IByokLmProviderConfiguration } from '../../common/agentHostByokLm.js';
 import { createAgentModelByokMeta } from '../../common/agentModelByokMeta.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID, createAgentModelSourceMeta } from '../../common/agentModelSource.js';
 import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
 import { getReasoningEffortDescription, getReasoningEffortLabel, resolveDefaultReasoningEffort } from '../../common/reasoningEffort.js';
 import { ISessionDataService } from '../../common/sessionDataService.js';
@@ -351,6 +352,7 @@ export class PiAgent extends Disposable implements IAgent {
 				maxContextWindow: model.maxContextWindowTokens,
 				maxOutputTokens: chatGptSubscriptionMaxOutputTokens(model),
 				supportsVision: model.supportsVision,
+				_meta: createAgentModelSourceMeta(CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID),
 				...(configSchema ? { configSchema } : {}),
 			};
 		});

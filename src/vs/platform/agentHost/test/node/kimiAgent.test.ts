@@ -8,6 +8,7 @@ import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'os';
 import { DeferredPromise } from '../../../../base/common/async.js';
 import { CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { Event } from '../../../../base/common/event.js';
 import { join } from '../../../../base/common/path.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -16,12 +17,13 @@ import { NullLogService } from '../../../log/common/log.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import type { IByokLmModelInfo } from '../../common/agentHostByokLm.js';
 import { IByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
+import { chatGptSubscriptionAgentModelId, type IChatGptSubscriptionService } from '../../node/chatGptSubscription.js';
 import { AgentSession, AgentSignal, type IAgentCreateChatOptions } from '../../common/agent.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { ActionType } from '../../common/state/sessionActions.js';
 import { MessageAttachmentKind, ResponsePartKind, ToolCallStatus, TurnState, buildDefaultChatUri } from '../../common/state/sessionState.js';
 import { KimiAgent } from '../../node/kimi/kimiAgent.js';
-import { IKimiApprovalRequest, IKimiCodeSdkService, IKimiEvent, IKimiHarness, IKimiQuestionRequest, IKimiSession, IKimiSessionSummary, KimiQuestionResult, KimiSdkProviderId, syncKimiHostInstructions, wrapKimiHarnessForByok } from '../../node/kimi/kimiCodeSdkService.js';
+import { IKimiApprovalRequest, IKimiCodeSdkService, IKimiEvent, IKimiHarness, IKimiQuestionRequest, IKimiSession, IKimiSessionSummary, KimiQuestionResult, KimiSdkProviderId, KimiSdkResponsesProviderId, syncKimiHostInstructions, wrapKimiHarnessForByok } from '../../node/kimi/kimiCodeSdkService.js';
 
 /** A Kimi row as it arrives from the renderer BYOK catalog: `<vendor>/<group>/<id>`. */
 // allow-any-unicode-next-line
@@ -141,10 +143,21 @@ class FakeKimiSdkService implements IKimiCodeSdkService {
 	close(): Promise<void> { return this.harness.close(); }
 }
 
-function createAgent(models: readonly IByokLmModelInfo[] = []): { agent: KimiAgent; sdk: FakeKimiSdkService } {
+function chatGptSubscription(signedIn: boolean): IChatGptSubscriptionService {
+	return {
+		_serviceBrand: undefined,
+		onDidChangeSignedIn: Event.None,
+		registerSource: () => Disposable.None,
+		getModels: () => [],
+		isSignedIn: () => signedIn,
+		readCredentials: () => Promise.resolve({ accessToken: 'token', accountId: 'acct-42', clientVersion: '0.153.4' }),
+	};
+}
+
+function createAgent(models: readonly IByokLmModelInfo[] = [], signedInToChatGpt = false): { agent: KimiAgent; sdk: FakeKimiSdkService } {
 	const sdk = new FakeKimiSdkService();
 	const environment = { userHome: URI.file('/home/test') } as INativeEnvironmentService;
-	return { agent: new KimiAgent(sdk, environment, new NullLogService(), byokRegistryWith(models)), sdk };
+	return { agent: new KimiAgent(sdk, environment, new NullLogService(), byokRegistryWith(models), chatGptSubscription(signedInToChatGpt)), sdk };
 }
 
 /**
@@ -312,7 +325,7 @@ suite('KimiAgent', () => {
 			const harness = wrapKimiHarnessForByok(rawHarness, {
 				token: 'n.kimi',
 				providerBaseUrl: () => 'http://127.0.0.1:4321/v1',
-				lookupModel: () => ({ vendor: 'customendpoint', id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', maxContextWindowTokens: 1_000_000, supportsVision: true }),
+				resolveModel: () => ({ wire: 'chat-completions', name: 'Kimi K2.6', maxContextWindowTokens: 1_000_000, supportsVision: true }),
 			});
 			const session = await harness.createSession({ id: 'session-1', workDir: '/workspace', model: BYOK_KIMI_MODEL_ID });
 			await session.setModel(BYOK_KIMI_MODEL_ID);
@@ -342,6 +355,96 @@ suite('KimiAgent', () => {
 			} else {
 				process.env['KIMI_MODEL_API_KEY'] = originalProviderEnv;
 			}
+		}
+	});
+
+	test('offers ChatGPT subscription models only while signed in', () => {
+		const signedOut = createAgent([], false);
+		const signedIn = createAgent([], true);
+		try {
+			assert.deepStrictEqual(signedOut.agent.models.get(), []);
+			assert.deepStrictEqual(signedIn.agent.models.get().map(model => ({ id: model.id, name: model.name })), [
+				{ id: '@provider=chatgpt-subscription:gpt-6-astra', name: 'GPT-6-Astra' },
+				{ id: '@provider=chatgpt-subscription:gpt-5.6-sol', name: 'GPT-5.6-Sol' },
+				{ id: '@provider=chatgpt-subscription:gpt-5.6-terra', name: 'GPT-5.6-Terra' },
+				{ id: '@provider=chatgpt-subscription:gpt-5.6-luna', name: 'GPT-5.6-Luna' },
+				{ id: '@provider=chatgpt-subscription:gpt-5.5', name: 'GPT-5.5' },
+				{ id: '@provider=chatgpt-subscription:gpt-5.4', name: 'GPT-5.4' },
+				{ id: '@provider=chatgpt-subscription:gpt-5.4-mini', name: 'GPT-5.4-Mini' },
+				{ id: '@provider=chatgpt-subscription:gpt-5.3-codex-spark', name: 'GPT-5.3-Codex-Spark' },
+			]);
+			const astra = signedIn.agent.models.get()[0];
+			assert.deepStrictEqual(astra.configSchema?.properties.serviceTier, {
+				type: 'string',
+				title: 'Speed',
+				description: 'Controls Kimi response speed and usage.',
+				default: 'standard',
+				enum: ['standard', 'priority'],
+				enumLabels: ['Standard', 'Fast'],
+				enumDescriptions: ['Standard speed and usage.', '2x speed, increased usage'],
+			});
+		} finally {
+			signedOut.agent.dispose();
+			signedIn.agent.dispose();
+		}
+	});
+
+	test('configures ChatGPT subscription models through the SDK native Responses provider', async () => {
+		const rawHarness = new FakeKimiHarness();
+		const modelId = chatGptSubscriptionAgentModelId('gpt-5.5', 'priority');
+		const harness = wrapKimiHarnessForByok(rawHarness, {
+			token: 'n.kimi',
+			providerBaseUrl: wire => wire === 'responses' ? 'http://127.0.0.1:4321' : 'http://127.0.0.1:4321/v1',
+			resolveModel: () => ({
+				wire: 'responses',
+				name: 'GPT-5.5',
+				maxContextWindowTokens: 272_000,
+				maxOutputTokens: 128_000,
+				supportsVision: true,
+				supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+				defaultReasoningEffort: 'medium',
+			}),
+		});
+
+		await harness.createSession({ id: 'session-1', workDir: '/workspace', model: modelId });
+
+		assert.deepStrictEqual(rawHarness.replaceConfigCalls[0], {
+			providers: {
+				[KimiSdkResponsesProviderId]: { type: 'openai_responses', baseUrl: 'http://127.0.0.1:4321', apiKey: 'n.kimi' },
+			},
+			models: {
+				[modelId]: {
+					provider: KimiSdkResponsesProviderId,
+					model: modelId,
+					maxContextSize: 272_000,
+					maxOutputSize: 128_000,
+					capabilities: ['image_in', 'thinking'],
+					displayName: 'GPT-5.5',
+					supportEfforts: ['low', 'medium', 'high', 'xhigh'],
+					defaultEffort: 'medium',
+				},
+			},
+			defaultModel: modelId,
+		});
+	});
+
+	test('carries the selected ChatGPT service tier in the runtime model id', async () => {
+		const { agent, sdk } = createAgent([], true);
+		const modelId = chatGptSubscriptionAgentModelId('gpt-5.5');
+		try {
+			const { chat } = await createKimiChat(agent, {
+				workingDirectories: [URI.file('/workspace')],
+				model: { id: modelId, config: { serviceTier: 'priority', thinkingLevel: 'high' } },
+			});
+			sdk.harness.session.promptImpl = async () => sdk.harness.session.emit({ type: 'turn.ended', turnId: 1, reason: 'completed' });
+
+			await agent.chats.sendMessage(chat, 'hello', [URI.file('/workspace')], undefined, 'turn-1');
+
+			assert.strictEqual(sdk.harness.createOptions[0].model, chatGptSubscriptionAgentModelId('gpt-5.5', 'priority'));
+			assert.strictEqual(sdk.harness.createOptions[0].thinking, 'high');
+		} finally {
+			await agent.shutdown();
+			agent.dispose();
 		}
 	});
 

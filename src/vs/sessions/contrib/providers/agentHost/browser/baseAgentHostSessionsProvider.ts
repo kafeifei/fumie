@@ -46,7 +46,7 @@ import { IChatSendRequestOptions, IChatService, type IChatModelReference } from 
 import { IChatSessionFileChange, IChatSessionFileChange2, IChatSessionsService } from '../../../../../workbench/contrib/chat/common/chatSessionsService.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind, ChatPermissionLevel, getChatPermissionLevelFromDefaultConfiguration, isChatPermissionLevel, type IChatDefaultConfiguration } from '../../../../../workbench/contrib/chat/common/constants.js';
 import { isAutoApprovePolicyRestricted, normalizeSessionConfigValue } from '../../../../../workbench/contrib/chat/common/agentHostConfigPolicy.js';
-import { ILanguageModelChatMetadata, ILanguageModelsService } from '../../../../../workbench/contrib/chat/common/languageModels.js';
+import { ILanguageModelsService, isLanguageModelVisibleInPicker } from '../../../../../workbench/contrib/chat/common/languageModels.js';
 import { getRegisteredLanguageModels, resolveConfiguredModel, resolveModelIdentifier, resolveModelIdentifierFromLanguageModels } from '../../../../../workbench/contrib/chat/common/modelSelection.js';
 import { agentModelIdFromIdentifier, resolveIdentifierForAgentModelId } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostModelIdentity.js';
 import { buildMutableConfigSchema, IAgentHostMcpServer, IAgentHostSessionsProvider, resolvedConfigsEqual, STORAGE_KEY_REMEMBERED_SESSION_CONFIG_VALUES } from '../../../../common/agentHostSessionsProvider.js';
@@ -3793,14 +3793,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 			if (model.metadata.isUserSelectable === false) {
 				return false;
 			}
-			// `byokModelHidden` is the host's own visibility state for a BYOK copy. It
-			// stands alone: a window reaching the catalogue only through a host holds
-			// no toggle of its own to consult.
-			if (model.metadata.byokModelHidden || this._languageModelsService.isModelHidden(model.identifier)) {
-				return false;
-			}
-			const manageModelsIdentifier = ILanguageModelChatMetadata.getAgentHostByokManageModelsIdentifier(model.metadata);
-			return manageModelsIdentifier === undefined || !this._languageModelsService.isModelHidden(manageModelsIdentifier);
+			return isLanguageModelVisibleInPicker(model, allModels, identifier => this._languageModelsService.isModelHidden(identifier));
 		});
 		const desiredModel = desiredModelId ? this._languageModelsService.lookupLanguageModel(desiredModelId) : undefined;
 		const resolvedDesiredModelId = desiredModel?.targetChatSessionType && this.resourceSchemeForProvider(desiredModel.targetChatSessionType) === resourceScheme

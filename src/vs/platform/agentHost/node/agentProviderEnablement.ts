@@ -15,6 +15,8 @@ export interface IProviderEnablementOptions {
 	readonly enabledByDefault?: boolean;
 	/** Root config key the renderer mirrors the same setting onto. */
 	readonly rootConfigKey: AgentHostProviderEnabledConfigKey;
+	/** Reports a provider-specific registration failure without stopping the host. */
+	readonly onRegistrationError?: (error: unknown) => void;
 	/** Test seam; defaults to `process.env`. */
 	readonly env?: NodeJS.ProcessEnv;
 }
@@ -50,14 +52,20 @@ export function registerProviderWhenEnabled(
 		if (registered) {
 			return;
 		}
-		const enabledByEnv = isAgentEnabled(env[options.enabledEnvVar], options.enabledByDefault ?? false);
-		const enabledByRootConfig = rootConfigIsLive
-			&& configurationService.getRootValue(platformRootSchema, options.rootConfigKey) === true;
+		const rootValue = configurationService.getRootValue(platformRootSchema, options.rootConfigKey);
+		const enabledByEnv = env[options.enabledEnvVar] === undefined
+			? (typeof rootValue === 'boolean' ? rootValue : options.enabledByDefault ?? true)
+			: isAgentEnabled(env[options.enabledEnvVar], options.enabledByDefault ?? true);
+		const enabledByRootConfig = rootConfigIsLive && rootValue === true;
 		if (!enabledByEnv && !enabledByRootConfig) {
 			return;
 		}
 		registered = true;
-		register();
+		try {
+			register();
+		} catch (error) {
+			options.onRegistrationError?.(error);
+		}
 	};
 	registerIfEnabled();
 	return configurationService.onDidRootConfigChange(() => {

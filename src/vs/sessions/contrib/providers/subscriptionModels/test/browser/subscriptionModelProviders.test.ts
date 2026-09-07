@@ -109,4 +109,21 @@ suite('subscriptionModelProviders', () => {
 			message: 'No models available',
 		});
 	});
+
+	test('marks Codex subscription rows as the local canonical visibility owners only', async () => {
+		const codex = store.add(new SubscriptionLanguageModelProvider(CODEX_SUBSCRIPTION_DEFINITION));
+		codex.updateModels([{ ...codexModel('@provider=openai:gpt-test', true), underlyingModelId: 'gpt-test' }]);
+		const claude = store.add(new SubscriptionLanguageModelProvider(CLAUDE_SUBSCRIPTION_DEFINITION));
+		claude.updateModels([claudeModel('claude-opus', CLAUDE_PROVIDER_ANTHROPIC)]);
+
+		const codexRows = await codex.provideLanguageModelChatInfo({ group: 'Codex Subscription', silent: true }, CancellationToken.None);
+		const claudeRows = await claude.provideLanguageModelChatInfo({ group: 'Claude Subscription', silent: true }, CancellationToken.None);
+		assert.deepStrictEqual(codexRows[0].metadata.sourceModel, {
+			sourceId: CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID,
+			modelId: 'gpt-test',
+			visibilityNamespace: 'local',
+			visibilityOwner: true,
+		});
+		assert.strictEqual(claudeRows[0].metadata.sourceModel, undefined);
+	});
 });

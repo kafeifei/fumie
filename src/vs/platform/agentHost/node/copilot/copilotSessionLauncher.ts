@@ -26,6 +26,8 @@ import { IAgentConfigurationService } from '../agentConfigurationService.js';
 import { IAgentHostManagedSettingsService } from '../agentHostManagedSettingsService.js';
 import { IAgentHostTerminalManager } from '../agentHostTerminalManager.js';
 import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
+import { CHATGPT_SUBSCRIPTION_MODELS, CHATGPT_SUBSCRIPTION_PROVIDER_NAME, chatGptSubscriptionAgentModelId, chatGptSubscriptionMaxOutputTokens } from '../chatGptSubscription.js';
+import { INativeModelProviderProxyService, type INativeModelProviderProxyHandle } from '../nativeModelProviderProxyService.js';
 import { IByokLmProxyService, type IByokLmProxyHandle } from './byokLmProxyService.js';
 import type { ICopilotMcpServerInfo, ICopilotPluginInfo } from './copilotAgent.js';
 import { toSdkHooks, toSdkInstructionDirectories, toSdkMcpServers, toSdkMcpServersFromConfigMap, toSdkSessionCustomAgents, toSdkSkillDirectories } from './copilotPluginConverters.js';
@@ -517,6 +519,48 @@ export async function resolveByokSessionConfig(
 	return { providers, models };
 }
 
+/**
+ * Additive Copilot SDK registry entries for the ChatGPT subscription owned by
+ * Codex. The SDK keeps its own `provider/id` selection namespace; `wireModel`
+ * is the host-qualified id that the native proxy resolves per request.
+ *
+ * These entries are installed even while signed out because the SDK freezes a
+ * session's provider registry at create/resume time. Picker visibility remains
+ * account-gated in {@link CopilotAgent}; pre-registering the credential-free
+ * loopback route lets an already-live session switch after a later sign-in.
+ */
+export async function resolveChatGptSubscriptionSessionConfig(
+	sessionId: string,
+	startProxy: () => Promise<INativeModelProviderProxyHandle>,
+	logService: ILogService,
+): Promise<{ providers?: NamedProviderConfig[]; models?: ProviderModelConfig[] }> {
+	let handle: INativeModelProviderProxyHandle;
+	try {
+		handle = await startProxy();
+	} catch (error) {
+		logService.warn(`[Copilot:${sessionId}] Failed to start ChatGPT subscription loopback proxy`, error);
+		return {};
+	}
+	return {
+		providers: [{
+			name: CHATGPT_SUBSCRIPTION_PROVIDER_NAME,
+			type: 'openai',
+			wireApi: 'responses',
+			baseUrl: handle.providerBaseUrl('responses'),
+			bearerToken: `${handle.nonce}.${sessionId}`,
+		}],
+		models: CHATGPT_SUBSCRIPTION_MODELS.map(model => ({
+			id: model.id,
+			provider: CHATGPT_SUBSCRIPTION_PROVIDER_NAME,
+			wireModel: chatGptSubscriptionAgentModelId(model.id),
+			modelId: model.id,
+			name: model.name,
+			maxPromptTokens: model.maxContextWindowTokens,
+			maxOutputTokens: chatGptSubscriptionMaxOutputTokens(model),
+		})),
+	};
+}
+
 export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 
 	/**
@@ -528,6 +572,8 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 	 * stopped, so the next start mints a fresh nonce.
 	 */
 	private _byokProxyHandle: Promise<IByokLmProxyHandle> | undefined;
+	/** Native Responses proxy shared by every ChatGPT-backed Copilot session. */
+	private _chatGptSubscriptionProxyHandle: Promise<INativeModelProviderProxyHandle> | undefined;
 
 	constructor(
 		@IAgentConfigurationService private readonly _configurationService: IAgentConfigurationService,
@@ -537,6 +583,7 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 		@IFileService private readonly _fileService: IFileService,
 		@IByokLmProxyService private readonly _byokLmProxyService: IByokLmProxyService,
 		@IByokLmBridgeRegistry private readonly _byokLmBridgeRegistry: IByokLmBridgeRegistry,
+		@INativeModelProviderProxyService private readonly _nativeModelProviderProxyService: INativeModelProviderProxyService,
 		@IAgentHostOTelService private readonly _otelService: IAgentHostOTelService,
 		@IProductService private readonly _productService: IProductService,
 	) { }
@@ -712,9 +759,18 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 		}, this._logService);
 	}
 
+	private _resolveChatGptSubscriptionSessionConfig(sessionId: string): Promise<{ providers?: NamedProviderConfig[]; models?: ProviderModelConfig[] }> {
+		return resolveChatGptSubscriptionSessionConfig(sessionId, () => {
+			if (!this._chatGptSubscriptionProxyHandle) {
+				this._chatGptSubscriptionProxyHandle = this._nativeModelProviderProxyService.start();
+			}
+			return this._chatGptSubscriptionProxyHandle;
+		}, this._logService);
+	}
+
 	/**
-	 * Release the memoized BYOK loopback proxy handle (if any) and clear it so
-	 * the next session launch mints a fresh nonce. Idempotent.
+	 * Release the memoized model proxy handles (if any) and clear them so the
+	 * next session launch mints fresh nonces. Idempotent.
 	 *
 	 * **Ownership invariant.** The caller MUST stop the Copilot client/runtime
 	 * subprocess before invoking this: disposing the handle drops the proxy's
@@ -724,15 +780,18 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 	 * client has stopped.
 	 */
 	async disposeByokProxyHandle(): Promise<void> {
-		const handle = this._byokProxyHandle;
+		const handles = [this._byokProxyHandle, this._chatGptSubscriptionProxyHandle];
 		this._byokProxyHandle = undefined;
-		if (!handle) {
-			return;
-		}
-		try {
-			(await handle).dispose();
-		} catch {
-			// The lazy `start()` rejected; there is nothing to release.
+		this._chatGptSubscriptionProxyHandle = undefined;
+		for (const handle of handles) {
+			if (!handle) {
+				continue;
+			}
+			try {
+				(await handle).dispose();
+			} catch {
+				// The lazy `start()` rejected; there is nothing to release.
+			}
 		}
 	}
 
@@ -741,7 +800,12 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 		// Synthesize BYOK provider/model config (empty when BYOK is gated off or the
 		// renderer reports no BYOK models), merged into the returned config so both
 		// createSession and resumeSession advertise the models to the runtime.
-		const byok = await this._resolveByokSessionConfig(plan.sessionId);
+		const [byok, chatGptSubscription] = await Promise.all([
+			this._resolveByokSessionConfig(plan.sessionId),
+			this._resolveChatGptSubscriptionSessionConfig(plan.sessionId),
+		]);
+		const providers = [...(byok.providers ?? []), ...(chatGptSubscription.providers ?? [])];
+		const models = [...(byok.models ?? []), ...(chatGptSubscription.models ?? [])];
 		const enableCustomTerminalTool = this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.EnableCustomTerminalTool) === true;
 		let shellTools: Awaited<ReturnType<typeof createShellTools>> = [];
 		if (enableCustomTerminalTool) {
@@ -846,8 +910,13 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 			})}`);
 		}
 		return {
-			...byok,
+			...(providers.length ? { providers } : {}),
+			...(models.length ? { models } : {}),
 			...disabledMcpServers,
+			// The ChatGPT subscription backend accepts the Responses streaming
+			// contract. Put this in shared launch config so resume cannot silently
+			// fall back to the SDK's non-streaming request mode.
+			streaming: true,
 			clientName: AGENT_HOST_COPILOT_CLIENT_NAME,
 			// Resume only: `_createSession` re-resolves the full effort for a create,
 			// while a resumed session keeps the effort the runtime journaled unless

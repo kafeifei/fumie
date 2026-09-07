@@ -13,11 +13,10 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IStorageService, StorageScope } from '../../../../platform/storage/common/storage.js';
 import { ChatInputModelSelectionController, IChatInputModelSelectionRuntime } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputModelSelectionController.js';
 import { ChatModelSelectionDiagnostics } from '../../../../workbench/contrib/chat/browser/widget/input/chatModelSelectionDiagnostics.js';
-import { isModelHiddenInPicker } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputModelUtils.js';
 import { getSelectedModelStorageKey, getStoredSelectedModel, storeSelectedModel } from '../../../../workbench/contrib/chat/common/chatSelectedModel.js';
 import { IChatSessionsService } from '../../../../workbench/contrib/chat/common/chatSessionsService.js';
 import { ChatAgentLocation, ChatConfiguration } from '../../../../workbench/contrib/chat/common/constants.js';
-import { ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService } from '../../../../workbench/contrib/chat/common/languageModels.js';
+import { ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService, isLanguageModelVisibleInPicker } from '../../../../workbench/contrib/chat/common/languageModels.js';
 import { IntendedModelSlot } from '../../../../workbench/contrib/chat/common/model/chatModel.js';
 import { getRegisteredLanguageModels, IPendingModelSelection, isInConversationModelChoice, ModelSelectionReason, resolveConfiguredModel, resolveModelIdentifier, RestoredModelReason } from '../../../../workbench/contrib/chat/common/modelSelection.js';
 import { isAgentHostProviderId } from '../../../common/agentHostSessionsProvider.js';
@@ -349,6 +348,26 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 			return;
 		}
 
+		// Removing or hiding the canonical provider withdraws its projections from
+		// every picker immediately, but it must not rewrite a conversation that is
+		// already running one of those models. Keep the controller's intent on the
+		// registered projection and withhold provider writes until its owner returns.
+		const unavailableSourceModel = chatModelId ? this._unavailableManagedSourceModel(chatModelId) : undefined;
+		if (unavailableSourceModel) {
+			this._displayOnly = true;
+			const conversation = this._conversation();
+			if (rebound || this._conversationSelectionChanged(unavailableSourceModel, chatModelSource)) {
+				this._claimChatModel(unavailableSourceModel, chatModelSource, conversationKey);
+			}
+			conversation.seeded = true;
+			this._diagnostics.report('managed-projection-unavailable', {
+				trigger,
+				model: unavailableSourceModel.identifier,
+			}, 'info');
+			this._publish(options, undefined);
+			return;
+		}
+
 		// Only a conversation that could be written to has anything to wait for. A display-only one
 		// writes nothing either way (see `_pushModelToProvider`), so waiting would blank its picker
 		// and block its composer to prevent a write that was never going to happen.
@@ -572,10 +591,34 @@ export class SessionModelSelection extends Disposable implements ISessionModelSe
 	}
 
 	private _visibleRegisteredModels(languageModelsService: ILanguageModelsService): readonly ILanguageModelChatMetadataAndIdentifier[] {
-		return getRegisteredLanguageModels(languageModelsService).filter(model =>
+		const allModels = getRegisteredLanguageModels(languageModelsService);
+		return allModels.filter(model =>
 			model.metadata.isUserSelectable !== false
-			&& !isModelHiddenInPicker(model, identifier => languageModelsService.isModelHidden(identifier))
+			&& isLanguageModelVisibleInPicker(model, allModels, identifier => languageModelsService.isModelHidden(identifier))
 		);
+	}
+
+	private _unavailableManagedSourceModel(modelIdentifier: string): ILanguageModelChatMetadataAndIdentifier | undefined {
+		const languageModelsService = this._languageModelsService;
+		if (!languageModelsService) {
+			return undefined;
+		}
+		const allModels = getRegisteredLanguageModels(languageModelsService);
+		const exact = allModels.find(model => model.identifier === modelIdentifier);
+		const aliases = exact ? [] : allModels.filter(model =>
+			model.metadata.targetChatSessionType === this._modelTarget
+			&& (model.metadata.id === modelIdentifier || model.metadata.underlyingModelId === modelIdentifier));
+		const held = this._controller.currentModel.get();
+		const heldMatches = held && (held.identifier === modelIdentifier
+			|| held.metadata.id === modelIdentifier
+			|| held.metadata.underlyingModelId === modelIdentifier)
+			? held
+			: undefined;
+		const model = exact ?? (aliases.length === 1 ? aliases[0] : undefined) ?? heldMatches;
+		if (!model?.metadata.sourceModel || this._models.some(candidate => candidate.identifier === model.identifier)) {
+			return undefined;
+		}
+		return model;
 	}
 
 	/**

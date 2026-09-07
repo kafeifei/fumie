@@ -218,7 +218,7 @@ registerAction2(class extends Action2 {
 	constructor() {
 		super({
 			id: AGENTIC_SIGN_IN_COMMAND_ID,
-			title: localize2('signIn', "Sign in to use GitHub Copilot"),
+			title: localize2('signInForRemoteControl', "Sign in to GitHub to enable remote control"),
 			icon: Codicon.signIn,
 			menu: {
 				id: AccountMenu,
@@ -899,8 +899,15 @@ class SidebarAccountWidget extends BaseActionViewItem {
 					section: AICustomizationManagementSection.HarnessSettings,
 				}),
 			)), { icon: true, label: false });
+			accountActionBar.push(panelStore.add(new Action(
+				'claude.signOutOfClaude',
+				localize('signOutOfClaude', "Sign out of Claude"),
+				ThemeIcon.asClassName(Codicon.signOut),
+				true,
+				() => this.claudeAccountService.signOut(),
+			)), { icon: true, label: false });
 			this.appendClaudeSubscription(accountSection, claudeAccount);
-		} else if (claudeAccountVisible && claudeAccount.status === 'signedOut') {
+		} else if (claudeAccountVisible) {
 			const accountSection = append(identities, $('section.sessions-account-titlebar-panel-provider-account.signed-out', {
 				'aria-label': localize('claudeAccountSectionLabel', "Claude account")
 			}));
@@ -915,10 +922,16 @@ class SidebarAccountWidget extends BaseActionViewItem {
 			}));
 			signInActionBar.push(panelStore.add(new Action(
 				'claude.signInToClaude',
-				localize('signInToClaude', "Sign in to Claude"),
+				localize('signInToUseClaude', "Sign in to use Claude"),
 				undefined,
 				true,
-				() => this.agentSdkSetupService.signIn(CLAUDE_AGENT_PROVIDER_ID),
+				() => {
+					if (this.agentSdkSetupService.setups.some(setup => setup.agent === CLAUDE_AGENT_PROVIDER_ID && setup.signInProviderName)) {
+						return this.agentSdkSetupService.signIn(CLAUDE_AGENT_PROVIDER_ID);
+					} else {
+						return this.commandService.executeCommand(MANAGE_CHAT_COMMAND_ID, '@provider:"Anthropic"');
+					}
+				},
 			)), { icon: false, label: true });
 		}
 
@@ -959,7 +972,7 @@ class SidebarAccountWidget extends BaseActionViewItem {
 			}
 		}
 
-		if (shouldShowAccountPanelSummary(this.lastState, this.shouldShowCopilotDashboardHover(), this.isAccountLoading)) {
+		if (!partitioned.signIn && shouldShowAccountPanelSummary(this.lastState, this.shouldShowCopilotDashboardHover(), this.isAccountLoading)) {
 			const contentSection = append(panel, $('.sessions-account-titlebar-panel-content'));
 			const summary = append(contentSection, $('.sessions-account-titlebar-panel-summary'));
 			summary.textContent = this.lastState.ariaLabel;
@@ -1182,6 +1195,7 @@ class SidebarAccountWidget extends BaseActionViewItem {
 		const store = new DisposableStore();
 		this.copilotDashboardStore.value = store;
 		const dashboardElement = ChatStatusDashboard.instantiateInContents(this.instantiationService, store, {
+			excludedStatusItemIds: ['github.copilot-chat.copilot.workspaceIndexStatus'],
 			disableInlineSuggestionsSettings: true,
 			disableModelSelection: true,
 			disableProviderOptions: true,
@@ -1291,6 +1305,7 @@ class ChatDashboardServiceImpl implements IChatDashboardService {
 
 	createDashboardElement(store: DisposableStore): HTMLElement | undefined {
 		const dashboardElement = ChatStatusDashboard.instantiateInContents(this.instantiationService, store, {
+			excludedStatusItemIds: ['github.copilot-chat.copilot.workspaceIndexStatus'],
 			disableInlineSuggestionsSettings: true,
 			disableModelSelection: true,
 			disableProviderOptions: true,

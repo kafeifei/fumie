@@ -66,31 +66,67 @@ suite('registerProviderWhenEnabled', () => {
 		assert.strictEqual(registrations, 1);
 	});
 
-	test('stays off when neither the environment nor the root config enables it', () => {
+	test('an explicit environment value keeps a provider off', () => {
 		const store = disposables.add(new DisposableStore());
 		const configurationService = createConfigurationService(store);
 		let registrations = 0;
 		store.add(registerProviderWhenEnabled(configurationService, {
 			enabledEnvVar: AgentHostOpencodeAgentEnabledEnvVar,
 			rootConfigKey: AgentHostOpencodeEnabledConfigKey,
-			env: {},
+			env: { [AgentHostOpencodeAgentEnabledEnvVar]: 'false' },
 		}, () => registrations++));
 		configurationService.setRootValue(AgentHostOpencodeEnabledConfigKey, false);
 
 		assert.strictEqual(registrations, 0);
 	});
 
-	test('honors the default when the environment variable is absent', () => {
+	test('registers by default when the environment variable is absent', () => {
 		const store = disposables.add(new DisposableStore());
 		const configurationService = createConfigurationService(store);
 		let registrations = 0;
 		store.add(registerProviderWhenEnabled(configurationService, {
 			enabledEnvVar: AgentHostClaudeAgentEnabledEnvVar,
 			rootConfigKey: AgentHostClaudeEnabledConfigKey,
-			enabledByDefault: true,
 			env: {},
 		}, () => registrations++));
 
+		assert.strictEqual(registrations, 1);
+	});
+
+	test('a provider registration failure does not block another provider', () => {
+		const store = disposables.add(new DisposableStore());
+		const configurationService = createConfigurationService(store);
+		const errors: unknown[] = [];
+		store.add(registerProviderWhenEnabled(configurationService, {
+			enabledEnvVar: AgentHostClaudeAgentEnabledEnvVar,
+			rootConfigKey: AgentHostClaudeEnabledConfigKey,
+			env: {},
+			onRegistrationError: error => errors.push(error),
+		}, () => { throw new Error('Claude unavailable'); }));
+
+		let opencodeRegistrations = 0;
+		store.add(registerProviderWhenEnabled(configurationService, {
+			enabledEnvVar: AgentHostOpencodeAgentEnabledEnvVar,
+			rootConfigKey: AgentHostOpencodeEnabledConfigKey,
+			env: {},
+		}, () => opencodeRegistrations++));
+
+		assert.strictEqual(errors.length, 1);
+		assert.strictEqual(opencodeRegistrations, 1);
+	});
+
+	test('a saved disabled setting wins over the default when no environment value is supplied', () => {
+		const store = disposables.add(new DisposableStore());
+		const configurationService = createConfigurationService(store);
+		configurationService.setRootValue(AgentHostOpencodeEnabledConfigKey, false);
+		let registrations = 0;
+		store.add(registerProviderWhenEnabled(configurationService, {
+			enabledEnvVar: AgentHostOpencodeAgentEnabledEnvVar,
+			rootConfigKey: AgentHostOpencodeEnabledConfigKey,
+			env: {},
+		}, () => registrations++));
+		assert.strictEqual(registrations, 0);
+		configurationService.setRootValue(AgentHostOpencodeEnabledConfigKey, true);
 		assert.strictEqual(registrations, 1);
 	});
 

@@ -3,7 +3,6 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as os from 'os';
 import { SequencerByKey } from '../../../../base/common/async.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
@@ -16,6 +15,9 @@ import { localize } from '../../../../nls.js';
 import { ILogService } from '../../../log/common/log.js';
 import { IProductService } from '../../../product/common/productService.js';
 import { AgentProvider, AgentSession, AgentSignal, IActiveClient, IAgent, IAgentChatConfigCompletionsParams, IAgentChatContext, IAgentChatDataChange, IAgentChatMetadata, IAgentChats, IAgentCreateChatOptions, IAgentCreateChatResult, IAgentDescriptor, IAgentMaterializeChatEvent, IAgentModelInfo, IAgentResolveChatConfigParams, IAgentSpawnChatEvent, OPENCODE_AGENT_PROVIDER_ID, resolveAgentChatContext, resolveAgentHostInstructions } from '../../common/agent.js';
+import { createAgentModelByokMeta } from '../../common/agentModelByokMeta.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID, createAgentModelSourceMeta } from '../../common/agentModelSource.js';
+import { getByokLmAgentModelId, type IByokLmModelInfo, visibleByokLmModels } from '../../common/agentHostByokLm.js';
 import { AutoApproveLevel, createSchema, platformSessionSchema } from '../../common/agentHostSchema.js';
 import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
 import { getReasoningEffortDescription, getReasoningEffortLabel, reasoningEffortLevels } from '../../common/reasoningEffort.js';
@@ -25,8 +27,10 @@ import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from 
 import { MessageAttachmentKind, type AgentSelection, type ConfigSchema, type ModelSelection, type ProtectedResourceMetadata, type ToolDefinition } from '../../common/state/protocol/state.js';
 import { ActionType } from '../../common/state/sessionActions.js';
 import { ChatInputResponseKind, MessageKind, type ChatInputAnswer, type ClientPluginCustomization, type MessageAttachment, type PendingMessage, type Turn } from '../../common/state/sessionState.js';
+import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
+import { CHATGPT_SUBSCRIPTION_PROVIDER_NAME, IChatGptSubscriptionService, chatGptSubscriptionMaxOutputTokens, type IChatGptSubscriptionModel } from '../chatGptSubscription.js';
 import { OpencodeTurnMapper, replayOpencodeMessagesToTurns, type IOpencodePart, type IOpencodePermissionAsk, type IOpencodeStoredMessage } from './opencodeReplayMapper.js';
-import { IOpencodeServerService, type IOpencodeEvent, type IOpencodeServer } from './opencodeServerService.js';
+import { IOpencodeServerService, OPENCODE_BYOK_PROVIDER_ID, type IOpencodeEvent, type IOpencodeServer } from './opencodeServerService.js';
 
 /**
  * The opencode provider.
@@ -84,6 +88,8 @@ interface IOpencodeChatEntry {
 	model?: ModelSelection;
 	providerData?: string;
 	server?: IOpencodeServer;
+	/** This chat keeps a retired server alive while its native work is active. */
+	serverRetained?: boolean;
 	/** Subscriptions to the shared server, dropped when this chat lets go of it. */
 	serverListeners?: DisposableStore;
 	/** The opencode session backing this chat; the anchor a restore resumes from. */
@@ -139,9 +145,13 @@ export class OpencodeAgent extends Disposable implements IAgent {
 		@IOpencodeServerService private readonly _serverService: IOpencodeServerService,
 		@ILogService private readonly _logService: ILogService,
 		@IProductService private readonly _productService: IProductService,
+		@IByokLmBridgeRegistry private readonly _byokBridgeRegistry: IByokLmBridgeRegistry,
+		@IChatGptSubscriptionService private readonly _chatGptSubscription: IChatGptSubscriptionService,
 	) {
 		super();
-		void this.refreshModels();
+		this._register(this._byokBridgeRegistry.onDidChangeModels(() => this._refreshModels()));
+		this._register(this._chatGptSubscription.onDidChangeSignedIn(() => this._refreshModels()));
+		this._refreshModels();
 	}
 
 	readonly chats: IAgentChats = {
@@ -164,46 +174,19 @@ export class OpencodeAgent extends Disposable implements IAgent {
 		return {
 			provider: this.id,
 			displayName: localize('opencodeAgent.displayName', "opencode"),
-			description: localize('opencodeAgent.description', "The opencode coding agent, using this machine's own opencode installation and sign-in"),
-			// opencode owns its model catalog: the models come from its own
-			// providers and its own credentials, not from Fumie's shared catalog.
-			// Nothing else is advertised — this connector cannot fork a chat, hosts
-			// no independently addressable peer chats.
-			capabilities: { modelCatalog: 'owned' },
+			description: localize('opencodeAgent.description', "The opencode coding agent, using this machine's opencode installation and Fumie Providers"),
+			capabilities: { modelCatalog: 'projected' },
 		};
 	}
 
-	/**
-	 * Reads opencode's model catalog.
-	 *
-	 * The catalog lives inside a running server, so this reuses one a chat
-	 * already started and otherwise pays for a short-lived one rooted at the home
-	 * directory — the catalog is per installation, not per workspace, and the
-	 * picker needs it before any session exists.
-	 */
-	async refreshModels(): Promise<void> {
-		let acquired: IOpencodeServer | undefined;
-		try {
-			const existing = [...this._entries.values()].find(entry => entry.server)?.server;
-			const server = acquired = existing ?? await this._serverService.acquire(os.homedir());
-			try {
-				const catalog = await server.request<IOpencodeProviderCatalog>('GET', '/config/providers');
-				this._models.set(opencodeCatalogModels(this.id, catalog), undefined);
-			} finally {
-				// A server started only to read the catalog is stopped again — unless
-				// a chat rooted at the same directory adopted it while the read was in
-				// flight, in which case it is now that chat's server.
-				if (!existing && ![...this._entries.values()].some(entry => entry.server === server)) {
-					server.dispose();
-				}
-			}
-		} catch (error) {
-			// A missing or unstartable opencode is the normal case for a machine that
-			// has not installed it, so this is not fatal — but the picker then shows
-			// "No models available" with no other clue, so say why at `warn`.
-			const where = acquired ? acquired.baseUrl : 'no server';
-			this._logService.warn(`[opencode] Could not read the model catalog (${where}): ${errorText(error)}`);
-		}
+	/** Republishes the compatible rows from Fumie's Provider catalog. */
+	refreshModels(): Promise<void> {
+		this._refreshModels();
+		return Promise.resolve();
+	}
+
+	private _refreshModels(): void {
+		this._models.set(opencodeProviderModels(this.id, this._byokBridgeRegistry.getModels(), this._chatGptSubscription.getModels()), undefined);
 	}
 
 	resolveChatConfig(params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
@@ -310,7 +293,7 @@ export class OpencodeAgent extends Disposable implements IAgent {
 		return [];
 	}
 
-	/** opencode signs in on its own (`~/.local/share/opencode/auth.json`). */
+	/** OpenCode authentication is disabled; credentials stay in Fumie Providers. */
 	authenticate(_resource: string, _token: string): Promise<boolean> {
 		return Promise.resolve(false);
 	}
@@ -406,6 +389,7 @@ export class OpencodeAgent extends Disposable implements IAgent {
 			if (entry.turn) {
 				throw new Error('A response is already being generated for this opencode chat.');
 			}
+			const effectiveModel = this._resolveModel(entry.model);
 			// A server is rooted at its `cwd` and opencode's per-request `directory`
 			// does not move its tools, so a moved working directory means a new
 			// server — and a session that belonged to the old one.
@@ -416,7 +400,7 @@ export class OpencodeAgent extends Disposable implements IAgent {
 				this._publishChatData(entry);
 			}
 			const generation = entry.generation;
-			const { server, opencodeSessionID } = await this._materialize(entry);
+			const { server, opencodeSessionID } = await this._materialize(entry, effectiveModel);
 			if (generation !== entry.generation) {
 				return;
 			}
@@ -442,7 +426,7 @@ export class OpencodeAgent extends Disposable implements IAgent {
 				type: ActionType.ChatTurnStarted,
 				turnId: effectiveTurnId,
 				startedAt: new Date(startedAt).toISOString(),
-				message: { text: prompt, origin: { kind: MessageKind.User }, ...(attachments?.length ? { attachments: [...attachments] } : {}), ...(entry.model ? { model: entry.model } : {}) },
+				message: { text: prompt, origin: { kind: MessageKind.User }, ...(attachments?.length ? { attachments: [...attachments] } : {}), model: effectiveModel },
 			});
 			const deferred = entry.deferredEvents;
 			entry.deferredEvents = undefined;
@@ -453,11 +437,11 @@ export class OpencodeAgent extends Disposable implements IAgent {
 				const hidden = this._hiddenContext(entry, context);
 				// Read off the chat's current selection at send time, so a model
 				// switch or a restored session takes effect on the very next turn.
-				const variant = opencodeVariant(entry.model, this._models.get());
+				const variant = opencodeVariant(effectiveModel, this._models.get());
 				const response = await server.request<IOpencodePromptResponse>('POST', `/session/${opencodeSessionID}/message`, {
 					messageID,
 					parts: opencodePromptParts(prompt, attachments, hidden),
-					...(opencodeModelRef(entry.model) ? { model: opencodeModelRef(entry.model) } : {}),
+					model: opencodeModelRef(effectiveModel),
 					...(variant ? { variant } : {}),
 				});
 				if (generation === entry.generation) {
@@ -499,6 +483,7 @@ export class OpencodeAgent extends Disposable implements IAgent {
 			if (reserved) {
 				reservedEntry.pendingSends!--;
 			}
+			this._releaseServerIfIdle(reservedEntry);
 		});
 	}
 
@@ -537,6 +522,7 @@ export class OpencodeAgent extends Disposable implements IAgent {
 		this._dispatch(turn.mapper.closeOutstandingToolCalls(localize('opencode.toolCall.turnEnded', "opencode ended the turn before this tool call finished."), turn.cancelRequested || aborted));
 		this._dispatch(turn.cancelRequested || aborted ? turn.mapper.mapCancelled(duration)
 			: error ? turn.mapper.mapFailure(error, duration) : turn.mapper.mapStop(duration));
+		this._releaseServerIfIdle(entry);
 	}
 
 	private _nativeTurnForMessage(entry: IOpencodeChatEntry, parentID: string): IOpencodeTurnState | undefined {
@@ -610,14 +596,21 @@ export class OpencodeAgent extends Disposable implements IAgent {
 				return [];
 			}
 			const server = await this._connect(entry);
-			const messages = await server.request<readonly IOpencodeStoredMessage[]>('GET', `/session/${opencodeSessionID}/message`);
-			return replayOpencodeMessagesToTurns(messages ?? [], chat, opencodeSessionID, entry.workingDirectories[0].fsPath);
+			try {
+				const messages = await server.request<readonly IOpencodeStoredMessage[]>('GET', `/session/${opencodeSessionID}/message`);
+				return replayOpencodeMessagesToTurns(messages ?? [], chat, opencodeSessionID, entry.workingDirectories[0].fsPath);
+			} finally {
+				this._releaseServerIfIdle(entry);
+			}
 		});
 	}
 
-	private async _materialize(entry: IOpencodeChatEntry): Promise<{ server: IOpencodeServer; opencodeSessionID: string }> {
+	private async _materialize(entry: IOpencodeChatEntry, model: ModelSelection): Promise<{ server: IOpencodeServer; opencodeSessionID: string }> {
 		const generation = entry.generation;
 		const server = await this._connect(entry);
+		if (!this._serverService.isModelAvailable(server, model.id)) {
+			throw new Error(`The selected OpenCode model '${model.id}' is not available in this chat's active OpenCode process. Wait for its background work to finish, then try again.`);
+		}
 		if (entry.opencodeSessionID) {
 			return { server, opencodeSessionID: entry.opencodeSessionID };
 		}
@@ -638,7 +631,9 @@ export class OpencodeAgent extends Disposable implements IAgent {
 
 	/** Attaches this chat to the server for its working directory, starting one if needed. */
 	private async _connect(entry: IOpencodeChatEntry): Promise<IOpencodeServer> {
-		if (entry.server) {
+		// A retained server owns a turn or native background child. Keep that
+		// generation until the native work ends even when Providers changes.
+		if (entry.server && entry.serverRetained) {
 			return entry.server;
 		}
 		const cwd = entry.workingDirectories[0]?.fsPath;
@@ -648,13 +643,18 @@ export class OpencodeAgent extends Disposable implements IAgent {
 		const generation = entry.generation;
 		const server = await this._serverService.acquire(cwd);
 		if (generation !== entry.generation || this._entries.get(entry.chat.toString()) !== entry) {
+			this._serverService.release(server);
 			throw new Error('opencode chat was released while connecting.');
 		}
-		const listeners = new DisposableStore();
-		listeners.add(server.onDidReceiveEvent(event => this._handleEvent(entry, event)));
-		listeners.add(server.onDidClose(reason => this._handleServerClose(entry, reason)));
-		entry.server = server;
-		entry.serverListeners = listeners;
+		entry.serverRetained = true;
+		if (entry.server !== server) {
+			const listeners = new DisposableStore();
+			listeners.add(server.onDidReceiveEvent(event => this._handleEvent(entry, event)));
+			listeners.add(server.onDidClose(reason => this._handleServerClose(entry, reason)));
+			entry.serverListeners?.dispose();
+			entry.server = server;
+			entry.serverListeners = listeners;
+		}
 		return server;
 	}
 
@@ -702,6 +702,7 @@ export class OpencodeAgent extends Disposable implements IAgent {
 		if (sessionID !== entry.opencodeSessionID) {
 			if (typeof sessionID === 'string' && mapper.ownsChild(sessionID)) {
 				this._dispatch(mapper.mapEvent(event));
+				this._releaseServerIfIdle(entry);
 			}
 			return;
 		}
@@ -725,6 +726,7 @@ export class OpencodeAgent extends Disposable implements IAgent {
 		if (event.type === 'message.part.updated' && part && message && mapper.backgroundResultForPart(part as unknown as IOpencodePart)) {
 			message.notification = part['text'] as string;
 			this._dispatch(mapper.mapEvent(event));
+			this._releaseServerIfIdle(entry);
 			return;
 		}
 		const status = (properties['status'] as { type?: string } | undefined)?.type;
@@ -870,9 +872,14 @@ export class OpencodeAgent extends Disposable implements IAgent {
 			entry.turn = undefined;
 			this._dispatch(turn.mapper.mapFailure(new Error(reason), Date.now() - turn.startedAt));
 		}
+		const server = entry.server;
 		entry.serverListeners?.dispose();
 		entry.serverListeners = undefined;
 		entry.server = undefined;
+		if (server && entry.serverRetained) {
+			entry.serverRetained = false;
+			this._serverService.release(server);
+		}
 		entry.mapper = undefined;
 		entry.messages.clear();
 		entry.steering.clear();
@@ -882,11 +889,27 @@ export class OpencodeAgent extends Disposable implements IAgent {
 
 	private _changeModel(chat: URI, model: ModelSelection): Promise<void> {
 		const entry = this._entryForChat(chat);
+		this._resolveModel(model);
 		entry.model = model;
 		this._publishChatData(entry);
 		// The choice rides every prompt, so a live session honours it on the next
 		// turn without opencode being told separately.
 		return Promise.resolve();
+	}
+
+	private _resolveModel(model: ModelSelection | undefined): ModelSelection {
+		const available = opencodeProviderModels(
+			this.id,
+			visibleByokLmModels(this._byokBridgeRegistry.getModels()),
+			this._chatGptSubscription.getModels(),
+		);
+		if (available.length === 0) {
+			throw new Error('OpenCode has no visible compatible model in Fumie Providers.');
+		}
+		if (model && !available.some(candidate => candidate.id === model.id)) {
+			throw new Error(`The selected OpenCode model '${model.id}' is no longer available in Fumie Providers.`);
+		}
+		return model ?? { id: available[0].id };
 	}
 
 	private _changeAgent(_chat: URI, agent: AgentSelection | undefined): Promise<void> {
@@ -958,15 +981,29 @@ export class OpencodeAgent extends Disposable implements IAgent {
 		if (entry.turn) {
 			this._finishTurn(entry, entry.turn);
 		}
+		const server = entry.server;
 		entry.serverListeners?.dispose();
 		entry.serverListeners = undefined;
 		entry.server = undefined;
+		if (server && entry.serverRetained) {
+			entry.serverRetained = false;
+			this._serverService.release(server);
+		}
 		entry.turn = undefined;
 		entry.mapper = undefined;
 		entry.messages.clear();
 		entry.steering.clear();
 		entry.lastUserMessageID = undefined;
 		entry.deferredEvents = undefined;
+	}
+
+	private _releaseServerIfIdle(entry: IOpencodeChatEntry): void {
+		const unreadNotification = [...entry.messages.values()].some(message => message.notification && !message.turn);
+		if (!entry.server || !entry.serverRetained || entry.pendingSends || entry.turn || entry.mapper?.hasActiveSubagents || unreadNotification) {
+			return;
+		}
+		entry.serverRetained = false;
+		this._serverService.release(entry.server);
 	}
 
 	private _publishChatData(entry: IOpencodeChatEntry): void {
@@ -1015,54 +1052,44 @@ interface IOpencodePromptResponse {
 	readonly parts?: readonly IOpencodePart[];
 }
 
-/** The `GET /config/providers` answer. */
-interface IOpencodeProviderCatalog {
-	readonly providers?: readonly {
-		readonly id: string;
-		readonly models?: Readonly<Record<string, IOpencodeCatalogModel>>;
-	}[];
-}
-
-interface IOpencodeCatalogModel {
-	readonly id?: string;
-	readonly name?: string;
-	readonly capabilities?: { readonly input?: { readonly image?: boolean } };
-	readonly limit?: { readonly context?: number; readonly output?: number };
-	/**
-	 * The model's thinking tiers, keyed by variant name — the value is the
-	 * provider options opencode applies for that tier, which is its business,
-	 * not ours. Absent or empty on models that have no tiers.
-	 */
-	readonly variants?: Readonly<Record<string, unknown>>;
-}
-
 /**
- * Projects opencode's catalog onto the picker's flat model list.
- *
- * The row id pairs the provider with the model because that pair is exactly
- * what a prompt has to name, so a stored selection resolves back to the model
- * opencode published without a lookup table in between.
+ * Projects the Fumie Provider catalog into the OpenCode picker's flat rows.
+ * OpenCode's own provider catalog and auth store never participate.
  */
-export function opencodeCatalogModels(provider: AgentProvider, catalog: IOpencodeProviderCatalog | undefined): readonly IAgentModelInfo[] {
-	const rows: IAgentModelInfo[] = [];
-	for (const entry of catalog?.providers ?? []) {
-		for (const [modelId, model] of Object.entries(entry.models ?? {})) {
-			const configSchema = opencodeVariantConfigSchema(model.variants);
-			rows.push({
+export function opencodeProviderModels(provider: AgentProvider, byokModels: readonly IByokLmModelInfo[], chatGptModels: readonly IChatGptSubscriptionModel[]): readonly IAgentModelInfo[] {
+	const byok = byokModels
+		.filter(model => model.supportedHarnesses?.includes(OPENCODE_AGENT_PROVIDER_ID))
+		.map((model): IAgentModelInfo => {
+			const modelIdentifier = model.modelIdentifier ?? getByokLmAgentModelId(model);
+			const configSchema = opencodeVariantConfigSchema(model.supportedReasoningEfforts);
+			const byokMeta = createAgentModelByokMeta(model.modelIdentifier, model.hidden);
+			return {
 				provider,
-				id: `${entry.id}/${modelId}`,
-				// opencode reports the bare model id in its transcripts; the provider
-				// qualification in `id` is ours.
-				underlyingModelId: modelId,
-				name: model.name ?? modelId,
-				supportsVision: model.capabilities?.input?.image === true,
-				...(model.limit?.context ? { maxContextWindow: model.limit.context } : {}),
-				...(model.limit?.output ? { maxOutputTokens: model.limit.output } : {}),
+				id: `${OPENCODE_BYOK_PROVIDER_ID}/${modelIdentifier}`,
+				underlyingModelId: model.id,
+				name: model.name ?? model.id,
+				supportsVision: model.supportsVision ?? false,
+				...(model.maxContextWindowTokens ? { maxContextWindow: model.maxContextWindowTokens } : {}),
+				...(model.maxOutputTokens ? { maxOutputTokens: model.maxOutputTokens } : {}),
 				...(configSchema ? { configSchema } : {}),
-			});
-		}
-	}
-	return rows;
+				...(byokMeta ? { _meta: byokMeta } : {}),
+			};
+		});
+	const chatGpt = chatGptModels.map((model): IAgentModelInfo => {
+		const configSchema = opencodeVariantConfigSchema(model.supportedReasoningEfforts);
+		return {
+			provider,
+			id: `${CHATGPT_SUBSCRIPTION_PROVIDER_NAME}/${model.id}`,
+			underlyingModelId: model.id,
+			name: model.name,
+			supportsVision: model.supportsVision,
+			maxContextWindow: model.maxContextWindowTokens,
+			maxOutputTokens: chatGptSubscriptionMaxOutputTokens(model),
+			...(configSchema ? { configSchema } : {}),
+			_meta: createAgentModelSourceMeta(CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID),
+		};
+	});
+	return [...byok, ...chatGpt];
 }
 
 /**
@@ -1078,8 +1105,8 @@ export function opencodeCatalogModels(provider: AgentProvider, catalog: IOpencod
  * No `default` is declared: an unpicked level sends no `variant` at all, which
  * is what leaves opencode on whatever it would have chosen for the model.
  */
-function opencodeVariantConfigSchema(variants: Readonly<Record<string, unknown>> | undefined): ConfigSchema | undefined {
-	const keys = Object.keys(variants ?? {});
+function opencodeVariantConfigSchema(supportedReasoningEfforts: readonly string[] | undefined): ConfigSchema | undefined {
+	const keys = [...supportedReasoningEfforts ?? []];
 	if (keys.length === 0) {
 		return undefined;
 	}

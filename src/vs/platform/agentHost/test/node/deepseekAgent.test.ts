@@ -14,13 +14,16 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { INativeEnvironmentService } from '../../../environment/common/environment.js';
 import { NullLogService } from '../../../log/common/log.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Emitter, Event } from '../../../../base/common/event.js';
 import type { IByokLmModelInfo } from '../../common/agentHostByokLm.js';
-import { IByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
+import { IByokLmBridgeRegistry, NullByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
 import { AgentSession, AgentSignal, DEEPSEEK_AGENT_PROVIDER_ID, type IAgentChatMetadata, type IAgentCreateChatOptions } from '../../common/agent.js';
 import { AHP_SESSION_NOT_FOUND, ProtocolError } from '../../common/state/sessionProtocol.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { buildDefaultChatUri } from '../../common/state/sessionState.js';
 import { DeepSeekAgent } from '../../node/deepseek/deepseekAgent.js';
+import { ChatGptSubscriptionService, chatGptSubscriptionAgentModelId, type IChatGptSubscriptionService } from '../../node/chatGptSubscription.js';
+import { DeepSeekChatGptProviderRoute, deepSeekSubscriptionAgentOptions, deepSeekSubscriptionProviderConfig } from '../../node/deepseek/deepseekSubscription.js';
 import { DeepSeekProviderRoute, buildDeepSeekPersona, type IDeepSeekAgent, type IDeepSeekAgentHandle, type IDeepSeekContext, type IDeepSeekEvent, type IDeepSeekHarness, type IDeepSeekMessage, type IDeepSeekSdkService, type IDeepSeekSession, type IDeepSeekSessionHeader } from '../../node/deepseek/deepseekSdkService.js';
 
 /** The creation stamp every session the fake harness stores carries. */
@@ -214,6 +217,8 @@ class FakeDeepSeekAgent implements IDeepSeekAgent {
 
 class FakeDeepSeekHarness implements IDeepSeekHarness {
 	readonly creations: IFakeDeepSeekCreation[] = [];
+	readonly runtimeOptions: Record<string, unknown>[] = [];
+	readonly requestSelections: { provider: string; model: string; reasoningEffort?: string }[] = [];
 	/** Every agent ever attached, including ones already disposed. */
 	readonly agents: FakeDeepSeekAgent[] = [];
 	readonly policies: { readonly agentId: string; readonly policy: string }[] = [];
@@ -273,6 +278,10 @@ class FakeDeepSeekHarness implements IDeepSeekHarness {
 		return { text } satisfies IFakeDeepSeekMessage;
 	}
 
+	createModelSelectionSetup(selection: { provider: string; model: string; reasoningEffort?: string }): () => void {
+		return () => { this.requestSelections.push(selection); };
+	}
+
 	/** Raises an `approval/request` the way the booted harness would. */
 	async requestApproval(agentId: string, toolName: string, callId = 'call-1'): Promise<unknown> {
 		const listener = this._listeners.get('approval/request');
@@ -290,7 +299,13 @@ class FakeDeepSeekHarness implements IDeepSeekHarness {
 		listener({ id: agentId }, { type: 'tool/call', data: { callId, name: toolName, arguments: JSON.stringify(input) } });
 	}
 
+	finishTurn(agentId: string): void {
+		this._listeners.get('session/event')?.({ id: agentId }, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+	}
+
 	private async _create(options: Record<string, unknown>): Promise<IDeepSeekAgentHandle> {
+		this.runtimeOptions.push(options.agentOptions as Record<string, unknown>);
+		(options.setup as (() => void) | undefined)?.();
 		const agentOptions = options.agentOptions as { readonly provider: string; readonly model: string };
 		const sessionId = String(options.sessionId);
 		// `agents.create` takes the cwd as a creation option under `meta`; the
@@ -305,11 +320,13 @@ class FakeDeepSeekHarness implements IDeepSeekHarness {
 
 	/** Re-attaches an agent to a stored session, as a cold resume does. */
 	private async _resume(options: Record<string, unknown>): Promise<IDeepSeekAgentHandle> {
+		this.runtimeOptions.push(options.agentOptions as Record<string, unknown>);
 		this.resumeCount++;
 		const session = this._persisted.get(String(options.resumeSessionId));
 		if (!session) {
 			throw new Error('No DeepSeek session to resume');
 		}
+		(options.setup as (() => void) | undefined)?.();
 		return this._attach(session);
 	}
 
@@ -347,9 +364,16 @@ class FakeDeepSeekSdkService implements IDeepSeekSdkService {
  * a restart looks like from the harness's side: the stored sessions survive, the
  * provider's in-memory bookkeeping does not.
  */
-function createAgent(models: readonly IByokLmModelInfo[] = [], sdk = new FakeDeepSeekSdkService()): { agent: DeepSeekAgent; sdk: FakeDeepSeekSdkService } {
+function createAgent(models: readonly IByokLmModelInfo[] = [], sdk = new FakeDeepSeekSdkService(), subscription: IChatGptSubscriptionService = {
+	_serviceBrand: undefined,
+	onDidChangeSignedIn: Event.None,
+	registerSource: () => Disposable.None,
+		getModels: () => [],
+	isSignedIn: () => false,
+	readCredentials: async () => { throw new Error('Not signed in'); },
+}): { agent: DeepSeekAgent; sdk: FakeDeepSeekSdkService } {
 	const environment = { userHome: URI.file('/home/test') } as INativeEnvironmentService;
-	return { agent: new DeepSeekAgent(sdk, environment, new NullLogService(), byokRegistryWith(models)), sdk };
+	return { agent: new DeepSeekAgent(sdk, environment, new NullLogService(), byokRegistryWith(models), subscription), sdk };
 }
 
 /** A renderer BYOK catalog with one DeepSeek row, enough to resume a session. */
@@ -523,6 +547,63 @@ suite('DeepSeekAgent', () => {
 			empty.agent.dispose();
 			populated.agent.dispose();
 		}
+	});
+
+	test('adds and removes ChatGPT models with the shared account while retaining BYOK models', () => {
+		const subscription = new ChatGptSubscriptionService(new NullByokLmBridgeRegistry());
+		const changed = new Emitter<void>();
+		let signedIn = false;
+		const source = subscription.registerSource({
+			onDidChangeSignedIn: changed.event,
+			isSignedIn: () => signedIn,
+			readCredentials: async () => { throw new Error('Catalog reads must not read credentials'); },
+		});
+		const { agent } = createAgent(DEEPSEEK_BYOK_MODELS, undefined, subscription);
+		try {
+			assert.deepStrictEqual(agent.models.get().map(model => model.id), [BYOK_DEEPSEEK_FLASH_ID]);
+			signedIn = true;
+			changed.fire();
+			assert.ok(agent.models.get().some(model => model.id === chatGptSubscriptionAgentModelId('gpt-6-astra')));
+			signedIn = false;
+			changed.fire();
+			assert.deepStrictEqual(agent.models.get().map(model => model.id), [BYOK_DEEPSEEK_FLASH_ID]);
+		} finally {
+			agent.dispose();
+			source.dispose();
+			changed.dispose();
+			subscription.dispose();
+		}
+	});
+
+	test('uses the native Responses provider for ChatGPT and changes back to BYOK on resume', async () => {
+		const { agent, sdk } = createAgent(DEEPSEEK_BYOK_MODELS);
+		sdk.harness.onFollowup = async agent => sdk.harness.finishTurn(agent.id);
+		const subscriptionModel = chatGptSubscriptionAgentModelId('gpt-6-astra');
+		try {
+			const { chat, session } = await createDeepSeekChat(agent, {
+				workingDirectories: [URI.file('/workspace')],
+				model: { id: subscriptionModel, config: { thinkingLevel: 'high' } },
+			});
+			await agent.chats.sendMessage(chat, 'first turn', [URI.file('/workspace')]);
+			assert.deepStrictEqual(sdk.harness.runtimeOptions.at(-1), { provider: DeepSeekChatGptProviderRoute, model: subscriptionModel, reasoningEffort: 'high' });
+			assert.deepStrictEqual(sdk.harness.requestSelections.at(-1), { provider: DeepSeekChatGptProviderRoute, model: subscriptionModel, reasoningEffort: 'high' });
+			await agent.chats.changeModel(chat, { id: BYOK_DEEPSEEK_FLASH_ID }, session);
+			await agent.chats.sendMessage(chat, 'second turn', [URI.file('/workspace')]);
+			assert.deepStrictEqual(sdk.harness.runtimeOptions.at(-1), { provider: DeepSeekProviderRoute, model: BYOK_DEEPSEEK_FLASH_ID });
+			assert.deepStrictEqual(sdk.harness.requestSelections.at(-1), { provider: DeepSeekProviderRoute, model: BYOK_DEEPSEEK_FLASH_ID });
+		} finally {
+			await agent.shutdown();
+			agent.dispose();
+		}
+	});
+
+	test('configures subscription requests on the SDK Responses adapter and rejects unsupported selections', () => {
+		const config = deepSeekSubscriptionProviderConfig('http://127.0.0.1:12345').providers[DeepSeekChatGptProviderRoute];
+		assert.strictEqual(config.api, 'openai-responses');
+		assert.strictEqual(config.baseURL, 'http://127.0.0.1:12345');
+		assert.ok(config.models.some(model => model.id === chatGptSubscriptionAgentModelId('gpt-6-astra')));
+		assert.throws(() => deepSeekSubscriptionAgentOptions({ id: chatGptSubscriptionAgentModelId('missing-model') }));
+		assert.throws(() => deepSeekSubscriptionAgentOptions({ id: chatGptSubscriptionAgentModelId('gpt-6-astra'), config: { thinkingLevel: 'ultra' } }));
 	});
 
 	test('names a session from a hidden toolless agent on the requested model and disposes it', async () => {

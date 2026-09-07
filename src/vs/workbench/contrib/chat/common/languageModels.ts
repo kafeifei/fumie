@@ -315,6 +315,21 @@ export interface ILanguageModelChatMetadata {
 		readonly sourceId?: string;
 	};
 	/**
+	 * Connects a projected agent-host row to the canonical model row whose
+	 * Manage Models entry owns whether that projection may be offered.
+	 *
+	 * The namespace keeps identical source/model pairs from different hosts or
+	 * accounts independent. The field is only present on explicitly managed
+	 * rows; older and remote agent-host catalogs therefore retain their own
+	 * visibility semantics.
+	 */
+	readonly sourceModel?: {
+		readonly sourceId: string;
+		readonly modelId: string;
+		readonly visibilityNamespace: string;
+		readonly visibilityOwner: boolean;
+	};
+	/**
 	 * For an agent-host copy of an extension-provided BYOK model, the identifier the
 	 * original model is registered under in the renderer's LM service
 	 * (`toModelIdentifier(vendor, group, id)` — `<vendor>/<group>/<id>` or `<vendor>/<id>`).
@@ -562,6 +577,51 @@ export const ILanguageModelsService = createDecorator<ILanguageModelsService>('I
 export interface ILanguageModelChatMetadataAndIdentifier {
 	metadata: ILanguageModelChatMetadata;
 	identifier: string;
+}
+
+function isLanguageModelHiddenByOwnVisibility(
+	model: ILanguageModelChatMetadataAndIdentifier,
+	isModelHidden: (identifier: string) => boolean,
+): boolean {
+	if (model.metadata.byokModelHidden || isModelHidden(model.identifier)) {
+		return true;
+	}
+	const manageModelsIdentifier = ILanguageModelChatMetadata.getAgentHostByokManageModelsIdentifier(model.metadata);
+	return manageModelsIdentifier !== undefined && isModelHidden(manageModelsIdentifier);
+}
+
+/**
+ * Whether a model may be offered in a picker after applying both its own
+ * Manage Models state and, for a managed projection, its canonical source
+ * model's state.
+ *
+ * A projection fails closed when its canonical owner is absent. Matching uses
+ * the explicit namespace as well as source and model ids, so an identically
+ * named model from another host or account cannot control this row.
+ */
+export function isLanguageModelVisibleInPicker(
+	model: ILanguageModelChatMetadataAndIdentifier,
+	allModels: readonly ILanguageModelChatMetadataAndIdentifier[],
+	isModelHidden: (identifier: string) => boolean,
+): boolean {
+	if (isLanguageModelHiddenByOwnVisibility(model, isModelHidden)) {
+		return false;
+	}
+
+	const sourceModel = model.metadata.sourceModel;
+	if (!sourceModel || sourceModel.visibilityOwner) {
+		return true;
+	}
+
+	return allModels.some(candidate => {
+		const owner = candidate.metadata.sourceModel;
+		return owner?.visibilityOwner === true
+			&& owner.visibilityNamespace === sourceModel.visibilityNamespace
+			&& owner.sourceId === sourceModel.sourceId
+			&& owner.modelId === sourceModel.modelId
+			&& candidate.metadata.isUserSelectable !== false
+			&& !isLanguageModelHiddenByOwnVisibility(candidate, isModelHidden);
+	});
 }
 
 export interface ILanguageModelChatInfoOptions {

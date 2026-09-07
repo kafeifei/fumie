@@ -19,7 +19,9 @@ import {
 	IByokLmOutputItem,
 	IByokLmProviderConfiguration,
 	IByokLmReasoningItem,
+	IManagedChatGptModelInfo,
 } from '../../../../../../platform/agentHost/common/agentHostByokLm.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID } from '../../../../../../platform/agentHost/common/agentModelSource.js';
 import { IContextKeyService } from '../../../../../../platform/contextkey/common/contextkey.js';
 import { ILogService } from '../../../../../../platform/log/common/log.js';
 import { ChatEntitlementContextKeys, IChatEntitlementService } from '../../../../../services/chat/common/chatEntitlementService.js';
@@ -224,12 +226,36 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
 		return models;
 	}
 
+	async listChatGptModels(_token: CancellationToken): Promise<IManagedChatGptModelInfo[]> {
+		await this._languageModelsService.whenReady;
+		const models: IManagedChatGptModelInfo[] = [];
+		for (const identifier of this._languageModelsService.getLanguageModelIds()) {
+			const metadata = this._languageModelsService.lookupLanguageModel(identifier);
+			const source = metadata?.sourceModel;
+			if (!metadata || !source?.visibilityOwner || source.sourceId !== CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID
+				|| metadata.isUserSelectable === false || this._languageModelsService.isModelHidden(identifier)) {
+				continue;
+			}
+			const reasoning = metadata.configurationSchema?.properties?.reasoningEffort;
+			const efforts = reasoning?.enum?.filter((value): value is string => typeof value === 'string');
+			models.push({
+				id: source.modelId,
+				name: metadata.name,
+				maxContextWindowTokens: metadata.maxInputTokens + metadata.maxOutputTokens,
+				maxOutputTokens: metadata.maxOutputTokens,
+				supportsVision: !!metadata.capabilities?.vision,
+				...(efforts?.length ? { supportedReasoningEfforts: efforts } : {}),
+				...(typeof reasoning?.default === 'string' ? { defaultReasoningEffort: reasoning.default } : {}),
+			});
+		}
+		return models;
+	}
+
 	private _supportedHarnesses(modelIdentifier: string, vendor: string, modelId: string): readonly string[] | undefined {
-		// Ollama is a general model source rather than an official Agent. Pi is the
-		// conservative default; providers can opt a model into another Agent with
-		// explicit `fumieHarnesses` metadata below.
+		// Pi and OpenCode use the provider's native wire through Fumie's proxy.
+		// Explicit per-model harness choices below still take precedence.
 		if (vendor === 'ollama') {
-			return ['pi'];
+			return ['pi', 'opencode'];
 		}
 		// Other BYOK providers do not expose a native transport through the shared
 		// proxy yet. Keep them out of Pi until that adapter exists.
@@ -239,7 +265,7 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
 		const group = this._languageModelsService.getLanguageModelGroups(vendor)
 			.find(candidate => candidate.modelIdentifiers.includes(modelIdentifier))?.group;
 		if (!group) {
-			return ['pi'];
+			return ['pi', 'opencode'];
 		}
 		const models = Array.isArray(group['models']) ? group['models'] : [];
 		const model = models.find(candidate => !!candidate && typeof candidate === 'object' && (candidate as { id?: unknown }).id === modelId) as {
@@ -251,7 +277,7 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
 			return model.fumieHarnesses.filter((value): value is string => typeof value === 'string');
 		}
 
-		return ['pi'];
+		return ['pi', 'opencode'];
 	}
 
 	/**

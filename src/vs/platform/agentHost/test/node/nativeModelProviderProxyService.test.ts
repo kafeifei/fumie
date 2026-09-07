@@ -44,6 +44,7 @@ suite('NativeModelProviderProxyService', () => {
 			_serviceBrand: undefined,
 			onDidChangeSignedIn: Event.None,
 			registerSource: () => Disposable.None,
+		getModels: () => [],
 			isSignedIn: () => !!credentials,
 			readCredentials: async () => {
 				if (!credentials) {
@@ -248,7 +249,7 @@ suite('NativeModelProviderProxyService', () => {
 			}, {
 				status: 200,
 				url: 'https://chatgpt.com/backend-api/codex/responses',
-				body: { model: 'gpt-5.5', input: 'hello', stream: true },
+				body: { model: 'gpt-5.5', input: 'hello', stream: true, instructions: '', store: false },
 				authorization: 'Bearer chatgpt-access-token',
 				originator: 'codex_cli_rs',
 				userAgent: 'codex_cli_rs/0.147.0',
@@ -282,7 +283,7 @@ suite('NativeModelProviderProxyService', () => {
 			const response = await fetch(`${handle.providerBaseUrl('responses')}/v1/responses`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${handle.nonce}.pi` },
-				body: JSON.stringify({ model: chatGptSubscriptionAgentModelId('gpt-5.5', 'priority'), input: 'hello', stream: true }),
+				body: JSON.stringify({ model: chatGptSubscriptionAgentModelId('gpt-5.5', 'priority'), input: 'hello', stream: true, instructions: 'Keep the native prompt.', store: true }),
 			});
 			assert.deepStrictEqual({
 				status: response.status,
@@ -291,7 +292,7 @@ suite('NativeModelProviderProxyService', () => {
 				body: JSON.parse(String(captured?.init?.body)),
 			}, {
 				status: 200,
-				body: { model: 'gpt-5.5', input: 'hello', stream: true, service_tier: 'priority' },
+				body: { model: 'gpt-5.5', input: 'hello', stream: true, service_tier: 'priority', instructions: 'Keep the native prompt.', store: false },
 			});
 		} finally {
 			handle.dispose();

@@ -5,7 +5,7 @@
 
 import { Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import type { IChatGptSubscriptionCredentials, IChatGptSubscriptionService } from '../../node/chatGptSubscription.js';
+import { CHATGPT_SUBSCRIPTION_MODELS, type IChatGptSubscriptionCredentials, type IChatGptSubscriptionService } from '../../node/chatGptSubscription.js';
 
 /**
  * An {@link IChatGptSubscriptionService} for tests that never signs anyone in
@@ -17,6 +17,7 @@ export function createTestChatGptSubscriptionService(credentials?: IChatGptSubsc
 		_serviceBrand: undefined,
 		onDidChangeSignedIn: Event.None,
 		registerSource: () => Disposable.None,
+		getModels: () => credentials ? CHATGPT_SUBSCRIPTION_MODELS : [],
 		isSignedIn: () => !!credentials,
 		readCredentials: async () => {
 			if (!credentials) {

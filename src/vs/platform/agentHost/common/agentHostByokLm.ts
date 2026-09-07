@@ -171,6 +171,17 @@ export interface IByokLmModelInfo {
 	readonly hidden?: boolean;
 }
 
+/** A visible ChatGPT model owned by the serving window's configured Provider. */
+export interface IManagedChatGptModelInfo {
+	readonly id: string;
+	readonly name: string;
+	readonly maxContextWindowTokens?: number;
+	readonly maxOutputTokens?: number;
+	readonly supportsVision?: boolean;
+	readonly supportedReasoningEfforts?: readonly string[];
+	readonly defaultReasoningEffort?: string;
+}
+
 /**
  * The rows a model picker, a proxy `/models` listing or a harness session config
  * may offer, i.e. the catalog minus what the user hid in "Manage Models".
@@ -271,6 +282,9 @@ export interface IAgentHostByokLmHandler {
 	 * provider/model config for the SDK runtime.
 	 */
 	listModels(token: CancellationToken): Promise<IByokLmModelInfo[]>;
+
+	/** Subscription access is separate from BYOK routing and carries no credentials. */
+	listChatGptModels?(token: CancellationToken): Promise<IManagedChatGptModelInfo[]>;
 }
 
 /**
@@ -283,4 +297,6 @@ export interface IByokLmBridgeConnection {
 	resolveProviderConfiguration?(modelIdentifier: string): Promise<IByokLmProviderConfiguration | undefined>;
 	/** Emits the renderer's current BYOK model snapshot on subscribe and on every change. */
 	readonly onDidChangeModels: Event<IByokLmModelInfo[]>;
+	/** Visible models in the configured ChatGPT Provider, including an authoritative empty list. */
+	readonly onDidChangeChatGptModels?: Event<IManagedChatGptModelInfo[]>;
 }

@@ -27,6 +27,8 @@ import { ensureWorkspacelessScratchDir } from '../workspacelessScratchDir.js';
 import { getByokLmAgentModelId } from '../../common/agentHostByokLm.js';
 import { createAgentModelByokMeta, readAgentModelByokHidden } from '../../common/agentModelByokMeta.js';
 import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
+import { IChatGptSubscriptionService } from '../chatGptSubscription.js';
+import { deepSeekSubscriptionAgentOptions, deepSeekSubscriptionModels } from './deepseekSubscription.js';
 import { DeepSeekProviderRoute, IDeepSeekEvent, IDeepSeekHarness, IDeepSeekSdkService, IDeepSeekSession, IDeepSeekSessionHeader, IDeepSeekAgent as IDeepSeekRuntimeAgent } from './deepseekSdkService.js';
 import { readDeepSeekStoredSession } from './deepseekSessionLog.js';
 import { replayDeepSeekSessionToTurns } from './deepseekReplayMapper.js';
@@ -116,21 +118,21 @@ export class DeepSeekAgent extends Disposable implements IAgent {
 		@INativeEnvironmentService private readonly _environmentService: INativeEnvironmentService,
 		@ILogService private readonly _logService: ILogService,
 		@IByokLmBridgeRegistry private readonly _byokBridgeRegistry: IByokLmBridgeRegistry,
+		@IChatGptSubscriptionService private readonly _chatGptSubscription: IChatGptSubscriptionService,
 	) {
 		super();
-		// The picker's rows are the DeepSeek-family slice of the renderer BYOK
-		// catalog; this agent holds no catalog of its own. Empty until a renderer
-		// bridge pushes models.
+		// Project the compatible BYOK rows and shared ChatGPT subscription catalog.
 		this._register(this._byokBridgeRegistry.onDidChangeModels(() => this._refreshModels()));
+		this._register(this._chatGptSubscription.onDidChangeSignedIn(() => this._refreshModels()));
 		this._refreshModels();
 	}
 
 	/**
 	 * Publish the provider-compatible slice of the renderer BYOK catalog.
-	 * Nothing here renames, re-stamps or dedupes provider rows.
+	 * BYOK rows keep their provider identity; subscription rows use a separate route.
 	 */
 	private _refreshModels(): void {
-		this._models.set(this._byokBridgeRegistry.getModels()
+		const byokModels = this._byokBridgeRegistry.getModels()
 			.filter(model => !model.supportedHarnesses || model.supportedHarnesses.includes(this.id))
 			.map((m): IAgentModelInfo => {
 				const byokMeta = createAgentModelByokMeta(m.modelIdentifier, m.hidden);
@@ -146,7 +148,8 @@ export class DeepSeekAgent extends Disposable implements IAgent {
 					supportsVision: m.supportsVision ?? false,
 					...(byokMeta && { _meta: byokMeta }),
 				};
-			}), undefined);
+			});
+		this._models.set([...byokModels, ...(this._chatGptSubscription.isSignedIn() ? deepSeekSubscriptionModels() : [])], undefined);
 	}
 
 	/**
@@ -160,7 +163,7 @@ export class DeepSeekAgent extends Disposable implements IAgent {
 		if (!first) {
 			throw new Error('DeepSeek has no model available from the configured model providers.');
 		}
-		return { provider: DeepSeekProviderRoute, model: deepSeekModelId({ id: first.id }) };
+		return deepSeekAgentOptions({ id: first.id });
 	}
 
 	readonly chats: IAgentChats = {
@@ -396,10 +399,12 @@ export class DeepSeekAgent extends Disposable implements IAgent {
 		const entry = this._sessions.get(AgentSession.id(session));
 		const harness = await this._sdkService.getHarness();
 		this._installHarnessSubscriptions(harness);
+		const agentOptions = deepSeekAgentOptions(request.modelId !== undefined ? { id: request.modelId } : entry?.model);
 		const handle = await harness.ctx.agents.create({
 			sessionId: generateUuid(),
 			meta: { cwd: entry?.workingDirectories[0]?.fsPath ?? os.tmpdir() },
-			agentOptions: { provider: DeepSeekProviderRoute, model: deepSeekModelId(request.modelId !== undefined ? { id: request.modelId } : entry?.model) },
+			agentOptions,
+			setup: harness.createModelSelectionSetup(agentOptions),
 		});
 		this._titleAgentIds.add(handle.agent.id);
 		// `ask` routes every tool call through the harness approval hook, which
@@ -522,10 +527,10 @@ export class DeepSeekAgent extends Disposable implements IAgent {
 		const harness = await this._sdkService.getHarness();
 		this._installHarnessSubscriptions(harness);
 		const id = AgentSession.id(entry.session);
-		const agentOptions = { provider: DeepSeekProviderRoute, model: deepSeekModelId(entry.model) };
+		const agentOptions = deepSeekAgentOptions(entry.model);
 		let handle: { readonly agent: IDeepSeekRuntimeAgent; dispose(): Promise<void> };
 		try {
-			handle = await harness.ctx.agents.resume({ resumeSessionId: id, agentOptions });
+			handle = await harness.ctx.agents.resume({ resumeSessionId: id, agentOptions, setup: harness.createModelSelectionSetup(agentOptions) });
 		} catch {
 			const primary = entry.workingDirectories[0]
 				?? await ensureWorkspacelessScratchDir(this._environmentService.userHome, id);
@@ -534,6 +539,7 @@ export class DeepSeekAgent extends Disposable implements IAgent {
 				sessionId: id,
 				meta: { cwd: primary.fsPath },
 				agentOptions,
+				setup: harness.createModelSelectionSetup(agentOptions),
 			});
 		}
 		entry.agentHandle = handle;
@@ -909,11 +915,15 @@ function migrateDeepSeekPermissionConfig(config: Readonly<Record<string, unknown
  * lists comes from that catalog, so anything else is a stale or foreign
  * selection and must not be silently substituted for a working one.
  */
-function deepSeekModelId(model: ModelSelection | undefined): string {
+function deepSeekAgentOptions(model: ModelSelection | undefined): { provider: string; model: string; reasoningEffort?: string } {
+	const subscription = model && deepSeekSubscriptionAgentOptions(model);
+	if (subscription) {
+		return subscription;
+	}
 	if (!model?.id.includes('/')) {
 		throw new Error(`DeepSeek cannot run model '${model?.id ?? ''}': it is not one of the models the configured providers advertise.`);
 	}
-	return model.id;
+	return { provider: DeepSeekProviderRoute, model: model.id };
 }
 
 /**

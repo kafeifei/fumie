@@ -37,6 +37,7 @@ import type { IAgentHostClientTelemetryContext } from '../../common/agentHostTel
 import { IAgentHostReviewService } from '../../common/agentHostReviewService.js';
 import { createPricingMetaFromBilling, hasLongContextSurcharge, normalizeCAPIBilling, type ICAPIModelBilling } from '../../common/agentModelPricing.js';
 import { createAgentModelByokMeta } from '../../common/agentModelByokMeta.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID, createAgentModelSourceMeta } from '../../common/agentModelSource.js';
 import { AgentHostConfigKey, agentHostCustomizationConfigSchema, DEFAULT_SESSION_CUSTOMIZATION_DISCOVERY_MODE, toContainerCustomization } from '../../common/agentHostCustomizationConfig.js';
 import { CopilotCliConfigKey, CopilotCliVSCodeAssignmentContextKey, copilotCliConfigSchema, DEFAULT_COPILOT_RUBBER_DUCK_ENABLED, type CopilotSdkLogLevelSetting } from '../../common/copilotCliConfig.js';
 import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostByokModelsEnabledConfigKey, AgentHostMcpServersConfigKey, AgentHostGitHubMcpServerEnabledConfigKey, AgentHostCopilotMultiRootEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, AgentHostSystemProxyEnabledConfigKey, AgentHostMigrateLegacyCopilotCliEnabledConfigKey, AgentHostProxyConfigKey, agentHostProxyConfigSchema, AutoApproveLevel, SessionMode, migrateLegacyAutopilotConfig, platformRootSchema, platformSessionSchema, type AgentHostMcpServers } from '../../common/agentHostSchema.js';
@@ -72,6 +73,7 @@ import { getSdkMcpServerEnablement, isCustomizationSdkEligible, resolveCustomiza
 import { McpServerStatus, type McpServerCustomization } from '../../common/state/protocol/channels-session/state.js';
 import { IAgentHostSessionTitleSignal } from '../agentHostSessionTitleSignal.js';
 import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
+import { CHATGPT_SUBSCRIPTION_MODELS, CHATGPT_SUBSCRIPTION_PROVIDER_NAME, IChatGptSubscriptionService, chatGptSubscriptionMaxOutputTokens } from '../chatGptSubscription.js';
 import { SessionWorkingDirectoryMissingError } from '../shared/worktreeIsolation.js';
 import { buildSessionEventLogFromTurns } from './buildSessionEvents.js';
 import { CopilotAgentSession } from './copilotAgentSession.js';
@@ -732,14 +734,16 @@ export class CopilotAgent extends Disposable implements IAgent {
 	private readonly _models = observableValue<readonly IAgentModelInfo[]>(this, []);
 	readonly models = this._models;
 	/**
-	 * The two sources merged into {@link _models}: CAPI models from the CLI's
-	 * `models.list` and BYOK models from the renderer bridge registry's serving
-	 * window. Tracked separately so each can refresh independently without
+	 * The three sources merged into {@link _models}: CAPI models from the CLI's
+	 * `models.list`, BYOK models from the renderer bridge registry's serving
+	 * window, and ChatGPT subscription models borrowed from Codex. Tracked
+	 * separately so each can refresh independently without
 	 * clobbering the other; {@link _publishModels} concatenates them for the
 	 * picker.
 	 */
 	private _capiModels: readonly IAgentModelInfo[] = [];
 	private _byokModels: readonly IAgentModelInfo[] = [];
+	private _chatGptSubscriptionModels: readonly IAgentModelInfo[] = [];
 
 	/** Model IDs whose long-context tier costs the same as the default tier (free long context). */
 	private readonly _freeLongContextModels = new Set<string>();
@@ -898,6 +902,7 @@ export class CopilotAgent extends Disposable implements IAgent {
 		@IAgentHostCustomizationEnablementService private readonly _customizationEnablementService: IAgentHostCustomizationEnablementService,
 		@INativeEnvironmentService private readonly _environmentService: INativeEnvironmentService,
 		@IByokLmBridgeRegistry private readonly _byokBridgeRegistry: IByokLmBridgeRegistry,
+		@IChatGptSubscriptionService private readonly _chatGptSubscription: IChatGptSubscriptionService,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@ICopilotApiService private readonly _copilotApiService: ICopilotApiService,
 		@IAgentHostProxyResolver private readonly _proxyResolver: IAgentHostProxyResolver,
@@ -980,6 +985,8 @@ export class CopilotAgent extends Disposable implements IAgent {
 			this._logService.info('[Copilot] BYOK bridge changed; refreshing models');
 			this._refreshByokModels();
 		}));
+		this._register(this._chatGptSubscription.onDidChangeSignedIn(() => this._refreshChatGptSubscriptionModels()));
+		this._refreshChatGptSubscriptionModels();
 
 		// `COPILOT_GH_HOST` is a subprocess env var (applied in `_ensureClient`) the
 		// CLI reads only at spawn time. When the configured GitHub Enterprise host
@@ -1300,7 +1307,7 @@ export class CopilotAgent extends Disposable implements IAgent {
 		const allowSignedOutWhenUsable = this._configurationService.getRootValue(agentHostCustomizationConfigSchema, AgentHostConfigKey.AllowSignedOutWhenUsable) === true;
 		const copilotResource = this._gitHubEndpointService.getCopilotResource();
 		return [
-			allowSignedOutWhenUsable && this._byokModels.length > 0 ? { ...copilotResource, required: false } : copilotResource,
+			allowSignedOutWhenUsable && (this._byokModels.length > 0 || this._chatGptSubscriptionModels.length > 0) ? { ...copilotResource, required: false } : copilotResource,
 			this._gitHubEndpointService.getRepoResource(),
 		];
 	}
@@ -1803,7 +1810,30 @@ export class CopilotAgent extends Disposable implements IAgent {
 	 * allocated each call so the observable always notifies its consumers.
 	 */
 	private _publishModels(): void {
-		this._models.set([...this._capiModels, ...this._byokModels], undefined);
+		this._models.set([...this._capiModels, ...this._byokModels, ...this._chatGptSubscriptionModels], undefined);
+	}
+
+	/** Publish the ChatGPT models only while Codex owns a live signed-in source. */
+	private _refreshChatGptSubscriptionModels(): void {
+		this._chatGptSubscriptionModels = this._chatGptSubscription.isSignedIn()
+			? CHATGPT_SUBSCRIPTION_MODELS.map((model): IAgentModelInfo => {
+				const thinkingLevel = this._createThinkingLevelConfigSchemaProperty(model.supportedReasoningEfforts, model.defaultReasoningEffort, model.id);
+				return {
+					provider: this.id,
+					// Named providers are selected as `provider/id` by the Copilot SDK.
+					// Its `wireModel` maps this back to the shared host route.
+					id: `${CHATGPT_SUBSCRIPTION_PROVIDER_NAME}/${model.id}`,
+					underlyingModelId: model.id,
+					name: model.name,
+					maxContextWindow: model.maxContextWindowTokens,
+					maxOutputTokens: chatGptSubscriptionMaxOutputTokens(model),
+					supportsVision: model.supportsVision,
+					...(thinkingLevel ? { configSchema: { type: 'object', properties: { [ThinkingLevelConfigKey]: thinkingLevel } } satisfies ConfigSchema } : {}),
+					_meta: createAgentModelSourceMeta(CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID),
+				};
+			})
+			: [];
+		this._publishModels();
 	}
 
 	/**

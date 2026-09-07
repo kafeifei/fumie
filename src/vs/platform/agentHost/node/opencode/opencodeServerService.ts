@@ -8,7 +8,7 @@ import type { Readable } from 'stream';
 import { existsSync } from 'fs';
 import { createServer, type AddressInfo } from 'net';
 import { request } from 'undici';
-import { DeferredPromise, raceTimeout } from '../../../../base/common/async.js';
+import { DeferredPromise, raceTimeout, SequencerByKey } from '../../../../base/common/async.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { delimiter, join } from '../../../../base/common/path.js';
@@ -16,8 +16,13 @@ import { isWindows } from '../../../../base/common/platform.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { createDecorator } from '../../../instantiation/common/instantiation.js';
 import { ILogService } from '../../../log/common/log.js';
+import { getByokLmAgentModelId, type IByokLmModelInfo, type IByokLmProviderConfiguration, visibleByokLmModels } from '../../common/agentHostByokLm.js';
 import { withoutModelProviderEnvironment } from '../modelProviderEnvironment.js';
+import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
+import { CHATGPT_SUBSCRIPTION_PROVIDER_NAME, IChatGptSubscriptionService, chatGptSubscriptionAgentModelId, chatGptSubscriptionMaxOutputTokens, type IChatGptSubscriptionModel } from '../chatGptSubscription.js';
+import { INativeModelProviderProxyService, type INativeModelProviderProxyHandle, type NativeModelWireProtocol } from '../nativeModelProviderProxyService.js';
 import { resolveDefaultAgentsDir } from '../fumie/agentSdkManager.js';
+import { OpencodeDbEnvVar, prepareOpencodeBackingStore } from './opencodeBackingStore.js';
 
 /**
  * The `opencode serve` process, and nothing else.
@@ -46,6 +51,21 @@ const OPENCODE_BASIC_AUTH_USER = 'opencode';
 
 /** Environment variable opencode reads its server password from. */
 const OPENCODE_SERVER_PASSWORD_ENV = 'OPENCODE_SERVER_PASSWORD';
+
+/** In-memory config overlay supported by opencode's own server launcher. */
+const OPENCODE_CONFIG_CONTENT_ENV = 'OPENCODE_CONFIG_CONTENT';
+
+/** Replaces OpenCode's auth-file view with an authoritative empty snapshot. */
+const OPENCODE_AUTH_CONTENT_ENV = 'OPENCODE_AUTH_CONTENT';
+
+/** Prevents OpenCode's built-in account/auth plugins from registering providers. */
+const OPENCODE_DISABLE_DEFAULT_PLUGINS_ENV = 'OPENCODE_DISABLE_DEFAULT_PLUGINS';
+
+/** Keeps models.dev from becoming a live catalog source for the embedded harness. */
+const OPENCODE_DISABLE_MODELS_FETCH_ENV = 'OPENCODE_DISABLE_MODELS_FETCH';
+
+/** The only provider id under which renderer BYOK rows enter OpenCode. */
+export const OPENCODE_BYOK_PROVIDER_ID = 'fumie-byok';
 
 /** How long a server gets to bind its port and answer the health probe. */
 const OPENCODE_START_TIMEOUT_MS = 60_000;
@@ -82,6 +102,10 @@ export interface IOpencodeServerService {
 	readonly _serviceBrand: undefined;
 	/** The running server for `cwd`, starting one if this is the first caller. */
 	acquire(cwd: string): Promise<IOpencodeServer>;
+	/** Releases one acquire. Retired generations stop after their last release. */
+	release(server: IOpencodeServer): void;
+	/** Whether this exact server generation was configured with the picker model. */
+	isModelAvailable(server: IOpencodeServer, modelId: string | undefined): boolean;
 	/** Stops every server this service started. */
 	close(): Promise<void>;
 }
@@ -89,49 +113,329 @@ export interface IOpencodeServerService {
 export class OpencodeServerService implements IOpencodeServerService {
 	declare readonly _serviceBrand: undefined;
 
-	private readonly _servers = new Map<string, Promise<OpencodeServer>>();
+	private readonly _workspaces = new Map<string, IOpencodeWorkspaceServers>();
+	private readonly _generations = new Map<IOpencodeServer, IOpencodeServerGeneration>();
+	private readonly _sequencer = new SequencerByKey<string>();
+	private readonly _pendingAcquires = new Set<Promise<IOpencodeServer>>();
+	private _closePromise: Promise<void> | undefined;
 
 	constructor(
 		@ILogService private readonly _logService: ILogService,
+		@INativeModelProviderProxyService private readonly _nativeModelProviderProxyService: INativeModelProviderProxyService,
+		@IByokLmBridgeRegistry private readonly _byokBridgeRegistry: IByokLmBridgeRegistry,
+		@IChatGptSubscriptionService private readonly _chatGptSubscription: IChatGptSubscriptionService,
+		private readonly _testHooks?: IOpencodeServerServiceTestHooks,
 	) { }
 
 	async acquire(cwd: string): Promise<IOpencodeServer> {
-		const existing = this._servers.get(cwd);
-		if (existing) {
-			try {
-				const server = await existing;
-				if (!server.closed) {
-					return server;
-				}
-			} catch {
-				// A failed start is not cached: the binary may have been installed
-				// since, and the next send is entitled to a fresh attempt.
-			}
-			this._servers.delete(cwd);
+		if (this._closePromise) {
+			throw new Error('OpenCode server service is closed.');
 		}
-		const starting = OpencodeServer.start(resolveOpencodeBinary(), cwd, this._logService);
-		this._servers.set(cwd, starting);
-		try {
-			return await starting;
-		} catch (error) {
-			if (this._servers.get(cwd) === starting) {
-				this._servers.delete(cwd);
+		const acquiring = this._sequencer.queue(cwd, async () => {
+			if (this._closePromise) {
+				throw new Error('OpenCode server service is closed.');
 			}
+			const snapshot = await this._snapshot();
+			const workspace = this._workspaces.get(cwd) ?? { generations: new Set<IOpencodeServerGeneration>() };
+			this._workspaces.set(cwd, workspace);
+			let generation = workspace.current;
+			if (!generation || generation.signature !== snapshot.signature || generation.server.closed) {
+				if (generation) {
+					generation.retired = true;
+					this._collect(generation);
+				}
+				workspace.current = undefined;
+				generation = await this._start(cwd, snapshot);
+				workspace.current = generation;
+				workspace.generations.add(generation);
+				this._generations.set(generation.server, generation);
+			}
+			generation.references++;
+			return generation.server;
+		});
+		this._pendingAcquires.add(acquiring);
+		try {
+			return await acquiring;
+		} finally {
+			this._pendingAcquires.delete(acquiring);
+		}
+	}
+
+	release(server: IOpencodeServer): void {
+		const generation = this._generations.get(server);
+		if (!generation || generation.references === 0) {
+			return;
+		}
+		generation.references--;
+		this._collect(generation);
+	}
+
+	isModelAvailable(server: IOpencodeServer, modelId: string | undefined): boolean {
+		const generation = this._generations.get(server);
+		return !!generation && (modelId ? generation.modelIds.has(modelId) : generation.modelIds.size > 0);
+	}
+
+	private async _start(cwd: string, snapshot: IOpencodeProviderSnapshot): Promise<IOpencodeServerGeneration> {
+		const modelIds = opencodeSnapshotModelIds(snapshot);
+		if (this._testHooks) {
+			return { cwd, signature: snapshot.signature, server: await this._testHooks.start(cwd, snapshot.signature), modelIds, references: 0, retired: false };
+		}
+		const proxy = await this._nativeModelProviderProxyService.start();
+		try {
+			const config = opencodeProviderConfig(proxy, snapshot);
+			const server = await OpencodeServer.start(resolveOpencodeBinary(), cwd, proxy, config, this._logService);
+			return { cwd, signature: snapshot.signature, server, modelIds, references: 0, retired: false };
+		} catch (error) {
+			proxy.dispose();
 			throw error;
 		}
 	}
 
-	async close(): Promise<void> {
-		const servers = [...this._servers.values()];
-		this._servers.clear();
-		for (const starting of servers) {
-			try {
-				(await starting).dispose();
-			} catch {
-				// A server that never started has nothing to stop.
+	private async _snapshot(): Promise<IOpencodeProviderSnapshot> {
+		const byok: IOpencodeByokModel[] = [];
+		for (const model of visibleByokLmModels(this._byokBridgeRegistry.getModels()).filter(model => model.supportedHarnesses?.includes('opencode'))) {
+			const modelIdentifier = model.modelIdentifier ?? getByokLmAgentModelId(model);
+			const provider = await this._byokBridgeRegistry.resolveProviderConfiguration?.(modelIdentifier);
+			if (!provider) {
+				throw new Error(`OpenCode cannot resolve the configured provider for '${modelIdentifier}'.`);
 			}
+			byok.push({ model, modelIdentifier, wire: opencodeWire(provider) });
+		}
+		const chatGpt = [...this._chatGptSubscription.getModels()];
+		const content = { byok, chatGpt };
+		return { ...content, signature: JSON.stringify(content) };
+	}
+
+	private _collect(generation: IOpencodeServerGeneration): void {
+		if (!generation.retired || generation.references > 0) {
+			return;
+		}
+		generation.server.dispose();
+		this._generations.delete(generation.server);
+		const workspace = this._workspaces.get(generation.cwd);
+		workspace?.generations.delete(generation);
+		if (workspace && !workspace.current && workspace.generations.size === 0) {
+			this._workspaces.delete(generation.cwd);
 		}
 	}
+
+	async close(): Promise<void> {
+		return this._closePromise ??= (async () => {
+			await Promise.allSettled([...this._pendingAcquires]);
+			const servers = [...this._generations.keys()];
+			this._workspaces.clear();
+			this._generations.clear();
+			for (const server of servers) {
+				server.dispose();
+			}
+		})();
+	}
+}
+
+interface IOpencodeWorkspaceServers {
+	current?: IOpencodeServerGeneration;
+	readonly generations: Set<IOpencodeServerGeneration>;
+}
+
+/** Narrow process seam for deterministic generation/shutdown tests. */
+export interface IOpencodeServerServiceTestHooks {
+	start(cwd: string, signature: string): Promise<IManagedOpencodeServer>;
+}
+
+type IManagedOpencodeServer = IOpencodeServer & { readonly closed: boolean };
+
+interface IOpencodeServerGeneration {
+	readonly cwd: string;
+	readonly signature: string;
+	readonly server: IManagedOpencodeServer;
+	readonly modelIds: ReadonlySet<string>;
+	references: number;
+	retired: boolean;
+}
+
+interface IOpencodeByokModel {
+	readonly model: IByokLmModelInfo;
+	readonly modelIdentifier: string;
+	readonly wire: NativeModelWireProtocol;
+}
+
+interface IOpencodeProviderSnapshot {
+	readonly signature: string;
+	readonly byok: readonly IOpencodeByokModel[];
+	readonly chatGpt: readonly IChatGptSubscriptionModel[];
+}
+
+function opencodeSnapshotModelIds(snapshot: Pick<IOpencodeProviderSnapshot, 'byok' | 'chatGpt'>): ReadonlySet<string> {
+	return new Set([
+		...snapshot.byok.map(model => `${OPENCODE_BYOK_PROVIDER_ID}/${model.modelIdentifier}`),
+		...snapshot.chatGpt.map(model => `${CHATGPT_SUBSCRIPTION_PROVIDER_NAME}/${model.id}`),
+	]);
+}
+
+interface IExpectedOpencodeProviders {
+	readonly providerIds: readonly string[];
+	readonly modelIds: Readonly<Record<string, readonly string[]>>;
+	readonly config: Record<string, unknown>;
+}
+
+/**
+ * opencode provider overlay for the ChatGPT subscription borrowed from Codex.
+ * Only the loopback nonce crosses into the subprocess; live ChatGPT credentials
+ * remain in the Agent Host and are resolved by the proxy for each request.
+ */
+export function opencodeProviderConfig(handle: INativeModelProviderProxyHandle, snapshot: Pick<IOpencodeProviderSnapshot, 'byok' | 'chatGpt'>): Record<string, unknown> {
+	const providers: Record<string, unknown> = {};
+	if (snapshot.byok.length > 0) {
+		providers[OPENCODE_BYOK_PROVIDER_ID] = {
+			name: 'Fumie Providers',
+			options: { apiKey: `${handle.nonce}.opencode` },
+			models: Object.fromEntries(snapshot.byok.map(({ model, modelIdentifier, wire }) => [modelIdentifier, opencodeByokModelConfig(handle, model, modelIdentifier, wire)])),
+		};
+	}
+	if (snapshot.chatGpt.length > 0) {
+		providers[CHATGPT_SUBSCRIPTION_PROVIDER_NAME] = {
+			npm: '@ai-sdk/openai',
+			name: 'ChatGPT',
+			options: {
+				baseURL: handle.providerBaseUrl('responses'),
+				apiKey: `${handle.nonce}.opencode`,
+			},
+			models: Object.fromEntries(snapshot.chatGpt.map(model => [model.id, {
+				// opencode keeps the map key as its provider-local selection id and
+				// sends `id` to the AI SDK as the wire model.
+				id: chatGptSubscriptionAgentModelId(model.id),
+				name: model.name,
+				options: { reasoningEffort: model.defaultReasoningEffort },
+				variants: Object.fromEntries(model.supportedReasoningEfforts.map(effort => [effort, { reasoningEffort: effort }])),
+				attachment: model.supportsVision,
+				reasoning: model.supportedReasoningEfforts.length > 0,
+				temperature: false,
+				tool_call: true,
+				limit: {
+					context: model.maxContextWindowTokens,
+					output: chatGptSubscriptionMaxOutputTokens(model),
+				},
+				modalities: {
+					input: model.supportsVision ? ['text', 'image'] : ['text'],
+					output: ['text'],
+				},
+			}])),
+		};
+	}
+	const providerIds = Object.keys(providers);
+	const firstProvider = providerIds[0];
+	const firstModels = firstProvider ? (providers[firstProvider] as { models: Record<string, unknown> }).models : {};
+	const firstModel = Object.keys(firstModels)[0];
+	const defaultModel = firstProvider && firstModel ? `${firstProvider}/${firstModel}` : undefined;
+	return {
+		disabled_providers: [],
+		enabled_providers: providerIds,
+		provider: providers,
+		...(defaultModel ? { model: defaultModel, small_model: defaultModel } : {}),
+	};
+}
+
+function opencodeByokModelConfig(handle: INativeModelProviderProxyHandle, model: IByokLmModelInfo, modelIdentifier: string, wire: NativeModelWireProtocol): Record<string, unknown> {
+	const context = model.maxContextWindowTokens ?? 128_000;
+	const output = Math.min(model.maxOutputTokens ?? 16_384, context);
+	const optionName = wire === 'messages' ? 'effort' : 'reasoningEffort';
+	const variants = Object.fromEntries((model.supportedReasoningEfforts ?? []).map(effort => [effort, { [optionName]: effort }]));
+	return {
+		id: modelIdentifier,
+		name: model.name ?? model.id,
+		provider: {
+			npm: wire === 'messages' ? '@ai-sdk/anthropic' : wire === 'responses' ? '@ai-sdk/openai' : '@ai-sdk/openai-compatible',
+			api: handle.providerBaseUrl(wire),
+		},
+		...(model.defaultReasoningEffort ? { options: { [optionName]: model.defaultReasoningEffort } } : {}),
+		...(Object.keys(variants).length ? { variants } : {}),
+		attachment: model.supportsVision ?? false,
+		reasoning: (model.supportedReasoningEfforts?.length ?? 0) > 0,
+		temperature: false,
+		tool_call: true,
+		limit: { context, output },
+		modalities: { input: model.supportsVision ? ['text', 'image'] : ['text'], output: ['text'] },
+	};
+}
+
+function opencodeWire(provider: IByokLmProviderConfiguration): NativeModelWireProtocol {
+	const models = Array.isArray(provider.configuration.models) ? provider.configuration.models : [];
+	const model = models.find(candidate => !!candidate && typeof candidate === 'object' && (candidate as { id?: unknown }).id === provider.modelId) as { apiType?: unknown; url?: unknown } | undefined;
+	const configured = typeof model?.apiType === 'string' ? model.apiType : typeof provider.configuration.apiType === 'string' ? provider.configuration.apiType : undefined;
+	const url = typeof model?.url === 'string' ? model.url : typeof provider.configuration.url === 'string' ? provider.configuration.url : '';
+	const wire = configured ?? (/\/messages(?:\?|$)/i.test(url) ? 'messages' : /\/responses(?:\?|$)/i.test(url) ? 'responses' : 'chat-completions');
+	if (wire !== 'responses' && wire !== 'messages' && wire !== 'chat-completions') {
+		throw new Error(`OpenCode does not support configured model wire '${wire}'.`);
+	}
+	return wire;
+}
+
+interface IOpencodePublicProvider {
+	readonly id: string;
+	readonly options?: Record<string, unknown>;
+	readonly models?: Readonly<Record<string, {
+		readonly api?: { readonly id?: string; readonly npm?: string; readonly url?: string };
+	}>>;
+}
+
+function expectedOpencodeProviders(config: Record<string, unknown>): IExpectedOpencodeProviders {
+	const provider = config['provider'] as Record<string, { models?: Record<string, unknown> }>;
+	const providerIds = config['enabled_providers'] as readonly string[];
+	return {
+		providerIds,
+		modelIds: Object.fromEntries(providerIds.map(id => [id, Object.keys(provider[id]?.models ?? {})])),
+		config,
+	};
+}
+
+function providerConfigMatches(actual: unknown, expected: unknown): boolean {
+	return structuralEquals(actual, expected);
+}
+
+function effectiveProviderMatches(provider: IOpencodePublicProvider, configured: unknown, modelIds: readonly string[]): boolean {
+	if (!isRecord(configured) || !structuralEquals(provider.options ?? {}, configured['options'] ?? {})) {
+		return false;
+	}
+	const configuredModels = isRecord(configured['models']) ? configured['models'] : {};
+	for (const modelId of modelIds) {
+		const model = provider.models?.[modelId];
+		const configuredModel = configuredModels[modelId];
+		if (!model || !isRecord(configuredModel)) {
+			return false;
+		}
+		const configuredRoute = isRecord(configuredModel['provider']) ? configuredModel['provider'] : {};
+		const expectedNpm = configuredRoute['npm'] ?? configured['npm'];
+		const expectedUrl = configuredRoute['api'] ?? configured['api'] ?? '';
+		if (model.api?.id !== configuredModel['id'] || model.api?.npm !== expectedNpm || model.api?.url !== expectedUrl) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function sameStrings(actual: unknown, expected: readonly string[]): boolean {
+	return Array.isArray(actual)
+		&& actual.every(value => typeof value === 'string')
+		&& [...actual].sort().join('\0') === [...expected].sort().join('\0');
+}
+
+function structuralEquals(left: unknown, right: unknown): boolean {
+	if (left === right) {
+		return true;
+	}
+	if (Array.isArray(left) || Array.isArray(right)) {
+		return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((value, index) => structuralEquals(value, right[index]));
+	}
+	if (!isRecord(left) || !isRecord(right)) {
+		return false;
+	}
+	const leftKeys = Object.keys(left).sort();
+	const rightKeys = Object.keys(right).sort();
+	return sameStrings(leftKeys, rightKeys) && leftKeys.every(key => structuralEquals(left[key], right[key]));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 class OpencodeServer extends Disposable implements IOpencodeServer {
@@ -143,18 +447,27 @@ class OpencodeServer extends Disposable implements IOpencodeServer {
 	 * a probe of some health route: it proves the very channel every turn depends
 	 * on is open, which a `200` on another path would not.
 	 */
-	static async start(binary: string, cwd: string, logService: ILogService): Promise<OpencodeServer> {
+	static async start(binary: string, cwd: string, providerProxy: INativeModelProviderProxyHandle, config: Record<string, unknown>, logService: ILogService): Promise<OpencodeServer> {
+		const dbPath = await prepareOpencodeBackingStore();
 		const port = await findFreePort();
 		const password = generateUuid();
-		const args = ['serve', '--hostname', '127.0.0.1', '--port', String(port)];
+		const args = ['serve', '--pure', '--hostname', '127.0.0.1', '--port', String(port)];
 		let child: OpencodeChildProcess;
 		try {
 			child = spawn(binary, args, {
 				cwd,
 				// Ambient provider configuration is never a configuration source for a
-				// harness Fumie launches; opencode signs in through its own
-				// `auth.json`, so nothing here is lost by scrubbing.
-				env: { ...withoutModelProviderEnvironment(process.env), [OPENCODE_SERVER_PASSWORD_ENV]: password },
+				// harness Fumie launches. Its providers and loopback credentials come
+				// exclusively from the config assembled above.
+				env: {
+					...withoutModelProviderEnvironment(process.env),
+					[OpencodeDbEnvVar]: dbPath,
+					[OPENCODE_SERVER_PASSWORD_ENV]: password,
+					[OPENCODE_CONFIG_CONTENT_ENV]: JSON.stringify(config),
+					[OPENCODE_AUTH_CONTENT_ENV]: '{}',
+					[OPENCODE_DISABLE_DEFAULT_PLUGINS_ENV]: '1',
+					[OPENCODE_DISABLE_MODELS_FETCH_ENV]: '1',
+				},
 				stdio: ['ignore', 'pipe', 'pipe'],
 				windowsHide: true,
 				// Node refuses to execute `.cmd` / `.bat` without a shell, and on
@@ -164,9 +477,10 @@ class OpencodeServer extends Disposable implements IOpencodeServer {
 		} catch (error) {
 			throw new Error(startFailureMessage(binary, error));
 		}
-		const server = new OpencodeServer(child, `http://127.0.0.1:${String(port)}`, password, cwd, logService);
+		const server = new OpencodeServer(child, `http://127.0.0.1:${String(port)}`, password, cwd, providerProxy, logService);
 		try {
 			await server._waitUntilConnected();
+			await server._validateProviderIsolation(expectedOpencodeProviders(config));
 			return server;
 		} catch (error) {
 			server.dispose();
@@ -191,6 +505,7 @@ class OpencodeServer extends Disposable implements IOpencodeServer {
 		private readonly _baseUrl: string,
 		password: string,
 		readonly cwd: string,
+		providerProxy: INativeModelProviderProxyHandle,
 		private readonly _logService: ILogService,
 	) {
 		super();
@@ -208,6 +523,7 @@ class OpencodeServer extends Disposable implements IOpencodeServer {
 				this._child.kill();
 			}
 		}));
+		this._register(providerProxy);
 	}
 
 	get baseUrl(): string {
@@ -234,6 +550,49 @@ class OpencodeServer extends Disposable implements IOpencodeServer {
 		}
 		if (this._exitReason) {
 			throw new Error(`opencode stopped before it was ready: ${this._exitReason}`);
+		}
+	}
+
+	/** Refuses a process whose later config layers changed Fumie's provider boundary. */
+	private async _validateProviderIsolation(expected: IExpectedOpencodeProviders): Promise<void> {
+		const config = await this.request<Record<string, unknown>>('GET', '/config');
+		const catalog = await this.request<{ providers?: readonly IOpencodePublicProvider[] }>('GET', '/config/providers');
+		const problems: string[] = [];
+		if (!sameStrings(config['enabled_providers'], expected.providerIds)) {
+			problems.push('enabled provider list');
+		}
+		if (!sameStrings(config['disabled_providers'], [])) {
+			problems.push('disabled provider list');
+		}
+		if (config['model'] !== expected.config['model'] || config['small_model'] !== expected.config['small_model']) {
+			problems.push('default model selection');
+		}
+		const configured = isRecord(config['provider']) ? config['provider'] : {};
+		for (const providerId of expected.providerIds) {
+			const wanted = (expected.config['provider'] as Record<string, unknown>)[providerId];
+			const actual = configured[providerId];
+			if (!providerConfigMatches(actual, wanted)) {
+				problems.push(`provider '${providerId}' configuration`);
+			}
+		}
+		const providers = catalog.providers ?? [];
+		if (!sameStrings(providers.map(provider => provider.id), expected.providerIds)) {
+			problems.push('effective provider catalog');
+		}
+		for (const providerId of expected.providerIds) {
+			const provider = providers.find(candidate => candidate.id === providerId);
+			const wantedModels = expected.modelIds[providerId] ?? [];
+			if (!provider || !sameStrings(Object.keys(provider.models ?? {}), wantedModels)) {
+				problems.push(`provider '${providerId}' model catalog`);
+				continue;
+			}
+			const configuredProvider = configured[providerId];
+			if (!effectiveProviderMatches(provider, configuredProvider, wantedModels)) {
+				problems.push(`provider '${providerId}' effective route`);
+			}
+		}
+		if (problems.length > 0) {
+			throw new Error(`OpenCode provider isolation validation failed: ${problems.join(', ')}.`);
 		}
 	}
 

@@ -198,6 +198,13 @@ export class NativeModelProviderProxyService extends LoopbackProxyServer<NativeM
 		for (const [parameter, value] of Object.entries(route.bodyParameters ?? {})) {
 			body[parameter] = value;
 		}
+		if (endpoint.providerKind === CHATGPT_SUBSCRIPTION_SOURCE) {
+			// Native Responses clients may carry their system prompt in `input`.
+			// Keep that prompt intact while supplying the subscription endpoint's
+			// required instructions field and non-persistent response mode.
+			body.instructions ??= '';
+			body.store = false;
+		}
 		const upstreamUrl = this._upstreamUrl(endpoint.url, inboundUrl);
 		const headers = this._upstreamHeaders(req.headers, endpoint, wire);
 		const entry: IProxyInFlight = { ac: new AbortController(), res, clientGone: false };

@@ -5,14 +5,56 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { CHATGPT_SUBSCRIPTION_MODELS, chatGptAccountIdFromAccessToken, chatGptSubscriptionAgentModelId, chatGptSubscriptionMaxOutputTokens, parseChatGptSubscriptionModelId } from '../../node/chatGptSubscription.js';
+import { CHATGPT_SUBSCRIPTION_MODELS, ChatGptSubscriptionService, chatGptAccountIdFromAccessToken, chatGptSubscriptionAgentModelId, chatGptSubscriptionMaxOutputTokens, parseChatGptSubscriptionModelId } from '../../node/chatGptSubscription.js';
+import { Emitter } from '../../../../base/common/event.js';
+import { ByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
+import type { IByokLmModelInfo, IManagedChatGptModelInfo } from '../../common/agentHostByokLm.js';
 
 function accessToken(claims: Record<string, unknown>): string {
 	return `header.${Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url')}.signature`;
 }
 
 suite('chatGptSubscription', () => {
-	ensureNoDisposablesAreLeakedInTestSuite();
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('requires a visible configured Provider model as well as a signed-in account', () => {
+		const registry = new ByokLmBridgeRegistry();
+		const byok = store.add(new Emitter<IByokLmModelInfo[]>());
+		const managed = store.add(new Emitter<IManagedChatGptModelInfo[]>());
+		const account = store.add(new Emitter<void>());
+		let signedIn = true;
+		const registration = store.add(registry.register('renderer', {
+			chat: async () => { throw new Error('Subscription models must not call the BYOK bridge'); },
+			onDidChangeModels: byok.event,
+			onDidChangeChatGptModels: managed.event,
+		}));
+		byok.fire([]);
+		const service = store.add(new ChatGptSubscriptionService(registry));
+		store.add(service.registerSource({
+			onDidChangeSignedIn: account.event,
+			isSignedIn: () => signedIn,
+			readCredentials: async () => { throw new Error('Catalog reads must not read credentials'); },
+		}));
+		let changes = 0;
+		store.add(service.onDidChangeSignedIn(() => changes++));
+		assert.deepStrictEqual(service.getModels(), []);
+		managed.fire([{ id: 'gpt-5.6-sol', name: 'Provider model', maxContextWindowTokens: 200000, supportedReasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high' }]);
+		assert.deepStrictEqual(service.getModels().map(model => [model.id, model.name, model.supportedReasoningEfforts, model.defaultReasoningEffort]), [['gpt-5.6-sol', 'Provider model', ['low', 'high'], 'high']]);
+		assert.strictEqual(service.getModels()[0].maxContextWindowTokens, 200000);
+		managed.fire([]); // Hiding every model or deleting the Provider revokes the catalog.
+		assert.deepStrictEqual(service.getModels(), []);
+		managed.fire([{ id: 'gpt-5.6-sol', name: 'Restored model' }]);
+		assert.strictEqual(service.getModels().length, 1);
+		signedIn = false;
+		account.fire();
+		assert.deepStrictEqual(service.getModels(), []);
+		signedIn = true;
+		account.fire();
+		assert.strictEqual(service.getModels().length, 1);
+		registration.dispose();
+		assert.deepStrictEqual(service.getModels(), []);
+		assert.ok(changes >= 6);
+	});
 
 	test('qualifies subscription model ids so they never collide with BYOK routing ids', () => {
 		assert.deepStrictEqual({

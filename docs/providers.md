@@ -11,6 +11,27 @@ when the native agent publishes its account-backed catalog. Existing provider
 names and settings are preserved. Removing either subscription provider keeps it
 removed across restarts; it can be added again through **Add Models**.
 
+All bundled agents are enabled by default. An explicit disabled setting is
+preserved. Native runtime setup and agent-owned account sign-in retain their
+existing flows where those account boundaries still apply.
+
+The account menu separates GitHub sign-in for remote control, ChatGPT sign-in
+for OpenAI models, and Claude sign-in for Claude. Claude has its own sign-out
+action. ChatGPT credentials remain owned and refreshed by Codex; Copilot, Kimi,
+DeepSeek, Pi, and OpenCode can also use that subscription through their native
+Responses support. These model rows follow the shared ChatGPT sign-in state.
+OpenCode only exposes models injected from Fumie's Provider catalog; its own
+auto-loaded provider catalog is not projected into Fumie's model picker. Its
+first managed launch copies the native OpenCode database into
+`$FUMIE_HOME/providers/opencode/opencode.db`, removes the native OpenCode account
+and active organization from that copy, and preserves existing transcripts and
+tool-integration state. The two databases then evolve independently. Hiding all
+compatible Provider models still allows old transcripts to be read, but new
+turns are rejected until a compatible model is visible again.
+Claude, including the Claude ACP adapter, keeps its native Claude account and
+model boundary. Each harness exposes only the reasoning options its SDK can
+send, and provider API keys remain a separate model source.
+
 Provider configuration belongs to the upstream language-model catalog and the
 user's settings and secret storage. A provider may be a local service, a
 custom endpoint, or an account-backed integration. Fumie should project that

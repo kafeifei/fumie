@@ -14,6 +14,7 @@ import { localize } from '../../../../../../nls.js';
 import { affectsAgentHostProviderPreference, IAgentHostService, protectedResourcesRequireGitHubCopilotSignIn, shouldSurfaceLocalAgentHostProvider, type AgentProvider } from '../../../../../../platform/agentHost/common/agentService.js';
 import { IAgentHostEnablementService } from '../../../../../../platform/agentHost/common/agentHostEnablementService.js';
 import { LOCAL_AGENT_HOST_AUTHORITY } from '../../../../../../platform/agentHost/common/agentHostUri.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID } from '../../../../../../platform/agentHost/common/agentModelSource.js';
 import { type ProtectedResourceMetadata } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
 import { type AgentInfo, type RootState } from '../../../../../../platform/agentHost/common/state/sessionState.js';
@@ -368,7 +369,11 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 		store.add(toDisposable(() => this._languageModelsService.deltaLanguageModelChatProviderDescriptors([], [vendorDescriptor])));
 		const presentationFactory = agentHostModelProviderPresentationRegistry.get(agent.provider);
 		const presentation = presentationFactory ? this._instantiationService.invokeFunction(presentationFactory) : undefined;
-		const modelProvider = store.add(new AgentHostLanguageModelProvider(sessionType, vendor, agent.capabilities?.modelCatalog, presentation));
+		const modelProvider = store.add(new AgentHostLanguageModelProvider(sessionType, vendor, agent.capabilities?.modelCatalog, presentation, {
+			namespace: LOCAL_AGENT_HOST_AUTHORITY,
+			sourceId: CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID,
+			owner: false,
+		}));
 		this._modelProviders.set(agent.provider, modelProvider);
 		store.add(toDisposable(() => this._modelProviders.delete(agent.provider)));
 		store.add(this._languageModelsService.registerLanguageModelProvider(vendor, modelProvider));

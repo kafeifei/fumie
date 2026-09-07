@@ -113,6 +113,7 @@ function chatGptSubscription(signedIn: boolean): IChatGptSubscriptionService {
 		_serviceBrand: undefined,
 		onDidChangeSignedIn: Event.None,
 		registerSource: () => Disposable.None,
+		getModels: () => [],
 		isSignedIn: () => signedIn,
 		readCredentials: () => Promise.resolve({ accessToken: 'token', accountId: 'acct-42', clientVersion: '0.147.0' }),
 	};

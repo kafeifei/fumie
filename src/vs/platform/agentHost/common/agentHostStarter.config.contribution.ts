@@ -281,7 +281,7 @@ configurationRegistry.registerConfiguration({
 		[AgentHostCodexAgentEnabledSettingId]: {
 			type: 'boolean',
 			description: nls.localize('chat.agentHost.codexAgent.enabled', "When enabled, the agent host registers the Codex provider (subject to the Codex SDK being reachable). Enabling takes effect without restarting the agent host; disabling takes effect after the agent host restarts."),
-			default: product.agentHostDefaultCodexHome ? true : false,
+			default: true,
 			tags: ['experimental', 'advanced'],
 			// Allow the default to be overridden by an experiment. Uses `startup`
 			// to match the sibling agent-host provider settings.
@@ -307,7 +307,7 @@ configurationRegistry.registerConfiguration({
 		[AgentHostKimiAgentEnabledSettingId]: {
 			type: 'boolean',
 			description: nls.localize('chat.agentHost.kimiAgent.enabled', "When enabled, the agent host registers the experimental Kimi provider when the Kimi SDK is available. Enabling takes effect without restarting the agent host; disabling takes effect after the agent host restarts."),
-			default: false,
+			default: true,
 			tags: ['experimental', 'advanced'],
 			included: false,
 			agentHost: { key: AgentHostKimiEnabledConfigKey },
@@ -315,7 +315,7 @@ configurationRegistry.registerConfiguration({
 		[AgentHostDeepSeekAgentEnabledSettingId]: {
 			type: 'boolean',
 			description: nls.localize('chat.agentHost.deepseekAgent.enabled', "When enabled, the agent host registers the experimental DeepSeek provider when the DeepSeek Harness SDK is reachable. Enabling takes effect without restarting the agent host; disabling takes effect after the agent host restarts."),
-			default: false,
+			default: true,
 			tags: ['experimental', 'advanced'],
 			included: false,
 			agentHost: { key: AgentHostDeepSeekEnabledConfigKey },
@@ -323,7 +323,7 @@ configurationRegistry.registerConfiguration({
 		[AgentHostPiAgentEnabledSettingId]: {
 			type: 'boolean',
 			description: nls.localize('chat.agentHost.piAgent.enabled', "When enabled, the agent host registers Pi when its coding-agent SDK is reachable. Pi is the minimal general-purpose Agent for models without an official Agent. Enabling takes effect without restarting the agent host; disabling takes effect after the agent host restarts."),
-			default: false,
+			default: true,
 			tags: ['experimental', 'advanced'],
 			included: false,
 			agentHost: { key: AgentHostPiEnabledConfigKey },
@@ -331,15 +331,15 @@ configurationRegistry.registerConfiguration({
 		[AgentHostAcpAgentEnabledSettingId]: {
 			type: 'boolean',
 			description: nls.localize('chat.agentHost.acpAgent.enabled', "When enabled, the agent host registers coding agents that speak the Agent Client Protocol (ACP). The agent's command-line tool must be installed separately and available on `PATH`. Enabling takes effect without restarting the agent host; disabling takes effect after the agent host restarts."),
-			default: false,
+			default: true,
 			tags: ['experimental', 'advanced'],
 			included: false,
 			agentHost: { key: AgentHostAcpEnabledConfigKey },
 		},
 		[AgentHostOpencodeAgentEnabledSettingId]: {
 			type: 'boolean',
-			description: nls.localize('chat.agentHost.opencodeAgent.enabled', "When enabled, the agent host registers the opencode provider. opencode must be installed separately and available on `PATH`; it runs with its own sign-in and its own model catalog. Enabling takes effect without restarting the agent host; disabling takes effect after the agent host restarts."),
-			default: false,
+			description: nls.localize('chat.agentHost.opencodeAgent.enabled', "When enabled, the agent host registers the opencode agent. opencode must be installed separately and available on `PATH`; its models and credentials are supplied by Fumie Providers. Enabling takes effect without restarting the agent host; disabling takes effect after the agent host restarts."),
+			default: true,
 			tags: ['experimental', 'advanced'],
 			included: false,
 			agentHost: { key: AgentHostOpencodeEnabledConfigKey },

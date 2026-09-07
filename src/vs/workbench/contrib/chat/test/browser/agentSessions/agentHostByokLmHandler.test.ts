@@ -13,6 +13,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 import { NullLogService } from '../../../../../../platform/log/common/log.js';
 import type { IByokLmChatRequest } from '../../../../../../platform/agentHost/common/agentHostByokLm.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID } from '../../../../../../platform/agentHost/common/agentModelSource.js';
 import { TestConfigurationService } from '../../../../../../platform/configuration/test/common/testConfigurationService.js';
 import { ContextKeyService } from '../../../../../../platform/contextkey/browser/contextKeyService.js';
 import { IContextKey, IContextKeyService } from '../../../../../../platform/contextkey/common/contextkey.js';
@@ -216,7 +217,7 @@ suite('AgentHostByokLmHandler', () => {
 			maxContextWindowTokens: 2000,
 			maxOutputTokens: 1000,
 			supportsVision: false,
-			supportedHarnesses: ['pi'],
+			supportedHarnesses: ['pi', 'opencode'],
 		}]);
 	});
 
@@ -236,11 +237,11 @@ suite('AgentHostByokLmHandler', () => {
 
 		assert.deepStrictEqual(models, [
 			{ vendor: 'acme', id: 'claude', name: 'acme claude', modelIdentifier: 'id-acme', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: true, supportedHarnesses: [] },
-			{ vendor: 'ollama', id: 'gemma4:31b-mlx', name: 'ollama gemma4:31b-mlx', modelIdentifier: 'ollama/Ollama/gemma4:31b-mlx', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: false, supportedHarnesses: ['pi'] },
+			{ vendor: 'ollama', id: 'gemma4:31b-mlx', name: 'ollama gemma4:31b-mlx', modelIdentifier: 'ollama/Ollama/gemma4:31b-mlx', maxContextWindowTokens: 2000, maxOutputTokens: 1000, supportsVision: false, supportedHarnesses: ['pi', 'opencode'] },
 		]);
 	});
 
-	test('listModels routes generic native models to Pi while preserving explicit Agent metadata', async () => {
+	test('listModels routes generic native models to Pi and OpenCode while preserving explicit Agent metadata', async () => {
 		const genericId = 'customendpoint/Generic/qwen3-coder';
 		const officialId = 'customendpoint/Generic/gpt-5';
 		const service = new TestLanguageModelsService(
@@ -267,9 +268,41 @@ suite('AgentHostByokLmHandler', () => {
 		const models = await createHandler(service).listModels(CancellationToken.None);
 
 		assert.deepStrictEqual(models.map(model => ({ id: model.id, harnesses: model.supportedHarnesses })), [
-			{ id: 'qwen3-coder', harnesses: ['pi'] },
+			{ id: 'qwen3-coder', harnesses: ['pi', 'opencode'] },
 			{ id: 'gpt-5', harnesses: ['codex'] },
 		]);
+	});
+
+	test('publishes only visible canonical subscription models and tracks Provider removal', async () => {
+		const id = 'subscription-provider:model';
+		const owner: ILanguageModelChatMetadata = {
+			...byokModel('subscription-provider', 'model'),
+			isBYOK: false,
+			sourceModel: { sourceId: CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID, modelId: 'gpt-example', visibilityNamespace: 'local', visibilityOwner: true },
+		};
+		const models = new Map<string, ILanguageModelChatMetadata>([
+			[id, owner],
+			['agent-copy:model', { ...owner, sourceModel: { ...owner.sourceModel!, visibilityOwner: false } }],
+			['byok:model', byokModel('customendpoint', 'gpt-example')],
+		]);
+		const hidden = new Set<string>();
+		const changes = store.add(new Emitter<void>());
+		const service = new TestLanguageModelsService(models, () => responseOf([]), changes.event, identifier => hidden.has(identifier));
+		const { contextKeyService } = createPolicyContext(false);
+		const handler = store.add(new AgentHostByokLmHandler(service, new NullLogService(), new TestChatEntitlementService(contextKeyService), contextKeyService));
+		let publishes = 0;
+		store.add(handler.onDidChangeModels(() => publishes++));
+		assert.deepStrictEqual((await handler.listChatGptModels(CancellationToken.None)).map(model => model.id), ['gpt-example']);
+		assert.deepStrictEqual(await handler.listModels(CancellationToken.None), []); // BYOK policy is independent.
+		hidden.add(id);
+		changes.fire();
+		assert.deepStrictEqual(await handler.listChatGptModels(CancellationToken.None), []);
+		hidden.clear();
+		changes.fire();
+		assert.strictEqual((await handler.listChatGptModels(CancellationToken.None)).length, 1);
+		models.delete(id);
+		assert.deepStrictEqual(await handler.listChatGptModels(CancellationToken.None), []);
+		assert.strictEqual(publishes, 2);
 	});
 
 	test('listModels carries the LM service identifier (the Manage Models visibility key)', async () => {

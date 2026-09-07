@@ -31,9 +31,11 @@ import { IAgentConfigurationService } from '../../node/agentConfigurationService
 import { AgentHostManagedSettingsService, IAgentHostManagedSettingsService } from '../../node/agentHostManagedSettingsService.js';
 import type { IAgentHostTerminalManager } from '../../node/agentHostTerminalManager.js';
 import { ByokLmBridgeRegistry, IByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
+import { CHATGPT_SUBSCRIPTION_MODELS, CHATGPT_SUBSCRIPTION_PROVIDER_NAME, chatGptSubscriptionAgentModelId } from '../../node/chatGptSubscription.js';
 import { ByokLmProxyService, IByokLmProxyService, type IByokLmProxyHandle } from '../../node/copilot/byokLmProxyService.js';
 import { resolveCopilotMcpServerInfo, type ICopilotPluginInfo } from '../../node/copilot/copilotAgent.js';
-import { CopilotSessionLauncher, filterClientToolNames, getCopilotReasoningEffort, isCopilotReasoningEffort, resolveByokSessionConfig, normalizeToolFilterPatterns, resolveConfiguredReasoningEffortOverride, resolveCopilotReasoningEffort, toSdkToolFilterPatterns, type CopilotSessionLaunchPlan, type ICopilotSessionRuntime } from '../../node/copilot/copilotSessionLauncher.js';
+import { CopilotSessionLauncher, filterClientToolNames, getCopilotReasoningEffort, isCopilotReasoningEffort, resolveByokSessionConfig, resolveChatGptSubscriptionSessionConfig, normalizeToolFilterPatterns, resolveConfiguredReasoningEffortOverride, resolveCopilotReasoningEffort, toSdkToolFilterPatterns, type CopilotSessionLaunchPlan, type ICopilotSessionRuntime } from '../../node/copilot/copilotSessionLauncher.js';
+import { INativeModelProviderProxyService, NullNativeModelProviderProxyService, type INativeModelProviderProxyHandle } from '../../node/nativeModelProviderProxyService.js';
 import { buildDefaultChatUri } from '../../common/state/sessionState.js';
 
 const testRuntime: ICopilotSessionRuntime = {
@@ -77,6 +79,7 @@ function createTestLauncher(managedSettingsPermissions?: IAgentHostManagedSettin
 		{} as IFileService,
 		{ _serviceBrand: undefined, start: async () => { throw new Error('Unexpected proxy start'); }, dispose: () => { } },
 		new ByokLmBridgeRegistry(),
+		new NullNativeModelProviderProxyService(),
 		{
 			_serviceBrand: undefined,
 			getSessionTraceContext: () => undefined,
@@ -288,6 +291,63 @@ suite('resolveByokSessionConfig', () => {
 	});
 });
 
+suite('resolveChatGptSubscriptionSessionConfig', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	function proxy() {
+		let starts = 0;
+		const handle: INativeModelProviderProxyHandle = {
+			baseUrl: 'http://127.0.0.1:9876',
+			nonce: 'NATIVE-NONCE',
+			providerBaseUrl: wire => `http://127.0.0.1:9876/${wire}`,
+			dispose: () => { },
+		};
+		return {
+			get starts() { return starts; },
+			start: async () => { starts++; return handle; },
+		};
+	}
+
+	test('pre-registers the route before sign-in so a live session can switch later', async () => {
+		const nativeProxy = proxy();
+		const config = await resolveChatGptSubscriptionSessionConfig('session-42', nativeProxy.start, new NullLogService());
+		assert.strictEqual(config.models?.length, CHATGPT_SUBSCRIPTION_MODELS.length);
+		assert.strictEqual(nativeProxy.starts, 1);
+	});
+
+	test('publishes additive Responses models with proxy-valid session auth', async () => {
+		const nativeProxy = proxy();
+		const config = await resolveChatGptSubscriptionSessionConfig('session-42', nativeProxy.start, new NullLogService());
+
+		assert.strictEqual(nativeProxy.starts, 1);
+		assert.deepStrictEqual(config.providers, [{
+			name: CHATGPT_SUBSCRIPTION_PROVIDER_NAME,
+			type: 'openai',
+			wireApi: 'responses',
+			baseUrl: 'http://127.0.0.1:9876/responses',
+			bearerToken: 'NATIVE-NONCE.session-42',
+		}]);
+		assert.strictEqual(config.models?.length, CHATGPT_SUBSCRIPTION_MODELS.length);
+		assert.deepStrictEqual(config.models?.find(model => model.id === 'gpt-5.6-luna'), {
+			id: 'gpt-5.6-luna',
+			provider: CHATGPT_SUBSCRIPTION_PROVIDER_NAME,
+			wireModel: chatGptSubscriptionAgentModelId('gpt-5.6-luna'),
+			modelId: 'gpt-5.6-luna',
+			name: 'GPT-5.6-Luna',
+			maxPromptTokens: 272_000,
+			maxOutputTokens: 128_000,
+		});
+	});
+
+	test('leaves ordinary Copilot sessions usable when the optional proxy cannot bind', async () => {
+		const config = await resolveChatGptSubscriptionSessionConfig('session-42', async () => {
+			throw new Error('bind failed');
+		}, new NullLogService());
+		assert.deepStrictEqual(config, {});
+	});
+});
+
 /**
  * Covers the launcher's lazy memoization and disposal of the shared BYOK proxy
  * handle: concurrent launches share one bind, and
@@ -338,6 +398,7 @@ suite('CopilotSessionLauncher BYOK proxy lifecycle', () => {
 		services.set(IProductService, { _serviceBrand: undefined } as IProductService);
 		services.set(IByokLmProxyService, proxy);
 		services.set(IByokLmBridgeRegistry, registry);
+		services.set(INativeModelProviderProxyService, new NullNativeModelProviderProxyService());
 		services.set(IAgentConfigurationService, {
 			_serviceBrand: undefined,
 			getRootValue: (_schema: unknown, key: string) => key === AgentHostByokModelsEnabledConfigKey ? byokModelsEnabled : undefined,
@@ -1101,6 +1162,7 @@ suite('CopilotSessionLauncher resume config', () => {
 		services.set(ILogService, new NullLogService());
 		services.set(IProductService, { _serviceBrand: undefined } as IProductService);
 		services.set(IByokLmBridgeRegistry, new ByokLmBridgeRegistry());
+		services.set(INativeModelProviderProxyService, new NullNativeModelProviderProxyService());
 		services.set(IAgentHostManagedSettingsService, store.add(new AgentHostManagedSettingsService()));
 		services.set(IAgentConfigurationService, {
 			_serviceBrand: undefined,
@@ -1118,7 +1180,7 @@ suite('CopilotSessionLauncher resume config', () => {
 		model: ModelSelection | undefined,
 		snapshot: CopilotSessionLaunchPlan['snapshot'] = { tools: [], plugins: [], mcpServers: {} },
 		createClientSdkTools: ICopilotSessionRuntime['createClientSdkTools'] = () => [],
-	): Promise<{ model?: string; reasoningEffort?: string; contextTier?: string; availableTools?: string[]; excludedTools?: string[]; modelCapabilities?: Record<string, unknown>; toolSearch?: { enabled: boolean } }> {
+	): Promise<{ model?: string; reasoningEffort?: string; contextTier?: string; streaming?: boolean; availableTools?: string[]; excludedTools?: string[]; modelCapabilities?: Record<string, unknown>; toolSearch?: { enabled: boolean } }> {
 		const plan = {
 			kind: 'resume',
 			client: { createSession: async () => { throw new Error('unused'); }, resumeSession: async () => { throw new Error('unused'); } },
@@ -1132,7 +1194,7 @@ suite('CopilotSessionLauncher resume config', () => {
 			fallback: { model },
 		};
 		const runtime = { createClientSdkTools, createServerSdkTools: () => [] };
-		return (launcher as unknown as { _buildSessionConfig(plan: unknown, runtime: unknown): Promise<{ model?: string; reasoningEffort?: string; contextTier?: string; availableTools?: string[]; excludedTools?: string[]; modelCapabilities?: Record<string, unknown>; toolSearch?: { enabled: boolean } }> })._buildSessionConfig(plan, runtime);
+		return (launcher as unknown as { _buildSessionConfig(plan: unknown, runtime: unknown): Promise<{ model?: string; reasoningEffort?: string; contextTier?: string; streaming?: boolean; availableTools?: string[]; excludedTools?: string[]; modelCapabilities?: Record<string, unknown>; toolSearch?: { enabled: boolean } }> })._buildSessionConfig(plan, runtime);
 	}
 
 	test('exposes only the client semantic-search override', async () => {
@@ -1150,6 +1212,7 @@ suite('CopilotSessionLauncher resume config', () => {
 			[disabled.excludedTools, enabled.excludedTools, filtered.excludedTools],
 			[[`builtin:${SEMANTIC_SEARCH_TOOL_NAME}`], undefined, [`custom:${SEMANTIC_SEARCH_TOOL_NAME}`, `builtin:${SEMANTIC_SEARCH_TOOL_NAME}`]],
 		);
+		assert.strictEqual(disabled.streaming, true, 'resume keeps Responses requests on the streaming wire');
 		store.dispose();
 	});
 

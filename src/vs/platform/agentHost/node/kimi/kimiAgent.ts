@@ -26,7 +26,9 @@ import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, 
 import { ensureWorkspacelessScratchDir } from '../workspacelessScratchDir.js';
 import { getByokLmAgentModelId } from '../../common/agentHostByokLm.js';
 import { createAgentModelByokMeta } from '../../common/agentModelByokMeta.js';
+import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID, createAgentModelSourceMeta } from '../../common/agentModelSource.js';
 import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
+import { CHATGPT_SUBSCRIPTION_MODELS, IChatGptSubscriptionService, chatGptSubscriptionAgentModelId, chatGptSubscriptionMaxOutputTokens, parseChatGptSubscriptionModelId, type IChatGptSubscriptionModel, type IChatGptSubscriptionServiceTier } from '../chatGptSubscription.js';
 import { IKimiApprovalRequest, IKimiCodeSdkService, IKimiEvent, IKimiPromptPart, IKimiQuestionRequest, IKimiSession, IKimiSessionSummary, KimiQuestionResult } from './kimiCodeSdkService.js';
 import { replayKimiSessionToTurns } from './kimiReplayMapper.js';
 import { buildKimiToolMeta, getKimiApprovalTarget, getKimiApprovalToolInput, getKimiConfirmationTitle, getKimiInvocationMessage, getKimiPastTenseMessage, getKimiToolDisplayName } from './kimiToolDisplay.js';
@@ -34,6 +36,8 @@ import { buildKimiToolMeta, getKimiApprovalTarget, getKimiApprovalToolInput, get
 const LegacyKimiPermissionModeConfigKey = 'permissionMode';
 const KimiPlanModeConfigKey = 'planMode';
 const KimiThinkingEffortConfigKey = 'thinkingLevel';
+const KimiServiceTierConfigKey = 'serviceTier';
+const KimiStandardServiceTier = 'standard';
 
 const kimiSessionConfigSchema = createSchema({
 	[SessionConfigKey.AutoApprove]: platformSessionSchema.definition[SessionConfigKey.AutoApprove],
@@ -118,25 +122,27 @@ export class KimiAgent extends Disposable implements IAgent {
 		@INativeEnvironmentService private readonly _environmentService: INativeEnvironmentService,
 		@ILogService private readonly _logService: ILogService,
 		@IByokLmBridgeRegistry private readonly _byokBridgeRegistry: IByokLmBridgeRegistry,
+		@IChatGptSubscriptionService private readonly _chatGptSubscription: IChatGptSubscriptionService,
 	) {
 		super();
-		// The picker's rows are the Kimi-family slice of the renderer BYOK
-		// catalog; this agent holds no catalog of its own. Empty until a renderer
-		// bridge pushes models.
+		// Keep renderer-owned BYOK rows and the host-owned ChatGPT subscription
+		// rows synchronized with their respective sources.
 		this._register(this._byokBridgeRegistry.onDidChangeModels(() => this._refreshModels()));
+		this._register(this._chatGptSubscription.onDidChangeSignedIn(() => this._refreshModels()));
 		this._refreshModels();
 	}
 
 	/**
-	 * Publish the provider-compatible slice of the renderer BYOK catalog.
-	 * Nothing here renames, re-stamps or dedupes provider rows.
+	 * Publish the provider-compatible slice of the renderer BYOK catalog plus
+	 * the subscription catalog while its credential owner is signed in.
+	 * Nothing here renames, re-stamps or dedupes BYOK provider rows.
 	 */
 	private _refreshModels(): void {
-		this._models.set(this._byokBridgeRegistry.getModels()
+		const byokModels = this._byokBridgeRegistry.getModels()
 			.filter(model => !model.supportedHarnesses || model.supportedHarnesses.includes(this.id))
 			.map((m): IAgentModelInfo => {
 				const byokMeta = createAgentModelByokMeta(m.modelIdentifier, m.hidden);
-				const configSchema = createKimiThinkingEffortSchema(m.supportedReasoningEfforts, m.defaultReasoningEffort, m.id);
+				const configSchema = createKimiModelConfigSchema(m.supportedReasoningEfforts, m.defaultReasoningEffort, m.id);
 				return {
 					provider: this.id,
 					id: getByokLmAgentModelId(m),
@@ -150,7 +156,28 @@ export class KimiAgent extends Disposable implements IAgent {
 					...(configSchema ? { configSchema } : {}),
 					...(byokMeta && { _meta: byokMeta }),
 				};
-			}), undefined);
+			});
+		this._models.set([...byokModels, ...this._chatGptSubscriptionModels()], undefined);
+	}
+
+	private _chatGptSubscriptionModels(): IAgentModelInfo[] {
+		if (!this._chatGptSubscription.isSignedIn()) {
+			return [];
+		}
+		return CHATGPT_SUBSCRIPTION_MODELS.map((model): IAgentModelInfo => {
+			const configSchema = createKimiModelConfigSchema(model.supportedReasoningEfforts, model.defaultReasoningEffort, model.id, model.serviceTiers);
+			return {
+				provider: this.id,
+				id: chatGptSubscriptionAgentModelId(model.id),
+				underlyingModelId: model.id,
+				name: model.name,
+				maxContextWindow: model.maxContextWindowTokens,
+				maxOutputTokens: chatGptSubscriptionMaxOutputTokens(model),
+				supportsVision: model.supportsVision,
+				_meta: createAgentModelSourceMeta(CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID),
+				...(configSchema ? { configSchema } : {}),
+			};
+		});
 	}
 
 	readonly chats: IAgentChats = {
@@ -460,13 +487,13 @@ export class KimiAgent extends Disposable implements IAgent {
 				id,
 				additionalDirs: entry.workingDirectories.slice(1).map(directory => directory.fsPath),
 				includeSubagents: true,
-				model: entry.model?.id,
+				model: kimiRuntimeModelId(entry.model),
 			});
 			if (entry.workingDirectories.length === 0) {
 				entry.workingDirectories = [URI.file(sdkSession.workDir)];
 			}
 			if (entry.model) {
-				await sdkSession.setModel(entry.model.id);
+				await sdkSession.setModel(kimiRuntimeModelId(entry.model)!);
 				const thinking = modelThinkingEffort(entry.model);
 				if (thinking) {
 					await sdkSession.setThinking(thinking);
@@ -483,7 +510,7 @@ export class KimiAgent extends Disposable implements IAgent {
 			sdkSession = await harness.createSession({
 				id,
 				workDir: primary.fsPath,
-				model: entry.model?.id,
+				model: kimiRuntimeModelId(entry.model),
 				thinking: modelThinkingEffort(entry.model),
 				permission: 'manual',
 				planMode: entry.planMode,
@@ -524,7 +551,8 @@ export class KimiAgent extends Disposable implements IAgent {
 			return undefined;
 		}
 		const entry = this._sessions.get(AgentSession.id(session));
-		const modelId = request.modelId ?? entry?.model?.id;
+		const selection = entry?.model?.id === request.modelId || request.modelId === undefined ? entry?.model : { id: request.modelId };
+		const modelId = kimiRuntimeModelId(selection);
 		const harness = await this._sdkService.getHarness();
 		// Passing no id makes the harness mint its own, so this can never adopt
 		// or disturb the session Fumie is naming.
@@ -812,7 +840,7 @@ export class KimiAgent extends Disposable implements IAgent {
 	private async _changeModel(chat: URI, model: ModelSelection): Promise<void> {
 		const entry = this._entryForChat(chat);
 		entry.model = model;
-		await entry.sdkSession?.setModel(model.id);
+		await entry.sdkSession?.setModel(kimiRuntimeModelId(model)!);
 		const thinking = modelThinkingEffort(model);
 		if (thinking) {
 			await entry.sdkSession?.setThinking(thinking);
@@ -973,24 +1001,49 @@ function modelThinkingEffort(model: ModelSelection | undefined): string | undefi
 	return optionalString(model?.config?.[KimiThinkingEffortConfigKey]);
 }
 
-function createKimiThinkingEffortSchema(supportedEfforts: readonly string[] | undefined, declaredDefault: string | undefined, modelId: string): ConfigSchema | undefined {
-	if (!supportedEfforts?.length) {
+function createKimiModelConfigSchema(supportedEfforts: readonly string[] | undefined, declaredDefault: string | undefined, modelId: string, serviceTiers?: readonly IChatGptSubscriptionServiceTier[]): ConfigSchema | undefined {
+	const properties: ConfigSchema['properties'] = {};
+	if (supportedEfforts?.length) {
+		properties[KimiThinkingEffortConfigKey] = {
+			type: 'string',
+			title: localize('kimi.modelThinkingLevel.title', "Thinking Level"),
+			description: localize('kimi.modelThinkingLevel.description', "Controls how much reasoning effort Kimi uses."),
+			default: resolveDefaultReasoningEffort(supportedEfforts, declaredDefault, modelId),
+			enum: [...supportedEfforts],
+			enumLabels: supportedEfforts.map(getReasoningEffortLabel),
+			enumDescriptions: supportedEfforts.map(effort => getReasoningEffortDescription(effort) ?? ''),
+		};
+	}
+	const additionalTiers = (serviceTiers ?? []).filter(tier => tier.id !== KimiStandardServiceTier);
+	if (additionalTiers.length > 0) {
+		properties[KimiServiceTierConfigKey] = {
+			type: 'string',
+			title: localize('kimi.modelServiceTier.title', "Speed"),
+			description: localize('kimi.modelServiceTier.description', "Controls Kimi response speed and usage."),
+			default: KimiStandardServiceTier,
+			enum: [KimiStandardServiceTier, ...additionalTiers.map(tier => tier.id)],
+			enumLabels: [localize('kimi.modelServiceTier.standard', "Standard"), ...additionalTiers.map(tier => tier.name)],
+			enumDescriptions: [localize('kimi.modelServiceTier.standardDescription', "Standard speed and usage."), ...additionalTiers.map(tier => tier.description)],
+		};
+	}
+	return Object.keys(properties).length > 0 ? { type: 'object', properties } : undefined;
+}
+
+function kimiRuntimeModelId(selection: ModelSelection | undefined): string | undefined {
+	if (!selection) {
 		return undefined;
 	}
-	return {
-		type: 'object',
-		properties: {
-			[KimiThinkingEffortConfigKey]: {
-				type: 'string',
-				title: localize('kimi.modelThinkingLevel.title', "Thinking Level"),
-				description: localize('kimi.modelThinkingLevel.description', "Controls how much reasoning effort Kimi uses."),
-				default: resolveDefaultReasoningEffort(supportedEfforts, declaredDefault, modelId),
-				enum: [...supportedEfforts],
-				enumLabels: supportedEfforts.map(getReasoningEffortLabel),
-				enumDescriptions: supportedEfforts.map(effort => getReasoningEffortDescription(effort) ?? ''),
-			},
-		},
-	};
+	const subscription = parseChatGptSubscriptionModelId(selection.id);
+	if (!subscription) {
+		return selection.id;
+	}
+	const model = CHATGPT_SUBSCRIPTION_MODELS.find(candidate => candidate.id === subscription.modelId);
+	return model ? chatGptSubscriptionAgentModelId(model.id, kimiServiceTier(selection, model)) : selection.id;
+}
+
+function kimiServiceTier(selection: ModelSelection, model: IChatGptSubscriptionModel): string | undefined {
+	const selected = selection.config?.[KimiServiceTierConfigKey];
+	return typeof selected === 'string' && model.serviceTiers?.some(tier => tier.id === selected) ? selected : undefined;
 }
 
 /**

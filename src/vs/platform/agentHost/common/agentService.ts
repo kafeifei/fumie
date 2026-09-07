@@ -176,9 +176,9 @@ export const AgentHostClaudeAgentEnabledSettingId = 'chat.agentHost.claudeAgent.
 
 /**
  * Configuration key controlling whether the Codex provider is registered in
- * the agent host process. When `false` (the default), the agent host skips
- * registering the Codex provider regardless of SDK availability. The agent
- * host process must be restarted for changes to take effect.
+ * the agent host process. When `false`, the agent host skips registering the
+ * Codex provider regardless of SDK availability. The agent host process must
+ * be restarted for changes to take effect.
  */
 export const AgentHostCodexAgentEnabledSettingId = 'chat.agentHost.codexAgent.enabled';
 

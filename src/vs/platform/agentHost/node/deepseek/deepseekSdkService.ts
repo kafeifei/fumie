@@ -16,6 +16,7 @@ import { AgentHostFumieHomeEnvVar } from '../../common/agentHostProductEnv.js';
 import { composeSessionHostContext } from '../../common/sessionHostContext.js';
 import { IAgentSdkDownloader, type IAgentSdkPackage } from '../agentSdkDownloader.js';
 import { INativeModelProviderProxyService, type INativeModelProviderProxyHandle } from '../nativeModelProviderProxyService.js';
+import { DeepSeekChatGptCredentialRef, deepSeekSubscriptionProviderConfig } from './deepseekSubscription.js';
 
 /**
  * DeepSeek Harness distribution descriptor. Lives in this file because it
@@ -33,7 +34,7 @@ export const DeepSeekSdkPackage: IAgentSdkPackage = {
 
 /**
  * The Cordis provider id the booted tree exposes DeepSeek models under. Every
- * model this harness serves is reached through it; the model string itself is
+ * BYOK model this harness serves is reached through it; the model string itself is
  * the provider-local id from the renderer BYOK catalog and travels to the BYOK
  * loopback proxy verbatim.
  */
@@ -134,6 +135,8 @@ export interface IDeepSeekContext {
 export interface IDeepSeekHarness {
 	readonly ctx: IDeepSeekContext;
 	createUserMessage(text: string): unknown;
+	/** Bind model and effort through the SDK's scoped request selection hook. */
+	createModelSelectionSetup(selection: { provider: string; model: string; reasoningEffort?: string }): (agentContext: unknown) => void;
 }
 
 export const IDeepSeekSdkService = createDecorator<IDeepSeekSdkService>('deepSeekSdkService');
@@ -243,6 +246,7 @@ export class DeepSeekSdkService implements IDeepSeekSdkService {
 		this._harness = undefined;
 		this._harnessPromise = undefined;
 		await harness?.ctx.get('credentials')?.unset(DeepSeekApiKeyEnvVar).catch(() => { });
+		await harness?.ctx.get('credentials')?.unset(DeepSeekChatGptCredentialRef).catch(() => { });
 		await harness?.ctx.fiber?.dispose();
 		// Ordering: the composition ran in this process and is now torn down, so
 		// releasing the bind can no longer strand a live client.
@@ -265,6 +269,9 @@ export class DeepSeekSdkService implements IDeepSeekSdkService {
 
 		const bootModule = await import(bootUrl) as IDeepSeekBootBindings;
 		const messageModule = await import(messageUrl) as IDeepSeekMessageBindings;
+		const agentModule = await import(pathToFileURL(join(root, 'node_modules', '@deepseek-ai', 'dsh-agent', 'lib', 'index.js')).href) as {
+			installModelSelection(context: unknown, selection: { current: { provider: string; model: string; reasoningEffort?: string }; assembled: undefined }): unknown;
+		};
 
 		const dshBasePatch = join(root, 'node_modules', '@deepseek-ai', 'dsh-base', 'cordis.patch.yml');
 		const basePatches = bootModule.loadOptionalPatches('fumie-deepseek', dshBasePatch) ?? [];
@@ -279,6 +286,7 @@ export class DeepSeekSdkService implements IDeepSeekSdkService {
 			{ id: 'settings', disabled: true },
 			{ id: 'system-prompt', config: { persona: buildDeepSeekPersona(composeSessionHostContext(this._productService)) } },
 			{ id: 'llm-deepseek', config: { apiKeyEnv: DeepSeekApiKeyEnvVar, baseURL: handle.providerBaseUrl('chat-completions') } },
+			{ id: 'llm-pi-ai', config: deepSeekSubscriptionProviderConfig(handle.providerBaseUrl('responses')) },
 		];
 		const configPath = join(this._home, 'cordis.yml');
 		writeFileSync(configPath, '[]\n');
@@ -299,9 +307,13 @@ export class DeepSeekSdkService implements IDeepSeekSdkService {
 		// be session-scoped. Store it through the harness credential seam; model
 		// configuration and tool subprocesses never see a provider environment var.
 		await credentials.set(DeepSeekApiKeyEnvVar, `${handle.nonce}.deepseek`);
+		await credentials.set(DeepSeekChatGptCredentialRef, `${handle.nonce}.deepseek`);
 
 		return {
 			ctx,
+			createModelSelectionSetup: selection => agentContext => {
+				agentModule.installModelSelection(agentContext, { current: selection, assembled: undefined });
+			},
 			createUserMessage: (text: string) => messageModule.createUserMessage({
 				content: [{ type: 'text', text }],
 				source: { kind: 'user' },
