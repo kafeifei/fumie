@@ -48,13 +48,19 @@ for (const sdk of ['claude', 'codex', 'deepseek', 'kimi', 'pi']) {
 	if (!names.length || names.some(name => !fs.existsSync(path.join(source, 'node_modules', name)))) {
 		throw new Error(`Incomplete SDK: ${sdk}`);
 	}
-	run('ditto', [source, path.join(resources, 'build/agent-sdk/agents', sdk)]);
+	run('ditto', ['--clone', source, path.join(resources, 'build/agent-sdk/agents', sdk)]);
 }
 // Remove source maps, and reject links that escape the standalone application.
 function inspect(directory) {
 	for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
 		const file = path.join(directory, item.name);
 		if (item.isSymbolicLink()) {
+			// Some SDK tarballs declare optional CLI aliases whose targets are
+			// not shipped. They are not runtime entry points; omit those aliases.
+			if (!fs.existsSync(file) && path.basename(directory) === '.bin') {
+				fs.unlinkSync(file);
+				continue;
+			}
 			const target = fs.realpathSync(file);
 			if (!target.startsWith(app + path.sep)) { throw new Error(`External symlink: ${path.relative(app, file)}`); }
 		} else if (item.isDirectory()) { inspect(file); }
