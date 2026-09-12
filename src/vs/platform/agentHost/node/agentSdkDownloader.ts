@@ -282,10 +282,24 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 	}
 
 	isAvailable(pkg: IAgentSdkPackage): boolean {
-		if (process.env[pkg.devOverrideEnvVar]) {
+		if (process.env[pkg.devOverrideEnvVar] || this._bundledSdkRoot(pkg)) {
 			return true;
 		}
 		return !!this._productService.agentSdks?.[pkg.id] && resolveSdkTarget(pkg) !== undefined;
+	}
+
+	private _bundledSdkRoot(pkg: IAgentSdkPackage): string | undefined {
+		if (!this._environmentService.isBuilt || !this._environmentService.appRoot) {
+			return undefined;
+		}
+		const root = path.join(this._environmentService.appRoot, 'build', 'agent-sdk', 'agents', pkg.id);
+		try {
+			const descriptor = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> };
+			const dependencies = Object.keys(descriptor.dependencies ?? {});
+			return dependencies.length > 0 && dependencies.every(name => fs.existsSync(path.join(root, 'node_modules', name, 'package.json'))) ? root : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	acquireDownloadProgressInterest(pkg: IAgentSdkPackage): IDisposable {
@@ -301,7 +315,7 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 	}
 
 	async isSdkResolvableWithoutDownload(pkg: IAgentSdkPackage): Promise<boolean> {
-		if (process.env[pkg.devOverrideEnvVar]) {
+		if (process.env[pkg.devOverrideEnvVar] || this._bundledSdkRoot(pkg)) {
 			return true;
 		}
 		const config = this._productService.agentSdks?.[pkg.id];
@@ -322,6 +336,12 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 		if (override) {
 			this._logService.info(`[AgentSdkDownloader] ${pkg.id}: using dev override at ${override}`);
 			return override;
+		}
+
+		const bundled = this._bundledSdkRoot(pkg);
+		if (bundled) {
+			this._logService.info(`[AgentSdkDownloader] ${pkg.id}: using bundled SDK at ${bundled}`);
+			return bundled;
 		}
 
 		// 2. Negative cache: a recent failure short-circuits without I/O. Not for a

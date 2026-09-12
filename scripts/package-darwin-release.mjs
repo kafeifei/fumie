@@ -22,6 +22,12 @@ if (fs.existsSync(app)) { throw new Error('Release staging directory already exi
 fs.mkdirSync(destination, { recursive: true });
 run('ditto', ['--clone', path.resolve(root, '..', `VSCode-darwin-${arch}`, 'Fumie.app'), app]);
 const resources = path.join(app, 'Contents/Resources/app');
+for (const dependency of ['source-map-support', 'source-map', 'buffer-from', 'dotenv']) {
+	run('ditto', ['--clone', path.join(root, 'extensions/copilot/node_modules', dependency), path.join(resources, 'extensions/copilot/node_modules', dependency)]);
+}
+if (!fs.existsSync(path.join(resources, 'node_modules.asar.unpacked/native-keymap/build/Release/keymapping.node'))) {
+	throw new Error('Missing native-keymap binary. Run npm rebuild native-keymap before packaging.');
+}
 const productPath = path.join(resources, 'product.json');
 const product = JSON.parse(fs.readFileSync(productPath, 'utf8'));
 if (product.commit !== commit) { throw new Error('Rebuild the application from the current commit before staging.'); }
@@ -74,6 +80,18 @@ if (JSON.stringify(expected) !== JSON.stringify(actual)) { throw new Error('Buil
 await sign({
 	app, identity, platform: 'darwin', type: 'distribution',
 	preAutoEntitlements: false, preEmbedProvisioningProfile: false,
+	ignore: file => {
+		// Resources are sealed by their enclosing bundle. Sign Mach-O code
+		// only, and avoid traversing framework aliases more than once.
+		if (fs.realpathSync(file) !== file) { return true; }
+		if (fs.statSync(file).isDirectory()) { return false; }
+		const fd = fs.openSync(file, 'r');
+		try {
+			const magic = Buffer.alloc(4);
+			fs.readSync(fd, magic, 0, 4, 0);
+			return !['feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic.toString('hex'));
+		} finally { fs.closeSync(fd); }
+	},
 	optionsForFile: file => {
 		const role = ['GPU', 'Renderer', 'Plugin'].find(role => file.includes(` Helper (${role}).app`));
 		const entitlements = role ? `helper-${role.toLowerCase()}-entitlements.plist` : file.includes(' Helper.app') ? 'helper-entitlements.plist' : 'app-entitlements.plist';

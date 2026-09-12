@@ -244,13 +244,13 @@ suite('AgentSdkDownloader', () => {
 	 * explicitly. Pass `productConfig: null` to omit the agentSdks block
 	 * entirely (the "no product config" case).
 	 */
-	function makeDownloader(productConfig?: { version?: string; urlTemplate?: string } | null, telemetryService: ITelemetryService = NullTelemetryService) {
+	function makeDownloader(productConfig?: { version?: string; urlTemplate?: string } | null, telemetryService: ITelemetryService = NullTelemetryService, bundledAppRoot?: string) {
 		const config = productConfig === null ? undefined : {
 			version: productConfig?.version ?? '1.0.0',
 			urlTemplate: productConfig?.urlTemplate ?? `http://127.0.0.1:${server.port}/sdk-{sdkTarget}.tgz`,
 		};
 		return disposables.add(new AgentSdkDownloader(
-			makeEnvService(userDataPath),
+			Object.assign(makeEnvService(userDataPath), bundledAppRoot ? { appRoot: bundledAppRoot, isBuilt: true } : {}),
 			makeProductService(config),
 			makeRequestService(disposables),
 			makeFileService(disposables),
@@ -261,6 +261,22 @@ suite('AgentSdkDownloader', () => {
 
 	test('isAvailable: false when no env override and no product config', () => {
 		assert.strictEqual(makeDownloader(null).isAvailable(ClaudeSdkPackage), false);
+	});
+
+	test('packaged SDK resolves offline, rejects incomplete dependencies, and honors overrides', async () => {
+		const root = path.join(userDataPath, 'build', 'agent-sdk', 'agents', 'claude');
+		await fsp.mkdir(root, { recursive: true });
+		await fsp.writeFile(path.join(root, 'package.json'), JSON.stringify({ dependencies: { 'fixture-sdk': '1.0.0' } }));
+		const downloader = makeDownloader(null, NullTelemetryService, userDataPath);
+		assert.strictEqual(downloader.isAvailable(ClaudeSdkPackage), false);
+		await fsp.mkdir(path.join(root, 'node_modules', 'fixture-sdk'), { recursive: true });
+		await fsp.writeFile(path.join(root, 'node_modules', 'fixture-sdk', 'package.json'), '{}');
+		assert.strictEqual(downloader.isAvailable(ClaudeSdkPackage), true);
+		assert.strictEqual(await downloader.isSdkResolvableWithoutDownload(ClaudeSdkPackage), true);
+		assert.strictEqual(await downloader.loadSdkRoot(ClaudeSdkPackage, newToken()), root);
+		assert.strictEqual(server.requestCount, 0);
+		process.env[AgentHostClaudeSdkRootEnvVar] = userDataPath;
+		assert.strictEqual(await downloader.loadSdkRoot(ClaudeSdkPackage, newToken()), userDataPath);
 	});
 
 	test('isAvailable: true when env override set', () => {
