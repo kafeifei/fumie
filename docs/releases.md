@@ -18,20 +18,39 @@ commit on `main`, and do not run another package build concurrently.
    file and running `npm ci --omit=dev` in that destination.
 3. Set `FUMIE_RELEASE_VERSION` and `CODESIGN_IDENTITY`, then run
    `node scripts/package-darwin-release.mjs`. The script uses a fresh staging
-   directory, checks source identity, embeds SDKs, rejects external symlinks,
+   directory, checks source identity, embeds SDKs, applies the same Copilot
+   dependency pruning as Debug, rejects external symlinks,
    and signs with hardened runtime. It does not install or launch the app.
 4. ZIP the staged app with `ditto -c -k --keepParent`, submit using
    `xcrun notarytool submit --keychain-profile <profile> --wait`, and require
    an Accepted result. Staple and validate the app, assess it with `spctl`,
-   then recreate the distribution ZIP from the stapled app. Create a DMG
-   containing the app and an Applications shortcut, sign and notarize that
-   image, then staple and validate it. Generate SHA-256 checksums last.
+   then recreate the distribution ZIP from the stapled app. Generate its
+   SHA-256 checksum last. Publish one selected distribution format; compare
+   equivalent ZIP/DMG candidates if choosing for download size.
 5. Verify clean-profile startup and representative agent workflows from the
    staged app, including SDK resolution without the source checkout. OpenCode
    remains an external CLI prerequisite. Record exactly what was tested.
 6. Verify local and remote `main` match the packaged source commit before
    creating the tag. Publish a GitHub prerelease explicitly against the Fumie
-   repository, with the ZIP, DMG, checksums, and source/version receipt.
+   repository, with the selected package. Include its checksum and source/version
+   receipt in the release notes. Keep other build artifacts local.
 
 Signing identities and notarization credentials stay in caller configuration
 and Keychain. Never copy a development profile or credentials into a release.
+
+For local size experiments, clone a staged app into a separate directory and run
+`node scripts/prune-packaged-copilot.cjs <app>/Contents/Resources/app`. This changes
+the bundle and invalidates its signature; sign the candidate again before runtime
+validation. Compare dependency loads, extension activation, and agent workflows
+with the baseline before treating the smaller candidate as release-ready.
+
+Fumie omits the Copilot extension's `ChatSessionsContrib`, so its CLI/cloud
+session providers do not register alongside Fumie's Agent Host providers.
+This must be rebuilt before pruning `@github/copilot`: the Agent Host allowlist
+alone does not disable the extension's separate registration path.
+
+`prune-packaged-resources.cjs` removes source maps inside ASAR archives as well
+as loose files, and trims foreign-platform prebuilds, declaration files and
+non-runtime tests/docs from embedded SDKs. It preserves Mermaid, editor type
+libraries, licenses, and Pi's runtime-referenced docs/examples. ASAR rewriting
+preserves every non-map entry, including unpacked metadata and links.

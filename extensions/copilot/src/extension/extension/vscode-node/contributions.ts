@@ -9,7 +9,6 @@ import { BYOKContrib } from '../../byok/vscode-node/byokContribution';
 import { ChatDebugFileLoggerContribution } from '../../chat/vscode-node/chatDebugFileLoggerService';
 import { ChatQuotaContribution } from '../../chat/vscode-node/chatQuota.contribution';
 import { ChatSessionContextContribution } from '../../chatSessionContext/vscode-node/chatSessionContextProvider';
-import { ChatSessionsContrib } from '../../chatSessions/vscode-node/chatSessions';
 import { SessionStoreTracker } from '../../chronicle/vscode-node/sessionStoreTracker';
 import * as sessionSyncContribution from '../../chronicle/vscode-node/sessionSync.contribution';
 import * as chatBlockLanguageContribution from '../../codeBlocks/vscode-node/chatBlockLanguageFeatures.contribution';
@@ -101,7 +100,7 @@ export const vscodeNodeContributions: IExtensionContributionFactory[] = [
 	asContributionFactory(ChatSessionContextContribution),
 	asContributionFactory(CompletionsUnificationContribution),
 	workspaceIndexingContribution,
-	asContributionFactory(ChatSessionsContrib),
+	// Fumie owns agent sessions. Do not register the extension Copilot CLI/cloud providers.
 	asContributionFactory(GitHubMcpContrib),
 	asContributionFactory(OTelContrib),
 	asContributionFactory(SessionStoreTracker),

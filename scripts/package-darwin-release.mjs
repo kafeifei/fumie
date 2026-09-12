@@ -56,6 +56,8 @@ for (const sdk of ['claude', 'codex', 'deepseek', 'kimi', 'pi']) {
 	}
 	run('ditto', ['--clone', source, path.join(resources, 'build/agent-sdk/agents', sdk)]);
 }
+// Apply the same runtime dependency pruning as the Debug channel before signing.
+run(process.execPath, [path.join(root, 'scripts/prune-packaged-copilot.cjs'), resources]);
 // Remove source maps, and reject links that escape the standalone application.
 function inspect(directory) {
 	for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -74,6 +76,7 @@ function inspect(directory) {
 	}
 }
 inspect(app);
+run(process.execPath, [path.join(root, 'scripts/prune-packaged-resources.cjs'), app]);
 const expected = execFileSync(process.execPath, [path.join(root, 'build/fumie/expectedBuiltinExtensions.ts'), '--entries', '--format', 'lines'], { encoding: 'utf8' }).trim().split('\n').sort();
 const actual = fs.readdirSync(path.join(resources, 'extensions')).sort();
 if (JSON.stringify(expected) !== JSON.stringify(actual)) { throw new Error('Built-in extension set mismatch'); }
