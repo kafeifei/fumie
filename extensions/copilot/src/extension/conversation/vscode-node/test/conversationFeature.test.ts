@@ -153,6 +153,20 @@ suite('Conversation feature test suite', function () {
 		}
 	});
 
+	test('activation completes when signed out and model enumeration awaits extension activation', async function () {
+		sandbox.stub(vscode.lm, 'selectChatModels').returns(new Promise<vscode.LanguageModelChat[]>(() => { /* waits for activation */ }));
+		sandbox.stub(vscode.lm, 'onDidChangeChatModels').returns({ dispose: () => { } });
+
+		const conversationFeature = instaService.createInstance(ConversationFeature);
+		try {
+			await conversationFeature.activationBlocker;
+			assert.deepStrictEqual(conversationFeature.activated, false);
+			assert.deepStrictEqual(conversationFeature.enabled, false);
+		} finally {
+			conversationFeature.dispose();
+		}
+	});
+
 	test('activationBlocker resolves on an auth change even when the BYOK query never settles', async function () {
 		// Reproduces the air-gapped startup deadlock: the BYOK detection query (which itself
 		// activates this extension's language-model providers) can hang until extension

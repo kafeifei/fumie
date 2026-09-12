@@ -145,6 +145,11 @@ export class ConversationFeature implements IExtensionContribution {
 		}));
 
 		reevaluate();
+		// Model enumeration can itself await this extension's activation. Auth
+		// may already have settled before this contribution subscribed, so an
+		// auth-change event cannot be the only way out of that cycle. Finish
+		// activation now; reevaluate still gates chat on a token or BYOK model.
+		activationBlockerDeferred.complete();
 	}
 
 	get enabled() {
