@@ -1,5 +1,7 @@
 # Fumie
 
+[下载 Beta / Releases](https://github.com/kafeifei/fumie/releases)
+
 Fumie 是一个基于 Code - OSS 的个人研究项目，主要用于调研和探索不同模型、harness 与 agent 的工作方式，并尝试把它们整合到同一个工作环境中。
 
 我通过实际任务观察不同组合的能力和差异，优先采用开源方案，让这项研究保持可维护、可掌控。
