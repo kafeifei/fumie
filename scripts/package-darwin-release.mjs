@@ -15,6 +15,15 @@ if (!/^\d+\.\d+\.\d+-beta\.\d+$/.test(version ?? '') || !identity) {
 	throw new Error('Set FUMIE_RELEASE_VERSION (x.y.z-beta.n) and CODESIGN_IDENTITY.');
 }
 const run = (cmd, args) => execFileSync(cmd, args, { stdio: 'inherit' });
+// The tunnel must also run on Macs without the build machine's package manager.
+const tunnelSource = path.join(root, 'cli/target/release/code');
+const nonSystemLibraries = execFileSync('otool', ['-L', tunnelSource], { encoding: 'utf8' })
+	.trim().split('\n').slice(1).map(line => line.trim().split(' (')[0])
+	.filter(library => !library.startsWith('/usr/lib/') && !library.startsWith('/System/Library/'));
+if (nonSystemLibraries.length) {
+	throw new Error(`Tunnel CLI links non-system libraries: ${nonSystemLibraries.join(', ')}. Rebuild with static OpenSSL.`);
+}
+
 const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 const destination = path.join(root, '.build', 'fumie-release', version);
 const app = path.join(destination, 'Fumie.app');
@@ -39,7 +48,7 @@ const plist = path.join(app, 'Contents/Info.plist');
 run('plutil', ['-replace', 'CFBundleShortVersionString', '-string', version.split('-')[0], plist]);
 run('plutil', ['-replace', 'CFBundleVersion', '-string', `${version.split('-')[0]}.${version.split('.').at(-1)}`, plist]);
 run('plutil', ['-insert', 'FumieReleaseVersion', '-string', version, plist]);
-run('ditto', [path.join(root, 'cli/target/release/code'), path.join(resources, 'bin', product.tunnelApplicationName)]);
+run('ditto', [tunnelSource, path.join(resources, 'bin', product.tunnelApplicationName)]);
 const web = path.join(resources, 'web-bundle');
 run('ditto', [path.join(root, 'out-fumie-web'), web]);
 for (const asset of JSON.parse(fs.readFileSync(path.join(root, 'build/fumie/webBundleNodeModules.json'), 'utf8'))) {

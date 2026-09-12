@@ -10,7 +10,11 @@ commit on `main`, and do not run another package build concurrently.
 
 1. Run `npm run gulp vscode-darwin-arm64-min`,
    `node build/next/index.ts bundle --target web --minify --out out-fumie-web`,
-   and `cargo build --release` in `cli/`.
+   and build `cli/` with static OpenSSL and the source commit embedded:
+   `OPENSSL_STATIC=1 OPENSSL_DIR="$(brew --prefix openssl@3)" VSCODE_CLI_COMMIT="$(git rev-parse HEAD)" cargo build --release`.
+   The OpenSSL prefix above is for Homebrew; another installation can supply its
+   own prefix containing static libraries. Packaging rejects non-system dylib
+   dependencies in the tunnel executable.
 2. For each descriptor in `build/agent-sdk/agents/`, copy its `package.json`
    into `.build/fumie-release/sdk/<id>/`. Install the pinned SDK there with
    `node build/agent-sdk/package.ts --sdk=<id> --install-dir=<absolute-directory>`.
